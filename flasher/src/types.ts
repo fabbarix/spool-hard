@@ -1,19 +1,13 @@
-// GitHub Releases REST API — only the fields we actually consume.
-// Reference: https://docs.github.com/en/rest/releases/releases#get-the-latest-release
-export interface GithubReleaseAsset {
+// esp-web-tools manifest format. We only read the version for display;
+// esp-web-tools handles parsing the rest itself.
+export interface FlasherManifest {
   name: string;
-  browser_download_url: string;
-  size: number;
-}
-
-export interface GithubRelease {
-  tag_name: string;
-  name: string;
-  html_url: string;
-  published_at: string;
-  prerelease: boolean;
-  draft: boolean;
-  assets: GithubReleaseAsset[];
+  version: string;
+  new_install_prompt_erase?: boolean;
+  builds: Array<{
+    chipFamily: string;
+    parts: Array<{ path: string; offset: number }>;
+  }>;
 }
 
 export type ProductId = 'console' | 'scale';
@@ -22,10 +16,10 @@ export interface ProductMeta {
   id: ProductId;
   name: string;
   blurb: string;
-  // Filename pattern in the GitHub release the per-product flasher manifest
-  // is uploaded under. release.sh writes it as `flasher-manifest.json` inside
-  // each product's release/ subdir; the GitHub-Release upload step is
-  // expected to rename to this prefix when attaching multiple products to
-  // the same release.
-  manifestAssetName: string;
+  // Same-origin path the Pages deploy serves the per-product manifest at.
+  // The deploy-flasher workflow pulls the latest release's
+  // `spoolhard-<product>-flasher-manifest.json` into `latest/` and
+  // rewrites its bin URLs to relative names that resolve against the
+  // manifest's own location — so loading this manifest URL is enough.
+  manifestPath: string;
 }

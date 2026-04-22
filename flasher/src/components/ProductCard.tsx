@@ -1,22 +1,12 @@
-import type { GithubRelease, ProductMeta } from '../types';
+import type { ProductMeta, FlasherManifest } from '../types';
 // JSX typing for <esp-web-install-button> lives in src/esp-web-tools.d.ts.
 
 interface Props {
   meta: ProductMeta;
-  release: GithubRelease | null;
+  state: { loading: boolean; manifest: FlasherManifest | null; error: string | null };
 }
 
-// Find an asset by name in a release's asset list. GitHub release-asset
-// downloads come from objects.githubusercontent.com which sets CORS-permissive
-// headers, so esp-web-tools can fetch them directly from the browser.
-function findAsset(release: GithubRelease | null, name: string) {
-  return release?.assets.find((a) => a.name === name) ?? null;
-}
-
-export default function ProductCard({ meta, release }: Props) {
-  const manifestAsset = findAsset(release, meta.manifestAssetName);
-  const manifestUrl = manifestAsset?.browser_download_url ?? '';
-
+export default function ProductCard({ meta, state }: Props) {
   return (
     <div className="rounded-card border border-border bg-card p-6 flex flex-col gap-4">
       <div>
@@ -25,27 +15,18 @@ export default function ProductCard({ meta, release }: Props) {
       </div>
 
       <div className="text-xs font-mono text-text-muted">
-        {release ? (
-          <>
-            <span className="text-brand-500">{release.tag_name}</span>
-            <span className="mx-2">·</span>
-            {new Date(release.published_at).toLocaleDateString()}
-            {release.prerelease && (
-              <span className="ml-2 px-2 py-0.5 rounded bg-amber-900/30 text-amber-400">
-                pre-release
-              </span>
-            )}
-          </>
-        ) : (
-          'Loading release info…'
-        )}
+        {state.loading
+          ? 'Loading manifest…'
+          : state.manifest
+          ? <span><span className="text-brand-500">v{state.manifest.version}</span> · {state.manifest.builds[0]?.chipFamily ?? 'unknown chip'}</span>
+          : <span className="text-red-400">manifest unavailable ({state.error})</span>}
       </div>
 
-      {manifestUrl ? (
+      {state.manifest && !state.loading && (
         // esp-web-tools handles UI, chip detection, erase, multi-part
         // upload, progress, and reset. The slotted span is the visible
         // button label — the component wraps it in its own <button>.
-        <esp-web-install-button manifest={manifestUrl}>
+        <esp-web-install-button manifest={meta.manifestPath}>
           <span slot="activate" className="cursor-pointer rounded-md bg-brand-500 hover:bg-brand-400 px-4 py-2 text-text-inverse font-medium inline-block">
             Flash {meta.name}
           </span>
@@ -56,11 +37,13 @@ export default function ProductCard({ meta, release }: Props) {
             This page must be served over HTTPS for Web Serial to work.
           </span>
         </esp-web-install-button>
-      ) : release ? (
+      )}
+
+      {!state.manifest && !state.loading && (
         <div className="text-sm text-text-muted italic">
-          No <code className="font-mono">{meta.manifestAssetName}</code> asset in this release.
+          No build available yet — wait for the next release deploy.
         </div>
-      ) : null}
+      )}
     </div>
   );
 }

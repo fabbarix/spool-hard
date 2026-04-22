@@ -1,14 +1,13 @@
 name: Deploy flasher to GitHub Pages
 
-# Runs on every push to main that touches the flasher (or its shared
-# dependencies). Tag pushes deliberately don't trigger this — the page
-# fetches the latest release at runtime via the GitHub API, so a tag
-# bump that only changes VERSION/CHANGELOG doesn't change what the
-# flasher serves; the corresponding main commit already triggered a
-# rebuild if the flasher source itself changed. Tag triggers also
-# collide with the github-pages environment's default protection rules
-# (which restrict deployments to the default branch). Manual dispatch
-# is available for re-deploys without a source change.
+# Two trigger paths:
+# 1. Push to main that touches the flasher source — rebuild the React
+#    app and re-deploy with whatever release was already published.
+# 2. workflow_run completion of "Release on tag" (release.yml) — a new
+#    release just published, fetch its assets into the Pages bundle so
+#    they're served same-origin (GitHub release CDN doesn't send CORS
+#    headers, so the browser can't fetch the .bins directly from there).
+# Manual dispatch is also available.
 on:
   push:
     branches: [main]
@@ -16,10 +15,13 @@ on:
       - 'flasher/**'
       - 'shared/frontend/**'
       - '.github/workflows/deploy-flasher.yml'
+  workflow_run:
+    workflows: ['Release on tag']
+    types: [completed]
   workflow_dispatch:
 
 # Pages deployment needs id-token for the OIDC handshake and pages: write
-# for the upload. contents:read is for the actions/checkout step.
+# for the upload. contents:read is for actions/checkout + gh release download.
 permissions:
   contents: read
   pages: write
@@ -31,15 +33,16 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
-# Opt actions in to Node.js 24 ahead of the June-2026 forced cutover —
-# silences the deprecation warning emitted on every run by actions still
-# bundling Node 20 (checkout, setup-node, etc.).
+# Opt JS actions in to Node 24 ahead of the June-2026 cutover.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Skip the workflow_run trigger if the upstream Release workflow
+    # didn't actually succeed — no point deploying with broken bins.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -48,16 +51,42 @@ jobs:
           node-version: 22
           cache: npm
 
-      # `npm ci` honours the lockfile exactly — the right call in CI vs
-      # `npm install` which can drift the tree.
       - run: npm ci
       - run: npm run build --workspace=@spoolhard/flasher
 
+      # Pull the latest release's per-product flasher bundles into the
+      # Pages site so they're served same-origin. GitHub's release CDN
+      # (release-assets.githubusercontent.com) doesn't send CORS headers,
+      # so any in-browser fetch of those URLs is blocked — bundling makes
+      # CORS a non-issue and the page loads bins from its own host.
+      - name: Pull latest release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p flasher/dist/latest
+          if gh release view --json tagName >/dev/null 2>&1; then
+            TAG=$(gh release view --json tagName --jq .tagName)
+            echo "Fetching assets from release $TAG"
+            gh release download "$TAG" \
+              --pattern 'spoolhard-*' \
+              --dir flasher/dist/latest
+            # The release.yml-generated flasher manifests reference
+            # absolute GitHub release URLs. Rewrite them to the asset
+            # filename only, so the manifest fetched at
+            # /latest/spoolhard-<product>-flasher-manifest.json resolves
+            # bin URLs against its own directory (same origin, no CORS).
+            for m in flasher/dist/latest/*-flasher-manifest.json; do
+              jq '(.builds[].parts[].path) |= sub(".*/"; "")' "$m" \
+                > "$m.tmp" && mv "$m.tmp" "$m"
+            done
+            ls -la flasher/dist/latest
+          else
+            echo "No release found yet — skipping asset bundle"
+          fi
+
       # Custom domain — write a CNAME file into the artifact root if the
-      # repo variable PAGES_CUSTOM_DOMAIN is set (e.g. `flasher.spoolhard.io`).
-      # GitHub Pages reads CNAME from the artifact and sets the custom
-      # domain on each deploy. Configure the variable in
-      # Settings → Secrets and variables → Actions → Variables.
+      # repo variable PAGES_CUSTOM_DOMAIN is set (e.g. `spoolhard.orksu.com`).
+      # Configure in Settings → Secrets and variables → Actions → Variables.
       - name: Plant CNAME (if configured)
         if: vars.PAGES_CUSTOM_DOMAIN != ''
         run: echo "${{ vars.PAGES_CUSTOM_DOMAIN }}" > flasher/dist/CNAME
