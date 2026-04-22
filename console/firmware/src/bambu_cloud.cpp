@@ -370,9 +370,88 @@ BambuCloudAuth::StepResult BambuCloudAuth::loginTfa(
     return out;
 }
 
-bool BambuCloudAuth::verifyToken(const String& token, Region r) {
-    _get(r, "/v1/user-service/my/profile", token);
-    return _lastHttpStatus == 200;
+BambuCloudAuth::VerifyResult BambuCloudAuth::verifyToken(const String& token, Region r) {
+    String body = _get(r, "/v1/user-service/my/profile", token);
+    if (_lastHttpStatus == 200) return VerifyResult::Verified;
+    // Network failure or no HTTP response at all → treat as unreachable
+    // so the caller can decide what to do (typically: save anyway,
+    // surface "couldn't verify").
+    if (_lastHttpStatus <= 0) return VerifyResult::Unreachable;
+    // Cloudflare reject template — same family of failure as a network
+    // outage from the user's POV; the token didn't even reach Bambu's
+    // application layer to be judged.
+    if (looksLikeCloudflareBlock(body)) return VerifyResult::Unreachable;
+    // Anything else (401/403 with a JSON body, 404, etc.) — Bambu told
+    // us the token isn't good.
+    return VerifyResult::Rejected;
+}
+
+// ── Cloudflare reject-page detector ──────────────────────────
+//
+// Cloudflare's static "Sorry, you have been blocked" template is what
+// we get back when bot management denies us at the edge. Distinguishing
+// it from a real auth failure matters because the right UX is very
+// different: "your token is wrong" vs "this device's network can't
+// reach Bambu Cloud, but your token might still be fine".
+
+bool BambuCloudAuth::looksLikeCloudflareBlock(const String& body, String* rayIdOut) {
+    if (body.indexOf("Attention Required") < 0) return false;
+    if (body.indexOf("Cloudflare")         < 0) return false;
+    if (rayIdOut) {
+        *rayIdOut = "";
+        // Marker is something like:
+        //   Cloudflare Ray ID: <strong class="font-semibold">9f06c07f8aea86e7</strong>
+        // We only need the bare ID for diagnostics, so just find the
+        // first <strong> after "Cloudflare Ray ID:" and read until </strong>.
+        int marker = body.indexOf("Cloudflare Ray ID:");
+        if (marker >= 0) {
+            int strongOpen = body.indexOf("<strong", marker);
+            if (strongOpen >= 0) {
+                int gt = body.indexOf('>', strongOpen);
+                int strongClose = (gt >= 0) ? body.indexOf("</strong>", gt) : -1;
+                if (gt >= 0 && strongClose > gt) {
+                    *rayIdOut = body.substring(gt + 1, strongClose);
+                    rayIdOut->trim();
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// ── SPOOLHARD-TOKEN: blob unpacker ───────────────────────────
+
+bool BambuCloudAuth::unpackTokenBlob(const String& pasted,
+                                     String& tokenOut,
+                                     String& regionOut,
+                                     String& emailOut) {
+    static const char* kPrefix = "SPOOLHARD-TOKEN:";
+    if (!pasted.startsWith(kPrefix)) return false;
+    String b64 = pasted.substring(strlen(kPrefix));
+    b64.trim();   // tolerate trailing whitespace from the user's paste
+    if (!b64.length()) return false;
+
+    // Decode base64. Same mbedtls helper used by decodeExpiry — no
+    // padding fixup needed because the script always emits canonical
+    // base64 output.
+    size_t buflen = (b64.length() * 3) / 4 + 4;
+    uint8_t* buf = (uint8_t*)malloc(buflen);
+    if (!buf) return false;
+    size_t outlen = 0;
+    int rc = mbedtls_base64_decode(buf, buflen, &outlen,
+                                   (const uint8_t*)b64.c_str(), b64.length());
+    if (rc != 0) { free(buf); return false; }
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, buf, outlen);
+    free(buf);
+    if (err) return false;
+
+    if (!doc["token"].is<const char*>()) return false;
+    tokenOut  = doc["token"].as<String>();
+    regionOut = doc["region"] | "global";
+    emailOut  = doc["email"]  | "";
+    return tokenOut.length() > 0;
 }
 
 // ── JWT decode ────────────────────────────────────────────────

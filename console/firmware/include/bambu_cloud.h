@@ -66,10 +66,31 @@ public:
     StepResult loginEmailCode(const String& account, const String& code,    Region region);
     StepResult loginTfa(const String& tfaKey, const String& tfaCode,        Region region);
 
-    // Stand-alone token check — calls /v1/user-service/my/profile and
-    // returns true on HTTP 200. Used both for "verify the token I just
-    // got" and "is the stored token still valid".
-    bool verifyToken(const String& token, Region region);
+    // Stand-alone token check — calls /v1/user-service/my/profile.
+    // Returns Verified on HTTP 200. Returns Rejected on a clean 4xx
+    // (the token is genuinely bad). Returns Unreachable when the
+    // request never lands a verdict — network failure, timeout, OR a
+    // Cloudflare hard-block (the WAF reject page). The Unreachable
+    // case lets the manual-paste flow accept a token even when this
+    // device's WAN is being blocked, with the UI flagging it as
+    // "saved but unverified".
+    enum class VerifyResult { Verified, Rejected, Unreachable };
+    VerifyResult verifyToken(const String& token, Region region);
+
+    // True if `body` looks like a Cloudflare hard-block reject page
+    // (the static "Sorry, you have been blocked" template Cloudflare
+    // serves when bot management denies the TLS handshake or request).
+    // Extracts the Ray ID into `rayIdOut` if present + non-null.
+    static bool looksLikeCloudflareBlock(const String& body, String* rayIdOut = nullptr);
+
+    // Unpack a SPOOLHARD-TOKEN: paste-blob produced by
+    // tools/bambu_login.py. Returns true on success and fills out the
+    // three reference args; returns false on missing prefix, bad
+    // base64, or missing JSON fields.
+    static bool unpackTokenBlob(const String& pasted,
+                                String& tokenOut,
+                                String& regionOut,
+                                String& emailOut);
 
     // ── Persistence ─────────────────────────────────────────
     void saveToken(const String& token, Region region, const String& email);

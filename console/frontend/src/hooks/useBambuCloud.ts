@@ -90,9 +90,23 @@ export function useBambuLoginTfa() {
   });
 }
 
+// `verified` and `blob` are populated on `status === 'ok'`:
+//  - `verified: false` means the firmware couldn't reach Bambu Cloud
+//    to validate the token (typically a Cloudflare hard-block on the
+//    /my/profile call). Token is saved anyway; UI should warn that
+//    cloud features may not work.
+//  - `blob: true` means the firmware unpacked a SPOOLHARD-TOKEN: blob
+//    (token + region + email all came from the blob).
+export interface BambuSetTokenResult {
+  status: 'ok' | 'invalid_credentials';
+  verified?: boolean;
+  blob?: boolean;
+  message?: string;
+}
+
 export function useBambuSetToken() {
   const qc = useQueryClient();
-  return useMutation<{ status: string; message?: string }, Error, { token: string; email?: string; region: BambuRegion }>({
+  return useMutation<BambuSetTokenResult, Error, { token: string; email?: string; region: BambuRegion }>({
     mutationFn: (b) => postJson('/api/bambu-cloud/token', b),
     onSuccess: (res) => {
       if (res.status === 'ok') qc.invalidateQueries({ queryKey: STATUS_KEY });
@@ -102,7 +116,7 @@ export function useBambuSetToken() {
 
 export function useBambuVerify() {
   const qc = useQueryClient();
-  return useMutation<{ valid: boolean }, Error, void>({
+  return useMutation<{ valid: boolean; unreachable?: boolean }, Error, void>({
     mutationFn: () =>
       fetch('/api/bambu-cloud/verify', { method: 'POST' }).then((r) => r.json()),
     onSuccess: () => qc.invalidateQueries({ queryKey: STATUS_KEY }),

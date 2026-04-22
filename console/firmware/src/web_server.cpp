@@ -1668,23 +1668,59 @@ void ConsoleWebServer::_handleBambuCloudSetToken(AsyncWebServerRequest* req,
         req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
         return;
     }
-    String token = body["token"] | "";
-    String email = body["email"] | "";
-    auto region = BambuCloudAuth::regionFromString(body["region"] | "global");
+    String pasted = body["token"] | "";
+    String token, region_str, email;
+    bool   blob = false;
+    if (BambuCloudAuth::unpackTokenBlob(pasted, token, region_str, email)) {
+        // SPOOLHARD-TOKEN: blob from tools/bambu_login.py — token /
+        // region / email all come from the blob and override anything
+        // the user typed in the per-field UI inputs.
+        blob = true;
+    } else if (pasted.startsWith("SPOOLHARD-TOKEN:")) {
+        // Has the prefix but failed to decode → user pasted a corrupted
+        // blob. Don't fall through to "raw JWT" treatment, that would
+        // hide the real failure.
+        req->send(400, "application/json",
+                  "{\"error\":\"corrupted SPOOLHARD-TOKEN blob — "
+                  "re-run tools/bambu_login.py and copy the whole line\"}");
+        return;
+    } else {
+        token      = pasted;
+        region_str = body["region"] | "global";
+        email      = body["email"]  | "";
+    }
     if (token.isEmpty()) {
         req->send(400, "application/json", "{\"error\":\"token required\"}");
         return;
     }
-    // Verify it works before persisting — saves the user a debugging
-    // round-trip when they paste a malformed or expired token.
-    if (!g_bambu_cloud.verifyToken(token, region)) {
-        req->send(401, "application/json",
-                  "{\"status\":\"invalid_credentials\","
-                  "\"message\":\"token rejected by /v1/user-service/my/profile\"}");
+    auto region = BambuCloudAuth::regionFromString(region_str);
+
+    // Soft verify. The verify endpoint sits behind the same Cloudflare
+    // wall that blocks the login endpoint, so a perfectly valid token
+    // can come back as Unreachable from a CF-blocked WAN. Save anyway
+    // in that case + tell the UI so it can warn the user that cloud
+    // features won't work until network/fingerprint changes.
+    auto vr = g_bambu_cloud.verifyToken(token, region);
+    using V = BambuCloudAuth::VerifyResult;
+    JsonDocument resp;
+    if (vr == V::Rejected) {
+        resp["status"]  = "invalid_credentials";
+        resp["message"] = "token rejected by /v1/user-service/my/profile";
+        String out; serializeJson(resp, out);
+        req->send(401, "application/json", out);
         return;
     }
     g_bambu_cloud.saveToken(token, region, email);
-    req->send(200, "application/json", "{\"status\":\"ok\"}");
+    resp["status"]   = "ok";
+    resp["verified"] = (vr == V::Verified);
+    resp["blob"]     = blob;
+    if (vr == V::Unreachable) {
+        resp["message"] = "saved, but couldn't reach Bambu Cloud to verify "
+                          "(api.bambulab.com unreachable from this device); "
+                          "cloud-dependent features may not work";
+    }
+    String out; serializeJson(resp, out);
+    req->send(200, "application/json", out);
 }
 
 void ConsoleWebServer::_handleBambuCloudVerify(AsyncWebServerRequest* req) {
@@ -1693,9 +1729,13 @@ void ConsoleWebServer::_handleBambuCloudVerify(AsyncWebServerRequest* req) {
         req->send(404, "application/json", "{\"error\":\"no token stored\"}");
         return;
     }
-    bool ok = g_bambu_cloud.verifyToken(g_bambu_cloud.token(), g_bambu_cloud.region());
+    auto vr = g_bambu_cloud.verifyToken(g_bambu_cloud.token(), g_bambu_cloud.region());
+    using V = BambuCloudAuth::VerifyResult;
     JsonDocument doc;
-    doc["valid"] = ok;
+    doc["valid"] = (vr == V::Verified);
+    if (vr == V::Unreachable) {
+        doc["unreachable"] = true;
+    }
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }

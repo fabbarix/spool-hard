@@ -45,7 +45,7 @@ export function BambuCloudSection() {
   const [emailCode, setEmailCode] = useState('');
   const [tfaCode, setTfaCode]     = useState('');
   const [phase, setPhase]         = useState<LoginPhase>({ kind: 'idle' });
-  const [feedback, setFeedback]   = useState<{ msg: string; tone: 'ok' | 'err' | 'info' } | null>(null);
+  const [feedback, setFeedback]   = useState<{ msg: string; tone: 'ok' | 'err' | 'info' | 'warn' } | null>(null);
   // Last failed step's raw response details, kept until the next attempt
   // so the user can read it after the friendly error.
   const [lastDiagnostics, setLastDiagnostics] = useState<BambuStepDiagnostics | null>(null);
@@ -109,7 +109,19 @@ export function BambuCloudSection() {
         onSuccess: (res) => {
           if (res.status === 'ok') {
             setManualToken(''); setManualEmail('');
-            setFeedback({ msg: 'Token verified and saved.', tone: 'ok' });
+            // verified=false: token was saved but the firmware couldn't
+            // reach Bambu Cloud to confirm it (typically the same WAF
+            // wall that blocks login). Token might still work for MQTT
+            // etc. when those endpoints aren't blocked, but cloud
+            // discovery / AMS reads will fail. Mark as warn, not ok.
+            if (res.verified === false) {
+              setFeedback({
+                msg: res.message || 'Token saved, but couldn\'t reach Bambu Cloud to verify it. Cloud-dependent features may not work until network access to api.bambulab.com is possible from this device.',
+                tone: 'warn',
+              });
+            } else {
+              setFeedback({ msg: 'Token verified and saved.', tone: 'ok' });
+            }
           } else {
             setFeedback({ msg: res.message || res.status, tone: 'err' });
           }
@@ -283,7 +295,11 @@ export function BambuCloudSection() {
           )}
         </div>
 
-        {feedback && (
+        {feedback && (feedback.tone === 'warn' ? (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-300">
+            {feedback.msg}
+          </div>
+        ) : (
           <div className={
             feedback.tone === 'ok'   ? 'text-sm text-teal-400'  :
             feedback.tone === 'err'  ? 'text-sm text-red-400'   :
@@ -291,7 +307,7 @@ export function BambuCloudSection() {
           }>
             {feedback.msg}
           </div>
-        )}
+        ))}
 
         {lastDiagnostics && (
           <details className="rounded-md border border-red-700/40 bg-red-950/20 text-xs">
@@ -342,22 +358,38 @@ export function BambuCloudSection() {
         </summary>
         <div className="mt-3 space-y-2">
           <p className="text-xs text-text-secondary">
-            Paste an access token you've grabbed from another tool (OrcaSlicer's
-            <code className="font-mono"> ~/.bambu_token</code>, the Bambu Studio
-            log, or a previous run of this device). It'll be verified against
-            <code className="font-mono"> /v1/user-service/my/profile</code> before
-            being stored.
+            Paste either:
+            {' '}<strong>(a)</strong> a raw access-token JWT (from OrcaSlicer's
+            <code className="font-mono"> ~/.bambu_token</code>, Bambu Studio log,
+            or a previous run of this device), or
+            {' '}<strong>(b)</strong> the <code className="font-mono">SPOOLHARD-TOKEN:</code>
+            blob produced by{' '}
+            <a
+              className="underline text-brand-500"
+              href="https://github.com/fabbarix/spool-hard/blob/main/tools/bambu_login.py"
+              target="_blank" rel="noopener noreferrer"
+            >tools/bambu_login.py</a>{' '}
+            — that script does the Bambu login on a real computer (where
+            Cloudflare's WAF lets the request through) and packages
+            token + region + account into one line.
           </p>
           <InputField
-            label="Token"
+            label="Token (or SPOOLHARD-TOKEN: blob)"
             value={manualToken}
             onChange={(e) => setManualToken(e.target.value)}
           />
-          <InputField
-            label="Account label (optional, just for the UI)"
-            value={manualEmail}
-            onChange={(e) => setManualEmail(e.target.value)}
-          />
+          {manualToken.trimStart().startsWith('SPOOLHARD-TOKEN:') ? (
+            <div className="text-xs text-text-secondary italic">
+              Paste-blob detected — region and account label will come from
+              the blob.
+            </div>
+          ) : (
+            <InputField
+              label="Account label (optional, just for the UI)"
+              value={manualEmail}
+              onChange={(e) => setManualEmail(e.target.value)}
+            />
+          )}
           <Button onClick={submitManualToken} disabled={setToken.isPending || !manualToken}>
             {setToken.isPending ? 'Verifying…' : 'Verify & save'}
           </Button>

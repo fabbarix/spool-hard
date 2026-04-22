@@ -8,6 +8,32 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.2.7] - 2026-04-22
+
+Bambu Cloud login: paste-blob workflow + soft-verify.
+
+- New helper script `tools/bambu_login.py` runs the Bambu Lab cloud
+  login on a desktop (where Cloudflare lets the request through, since
+  the WAF that blocks the ESP32 is keying off the device's TLS
+  fingerprint). On success it prints a `SPOOLHARD-TOKEN:<base64>` blob
+  carrying token + region + account label on a single line.
+- The console firmware detects the prefix in the manual-paste field
+  and unpacks the blob automatically; raw JWTs from other tools still
+  work (no prefix, no behaviour change).
+- `BambuCloudAuth::verifyToken` now returns a tri-state
+  (`Verified` / `Rejected` / `Unreachable`). When the verify endpoint
+  is itself blocked by Cloudflare, the token is saved anyway with an
+  amber "couldn't verify" warning in the UI — a perfectly valid token
+  no longer gets rejected just because the verify call hits the same
+  WAF as the login.
+- `looksLikeCloudflareBlock()` parses the static "Sorry, you have been
+  blocked" template and extracts the Ray ID for diagnostics.
+- TLS-fingerprint changes + framework upgrade (pioarduino /
+  arduino-esp32 v3 / mbedtls 3.x for TLS 1.3) were investigated and
+  deferred — even if it bypassed Cloudflare today it'd be a treadmill
+  against bot-management updates, and the paste-blob flow handles the
+  WAF case cleanly.
+
 ## [0.2.6] - 2026-04-22
 
 OTA UX polish + Bambu Cloud login fix.
