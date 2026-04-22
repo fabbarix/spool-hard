@@ -1,5 +1,8 @@
 # SpoolHard
 
+> ⚠️ **Work in progress — not ready for daily use.**
+> This is an active rewrite. Expect breaking changes between releases, partially-implemented features, rough edges, and the occasional brick that needs a USB re-flash. Pre-release and unsupported. If you depend on a working spool tracker today, stay on upstream [yanshay/SpoolEase](https://github.com/yanshay/SpoolEase) and check back here once the project hits a 1.0 tag.
+
 Open-source firmware and web interfaces for the SpoolHard filament management ecosystem. A fork of sorts of SpoolEase.
 
 This could have not been possible without Claude Code - it wrote every single line of code as I focused on the design and
