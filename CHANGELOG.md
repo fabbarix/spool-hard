@@ -8,6 +8,15 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.2.3] - 2026-04-22
+
+CI build fix. v0.2.2's release workflow failed at the console build step
+because a fresh `^1.2.0` resolve picked LovyanGFX 1.3.x, whose vendored
+LVGL adapter (`lgfx/v1/lv_font/font_fmt_txt.h`) collides with the real
+lvgl package (duplicate enums / typedefs). Pinned LovyanGFX to 1.2.19
+exactly, and extended `console/scripts/patch_lvgl.py` to also stub the
+vendored lv_font headers if a future bump re-introduces them.
+
 ## [0.2.2] - 2026-04-22
 
 Release pipeline only — no firmware-side changes from v0.2.1. Tag-triggered
