@@ -44,3 +44,50 @@ Both firmwares build with plain `pio run` from their `firmware/` dir. The
 release scripts under `*/scripts/release.sh` additionally build the
 frontend, gzip it, produce a SPIFFS image, and emit a `manifest.json` for
 distribution — only needed for actual releases.
+
+## Shared firmware library: `spoolhard_core`
+
+Code that's identical for both products lives in
+**`shared/firmware/spoolhard_core/`** as a PlatformIO local library. Each
+product's `platformio.ini` pulls it in via:
+
+```ini
+lib_extra_dirs = ../../shared/firmware
+```
+
+(no entry in `lib_deps` is required — PlatformIO LDF picks it up because
+the headers are `#include`d).
+
+**What's in the lib today**
+
+- `spoolhard/ota.h` / `src/ota.cpp` — manifest-driven OTA: scheduled
+  version checker, `OtaConfig` (NVS-backed), `otaRun()` runner that
+  flashes firmware then frontend with sha256 verification.
+- `spoolhard/product_signature.h` — `SPOOLHARD-PRODUCT=<id>` byte marker
+  + `ProductSignatureMatcher` for streaming-upload validation.
+- `spoolhard/version_marker.h` / `src/version_marker.cpp` —
+  `SPOOLHARD-VERSION=<v>\x01` byte marker + `VersionMarkerParser` that
+  pulls the version out of an uploaded firmware image.
+
+**Per-product identity**: the library has no per-product config header
+on its include path. Identity comes in as `-D` build flags from each
+product's `platformio.ini`:
+
+```
+-DPRODUCT_ID=\"console\"            ; or "spoolscale"
+-DPRODUCT_NAME=\"SpoolHard\ Console\"
+-DOTA_DEFAULT_URL=\"https://…manifest.json\"
+```
+
+`FW_VERSION` / `FE_VERSION` are stamped in by
+`scripts/patch_version.py` from each product's `VERSION` file at build
+time. The library headers `#error` out if any of these macros are
+missing.
+
+**NVS schema (OTA)** is owned by `spoolhard_core/src/ota.cpp` — namespace
+`ota_cfg`, keys `url`, `use_ssl`, `verify_ssl`, `ck_en`, `ck_hrs`,
+`lck_ts`, `lck_st`, `lk_fw`, `lk_fe`. Both products use the same
+schema; do not re-define those keys in the per-product `config.h`.
+
+When adding new shared code, prefer extending the lib over duplicating
+between `console/` and `scale/`.

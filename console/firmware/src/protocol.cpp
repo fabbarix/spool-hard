@@ -21,6 +21,7 @@ static Type nameToType(const char* name) {
     if (strcmp(name, "PN532Status")         == 0) return Type::PN532Status;
     if (strcmp(name, "ScaleVersion")        == 0) return Type::ScaleVersion;
     if (strcmp(name, "OtaProgressUpdate")   == 0) return Type::OtaProgressUpdate;
+    if (strcmp(name, "OtaPending")          == 0) return Type::OtaPending;
     if (strcmp(name, "Term")                == 0) return Type::Term;
     if (strcmp(name, "CurrentWeight")       == 0) return Type::CurrentWeight;
     return Type::Unknown;
@@ -38,6 +39,7 @@ const char* typeToString(Type t) {
         case Type::PN532Status:         return "PN532Status";
         case Type::ScaleVersion:        return "ScaleVersion";
         case Type::OtaProgressUpdate:   return "OtaProgressUpdate";
+        case Type::OtaPending:          return "OtaPending";
         case Type::Term:                return "Term";
         case Type::CurrentWeight:       return "CurrentWeight";
         default:                        return "Unknown";
@@ -112,6 +114,8 @@ static const char* typeName(Type t) {
         case Type::UpdateFirmware:       return "UpdateFirmware";
         case Type::TagsInStore:          return "TagsInStore";
         case Type::GetCurrentWeight:     return "GetCurrentWeight";
+        case Type::RunOtaUpdate:         return "RunOtaUpdate";
+        case Type::CheckOtaUpdates:      return "CheckOtaUpdates";
     }
     return "?";
 }

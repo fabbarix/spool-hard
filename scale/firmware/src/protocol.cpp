@@ -17,6 +17,7 @@ static const char* s2cName(ScaleToConsole::Type t) {
         case T::PN532Status:         return "PN532Status";
         case T::ScaleVersion:        return "ScaleVersion";
         case T::OtaProgressUpdate:   return "OtaProgressUpdate";
+        case T::OtaPending:          return "OtaPending";
         case T::Term:                return "Term";
         case T::CurrentWeight:       return "CurrentWeight";
     }
@@ -135,6 +136,14 @@ void send(Type type, JsonDocument& doc) {
             emitStruct("TagStatus", doc);
             break;
         }
+        case Type::OtaPending: {
+            // Forward whatever fields main.cpp built as the inner object.
+            // Schema: firmware_current/latest, frontend_current/latest,
+            // firmware_update (bool), frontend_update (bool),
+            // last_check_ts (epoch), last_check_status.
+            emitStruct("OtaPending", doc);
+            break;
+        }
         case Type::OtaProgressUpdate: {
             // Map simple percent/text progress into Status{text}.
             JsonDocument inner;
@@ -204,6 +213,8 @@ static Type nameToType(const char* name) {
     if (strcmp(name, "UpdateFirmware")       == 0) return Type::UpdateFirmware;
     if (strcmp(name, "TagsInStore")          == 0) return Type::TagsInStore;
     if (strcmp(name, "GetCurrentWeight")     == 0) return Type::GetCurrentWeight;
+    if (strcmp(name, "RunOtaUpdate")         == 0) return Type::RunOtaUpdate;
+    if (strcmp(name, "CheckOtaUpdates")      == 0) return Type::CheckOtaUpdates;
     return Type::Unknown;
 }
 

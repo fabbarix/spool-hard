@@ -9,7 +9,7 @@
 #include "console_channel.h"
 #include "web_server.h"
 #include "wifi_provisioning.h"
-#include "ota.h"
+#include "spoolhard/ota.h"
 #include <SPIFFS.h>
 
 // ── Globals ──────────────────────────────────────────────────
@@ -51,6 +51,54 @@ static constexpr unsigned long BTN_RESPONSE_TIMEOUT_MS = 2000;
 // Forward-declared so GetCurrentWeight can include the state name in its reply
 // without reordering the whole file.
 static const char* weightStateName(WeightState s);
+
+// ── OTA pending-state push ──────────────────────────────────
+//
+// The scale's OtaChecker (manifest fetch + version compare) lives in the
+// shared spoolhard_core library; we drive it here. Every loop tick we
+// peek at the cached pending state and, if it has changed since the last
+// push, send an OtaPending frame to the console so its combined "updates
+// available" banner stays in sync without polling.
+//
+// The hash is a cheap concatenation of the fields that matter — the only
+// purpose is change detection, not security.
+static String g_lastPendingHash;
+static bool   g_pendingPushPending = false;  // force-push (e.g. on connect)
+
+static String _pendingHash(const OtaPending& p, uint32_t lastTs, const String& lastSt) {
+    String s;
+    s.reserve(96);
+    s += p.firmware_current; s += '|'; s += p.firmware_latest; s += '|';
+    s += p.frontend_current; s += '|'; s += p.frontend_latest; s += '|';
+    s += (p.firmware ? '1' : '0');
+    s += (p.frontend ? '1' : '0');
+    s += '|'; s += String(lastTs);
+    s += '|'; s += lastSt;
+    return s;
+}
+
+static void pushOtaPendingIfChanged(bool force) {
+    if (!g_console.isConnected()) return;
+
+    auto p       = g_ota_checker.pending();
+    uint32_t ts  = g_ota_checker.lastCheckTs();
+    const String& st = g_ota_checker.lastStatus();
+
+    String h = _pendingHash(p, ts, st);
+    if (!force && h == g_lastPendingHash) return;
+    g_lastPendingHash = h;
+
+    JsonDocument doc;
+    doc["firmware_current"]  = p.firmware_current;
+    doc["firmware_latest"]   = p.firmware_latest;
+    doc["frontend_current"]  = p.frontend_current;
+    doc["frontend_latest"]   = p.frontend_latest;
+    doc["firmware_update"]   = p.firmware;
+    doc["frontend_update"]   = p.frontend;
+    doc["last_check_ts"]     = ts;
+    doc["last_check_status"] = st;
+    ScaleToConsole::send(ScaleToConsole::Type::OtaPending, doc);
+}
 
 // ── Console protocol ─────────────────────────────────────────
 static void handleConsoleMessage(ConsoleToScale::Message& msg) {
@@ -110,6 +158,21 @@ static void handleConsoleMessage(ConsoleToScale::Message& msg) {
             // Encrypted in real protocol — not yet decrypted here
             Serial.println("[App] UpdateFirmware received (encrypted payload, not yet handled)");
             g_pendingOta = true;
+            break;
+        }
+        case T::RunOtaUpdate: {
+            // Phase-5 trigger from the console. Same effect as the local
+            // /api/ota-run on the scale's own web UI: queue an OTA run on
+            // the next loop tick using the stored OtaConfig.
+            Serial.println("[App] RunOtaUpdate received from console");
+            g_pendingOta = true;
+            break;
+        }
+        case T::CheckOtaUpdates: {
+            // Console hit "Check now" — refresh our manifest immediately so
+            // the next OtaPending push reflects the latest known versions.
+            Serial.println("[App] CheckOtaUpdates received from console");
+            g_ota_checker.kickNow();
             break;
         }
         case T::GetCurrentWeight: {
@@ -347,6 +410,12 @@ void setup() {
         // expires UPLOAD_LIVENESS_MS later and the LED returns to normal.
         g_uploadActiveUntil = millis() + UPLOAD_LIVENESS_MS;
     });
+    g_web.onOtaRequested([]() {
+        // POST /api/ota-run on the scale's own web UI. Defer to the main
+        // loop's OTA path so the HTTP response can finish before we start
+        // pulling firmware over HTTPS.
+        g_pendingOta = true;
+    });
     g_web.begin();                   // register API routes (port 80)
     g_wifi.begin(g_web.server());    // register captive portal routes
     g_web.start();                   // start the config server
@@ -369,6 +438,11 @@ void setup() {
         doc["version"]   = FW_VERSION;
         doc["precision"] = g_scale.params().precision;
         ScaleToConsole::send(ScaleToConsole::Type::ScaleVersion, doc);
+
+        // Force a fresh OtaPending push on every reconnect — the console
+        // doesn't persist the cached state across its own reboots, so a
+        // reconnect (e.g. after a console OTA) needs to re-seed it.
+        g_pendingPushPending = true;
     });
     g_console.onDisconnected([]() {
         Serial.println("[Console] SpoolHard Console disconnected");
@@ -387,6 +461,16 @@ void setup() {
     ConsoleToScale::setRxTap([](const String& frame) {
         g_web.broadcastConsoleFrame("in", frame);
     });
+
+    // SNTP for the OTA checker's last_check_ts (and any future wall-clock
+    // needs). Fires once an interface is up; harmless to call before WiFi
+    // associates.
+    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+
+    // Manifest-driven OTA checker (shared spoolhard_core lib). begin()
+    // only records boot millis; the first network fetch happens once
+    // WiFi is up and the configured interval elapses.
+    g_ota_checker.begin();
 
     Serial.println("[Main] Init complete");
 }
@@ -479,6 +563,15 @@ void loop() {
     // LED (state + flash tick)
     updateLed();
     g_led.update();
+
+    // OTA periodic check (no-op until WiFi is up + interval elapsed).
+    g_ota_checker.update();
+
+    // Push the latest pending state to the console if it changed (or if a
+    // forced push was queued, e.g. on console reconnect). Cheap — peeks
+    // cached fields, no network.
+    pushOtaPendingIfChanged(g_pendingPushPending);
+    g_pendingPushPending = false;
 
     // OTA (triggered by console command or UpdateFirmware message)
     if (g_pendingOta) {

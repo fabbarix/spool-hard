@@ -3,7 +3,7 @@
 #include <AsyncWebSocket.h>
 #include <ArduinoJson.h>
 #include <functional>
-#include "product_signature.h"
+#include "spoolhard/product_signature.h"
 
 class ScaleWebServer {
 public:
@@ -21,6 +21,10 @@ public:
     // onUploadStarted only fires once at index 0, after which updateLed()
     // would otherwise overwrite the amber pulse on the next loop tick.
     void onUploadProgress(std::function<void()> cb) { _onUploadProgress = std::move(cb); }
+    // Fires when the user clicks "Update now" in the scale's own web UI
+    // (POST /api/ota-run). main.cpp wires this to set g_pendingOta so the
+    // OTA flow runs from the main loop, not from inside the HTTP handler.
+    void onOtaRequested(std::function<void()> cb) { _onOtaRequested = std::move(cb); }
     void onTare(std::function<void()> cb) { _onTare = std::move(cb); }
     void onCalibrate(std::function<void(float)> cb) { _onCalibrate = std::move(cb); }
     void onAddCalPoint(std::function<void(float)> cb) { _onAddCalPoint = std::move(cb); }
@@ -53,6 +57,10 @@ private:
     void _handleDeviceName(AsyncWebServerRequest* req);
     void _handleOtaConfigGet(AsyncWebServerRequest* req);
     void _handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    // GET /api/ota-status — pending state + last-check telemetry from the
+    // shared OtaChecker. Same shape as the console's, minus the `console`/
+    // `scale` split (the scale only knows about itself).
+    void _handleOtaStatus(AsyncWebServerRequest* req);
     void _handleReset(AsyncWebServerRequest* req);
     void _handleTestKey(AsyncWebServerRequest* req);
     void _handleFixedKeyConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
@@ -69,6 +77,7 @@ private:
 
     std::function<void(const char*)> _onUploadStarted;
     std::function<void()>            _onUploadProgress;
+    std::function<void()>            _onOtaRequested;
     std::function<void()>            _onTare;
     std::function<void(float)>       _onCalibrate;
     std::function<void(float)>       _onAddCalPoint;

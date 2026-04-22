@@ -1,7 +1,7 @@
 #include "web_server.h"
 #include "config.h"
 #include "display.h"
-#include "ota.h"
+#include "spoolhard/ota.h"
 #include "store.h"
 #include "scale_link.h"
 #include "scale_secrets.h"
@@ -10,6 +10,7 @@
 #include "sdcard.h"
 #include "printer_config.h"
 #include "bambu_manager.h"
+#include "bambu_cloud.h"
 #include "bambu_discovery.h"
 #include "scale_discovery.h"
 #include <Preferences.h>
@@ -41,52 +42,6 @@ void ConsoleWebServer::begin()  {
     _setupRoutes();
 }
 void ConsoleWebServer::start()  { _server.begin(); Serial.println("[WebServer] Listening on :80"); }
-
-// Stream-scan the upload for "SPOOLHARD-VERSION=<v>\x01" planted by
-// product_signature.h. Phase 1 matches the literal prefix one byte at a
-// time; phase 2 captures printable bytes verbatim until the 0x01 sentinel.
-//
-// Important subtlety: the parser's own kPrefix string literal also lives in
-// the uploaded firmware's .rodata (right next to the real marker). The
-// parser will hit it FIRST during a stream scan — followed by a NUL, not a
-// real version. So in capture phase, any non-printable byte before the
-// sentinel means "this wasn't the marker, keep scanning".
-void ConsoleWebServer::VersionMarkerParser::feed(const uint8_t* data, size_t n) {
-    if (parsed) return;
-    static const char   kPrefix[]  = "SPOOLHARD-VERSION=";
-    static const size_t kPrefixLen = sizeof(kPrefix) - 1;  // drop trailing NUL
-    for (size_t i = 0; i < n; ++i) {
-        uint8_t b = data[i];
-        if (!capturing) {
-            if (b == (uint8_t)kPrefix[prefixMatched]) {
-                if (++prefixMatched == kPrefixLen) {
-                    capturing  = true;
-                    versionLen = 0;
-                }
-            } else {
-                prefixMatched = (b == (uint8_t)kPrefix[0]) ? 1 : 0;
-            }
-            continue;
-        }
-        // Capture phase.
-        if (b == 0x01) {
-            version[versionLen] = 0;
-            parsed = true;
-            return;
-        }
-        bool printable = (b >= 0x20 && b <= 0x7E);
-        if (!printable || versionLen + 1 >= sizeof(version)) {
-            // Bogus capture (NUL after the parser's own kPrefix literal,
-            // or runaway length). Abandon this match attempt and resume
-            // prefix scanning from the current byte.
-            capturing     = false;
-            versionLen    = 0;
-            prefixMatched = (b == (uint8_t)kPrefix[0]) ? 1 : 0;
-            continue;
-        }
-        version[versionLen++] = (char)b;
-    }
-}
 
 void ConsoleWebServer::broadcastDebug(const String& type, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
@@ -199,6 +154,32 @@ void ConsoleWebServer::_setupRoutes() {
     _server.on("/api/ota-run", HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (_onOtaRequested) _onOtaRequested();
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
+    // Periodic-check telemetry + manual triggers.
+    _server.on("/api/ota-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        _handleOtaStatus(req);
+    });
+    _server.on("/api/ota-check", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        g_ota_checker.kickNow();
+        // Phase 5: also forward to the paired scale so a single "Check now"
+        // refreshes both products. No-op if the link is down — the cached
+        // OtaPending will be cleared on disconnect anyway.
+        if (_scale) _scale->requestScaleOtaCheck();
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
+    // Phase-5 trigger: tell the paired scale to flash itself NOW using its
+    // stored OtaConfig. Returns 503 if the link is down so the React UI can
+    // surface a clear "scale offline, can't update" message.
+    _server.on("/api/ota-update-scale", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        if (!_scale || !_scale->isConnected()) {
+            req->send(503, "application/json",
+                      "{\"ok\":false,\"error\":\"scale not connected\"}");
+            return;
+        }
+        _scale->requestScaleOtaUpdate();
         req->send(200, "application/json", "{\"ok\":true}");
     });
 
@@ -371,6 +352,37 @@ void ConsoleWebServer::_setupRoutes() {
             _handleScaleSecretPost(req, data, len);
         }
     );
+
+    // ── Bambu Lab cloud auth ────────────────────────────────
+    _server.on("/api/bambu-cloud", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        _handleBambuCloudGet(req);
+    });
+    _server.on("/api/bambu-cloud", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+        _handleBambuCloudClear(req);
+    });
+    _server.on("/api/bambu-cloud/login", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            _handleBambuCloudLogin(req, data, len);
+        }
+    );
+    _server.on("/api/bambu-cloud/login-code", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            _handleBambuCloudLoginCode(req, data, len);
+        }
+    );
+    _server.on("/api/bambu-cloud/login-tfa", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            _handleBambuCloudLoginTfa(req, data, len);
+        }
+    );
+    _server.on("/api/bambu-cloud/token", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            _handleBambuCloudSetToken(req, data, len);
+        }
+    );
+    _server.on("/api/bambu-cloud/verify", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        _handleBambuCloudVerify(req);
+    });
 
     // ── Firmware upload (recovery path) ──────────────────────
     _server.on("/api/upload/firmware", HTTP_POST,
@@ -808,9 +820,11 @@ void ConsoleWebServer::_handleOtaConfigGet(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
     OtaConfig cfg; cfg.load();
     JsonDocument doc;
-    doc["url"]        = cfg.url;
-    doc["use_ssl"]    = cfg.use_ssl;
-    doc["verify_ssl"] = cfg.verify_ssl;
+    doc["url"]               = cfg.url;
+    doc["use_ssl"]           = cfg.use_ssl;
+    doc["verify_ssl"]        = cfg.verify_ssl;
+    doc["check_enabled"]     = cfg.check_enabled;
+    doc["check_interval_h"]  = cfg.check_interval_h;
     String r; serializeJson(doc, r);
     req->send(200, "application/json", r);
 }
@@ -826,14 +840,72 @@ void ConsoleWebServer::_handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t*
     if (doc["url"].is<const char*>())     cfg.url        = doc["url"].as<String>();
     if (doc["use_ssl"].is<bool>())        cfg.use_ssl    = doc["use_ssl"];
     if (doc["verify_ssl"].is<bool>())     cfg.verify_ssl = doc["verify_ssl"];
+    if (doc["check_enabled"].is<bool>())  cfg.check_enabled    = doc["check_enabled"];
+    if (doc["check_interval_h"].is<uint32_t>()) {
+        uint32_t h = doc["check_interval_h"];
+        if (h < kOtaCheckIntervalMin) h = kOtaCheckIntervalMin;
+        if (h > kOtaCheckIntervalMax) h = kOtaCheckIntervalMax;
+        cfg.check_interval_h = h;
+    }
     if (!cfg.use_ssl) cfg.verify_ssl = false;
     cfg.save();
 
     JsonDocument r;
-    r["url"]        = cfg.url;
-    r["use_ssl"]    = cfg.use_ssl;
-    r["verify_ssl"] = cfg.verify_ssl;
+    r["url"]              = cfg.url;
+    r["use_ssl"]          = cfg.use_ssl;
+    r["verify_ssl"]       = cfg.verify_ssl;
+    r["check_enabled"]    = cfg.check_enabled;
+    r["check_interval_h"] = cfg.check_interval_h;
     String s; serializeJson(r, s);
+    req->send(200, "application/json", s);
+}
+
+// Surface what the periodic checker has learned: the timestamp of the
+// last attempt, its tag, the latest-known versions for each component
+// the device tracks, and a pending-updates summary the React side
+// (and later the LCD banner) can render. Doesn't touch the network —
+// it's all in-memory cache from the last check.
+void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    OtaConfig cfg; cfg.load();
+    auto p = g_ota_checker.pending();
+
+    JsonDocument doc;
+    doc["check_enabled"]    = cfg.check_enabled;
+    doc["check_interval_h"] = cfg.check_interval_h;
+    doc["last_check_ts"]    = g_ota_checker.lastCheckTs();
+    doc["last_check_status"] = g_ota_checker.lastStatus();
+    doc["check_in_flight"]  = g_ota_checker.checkInFlight();
+
+    JsonObject console = doc["console"].to<JsonObject>();
+    console["firmware_current"] = p.firmware_current;
+    console["firmware_latest"]  = p.firmware_latest;
+    console["frontend_current"] = p.frontend_current;
+    console["frontend_latest"]  = p.frontend_latest;
+    console["pending"]          = p.firmware || p.frontend;
+
+    // Scale block: cached from the most recent OtaPending frame the scale
+    // pushed. `link == "online"` only when the WS link is up AND we've
+    // received at least one snapshot since connect; "offline" otherwise so
+    // the UI can dim the panel rather than imply there's nothing to update.
+    JsonObject scale = doc["scale"].to<JsonObject>();
+    bool linkUp = _scale && _scale->isConnected();
+    const auto& sop = _scale ? _scale->scaleOtaPending() : ScaleLink::ScaleOtaPending{};
+    if (linkUp && sop.valid) {
+        scale["link"]              = "online";
+        scale["firmware_current"]  = sop.firmware_current;
+        scale["firmware_latest"]   = sop.firmware_latest;
+        scale["frontend_current"]  = sop.frontend_current;
+        scale["frontend_latest"]   = sop.frontend_latest;
+        scale["last_check_ts"]     = sop.last_check_ts;
+        scale["last_check_status"] = sop.last_check_status;
+        scale["pending"]           = sop.firmware_update || sop.frontend_update;
+    } else {
+        scale["link"]    = linkUp ? "waiting" : "offline";
+        scale["pending"] = false;
+    }
+
+    String s; serializeJson(doc, s);
     req->send(200, "application/json", s);
 }
 
@@ -1425,6 +1497,199 @@ void ConsoleWebServer::_handleScaleSecretPost(AsyncWebServerRequest* req, uint8_
     // Ping the link state so the UI's handshake indicator updates immediately
     // without waiting for a reconnect event.
     if (_scale) _scale->pokeHandshake();
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+// ── Bambu Lab cloud auth ─────────────────────────────────────
+
+// Map a step result onto an HTTP response. Same shape regardless of
+// which step triggered it, so the React side has one parser to write.
+//
+// On any non-Ok outcome (including the multi-step branches) the response
+// also carries a `diagnostics` block — request URL, HTTP status, raw
+// response body, collected response headers — so the UI's collapsible
+// "show details" panel can reveal exactly what came back. Skipped on
+// Ok because the response body there contains the access token.
+static void _sendBambuStepResult(AsyncWebServerRequest* req,
+                                 BambuCloudAuth::StepResult res,
+                                 BambuCloudAuth::Region region,
+                                 const String& accountForSave = "") {
+    using S = BambuCloudAuth::StepStatus;
+    JsonDocument doc;
+    int code = 200;
+    switch (res.status) {
+        case S::Ok:
+            doc["status"]  = "ok";
+            doc["message"] = res.message;
+            // Persist on success — the frontend doesn't need to round-trip
+            // the token through itself; if it ever does want to display it
+            // a separate `show_token` flow is gated by auth.
+            g_bambu_cloud.saveToken(res.token, region, accountForSave);
+            break;
+        case S::NeedEmailCode:
+            doc["status"]  = "need_email_code";
+            doc["message"] = res.message;
+            break;
+        case S::NeedTfa:
+            doc["status"]  = "need_tfa";
+            doc["tfa_key"] = res.tfaKey;
+            doc["message"] = res.message;
+            break;
+        case S::InvalidCreds:
+            code = 401;
+            doc["status"]  = "invalid_credentials";
+            doc["message"] = res.message;
+            break;
+        case S::NetworkError:
+            code = 502;
+            doc["status"]  = "network_error";
+            doc["message"] = res.message;
+            break;
+        case S::ServerError:
+        default:
+            code = 502;
+            doc["status"]  = "server_error";
+            doc["message"] = res.message;
+            break;
+    }
+    if (res.status != S::Ok) {
+        JsonObject diag = doc["diagnostics"].to<JsonObject>();
+        diag["request_url"]      = res.requestUrl;
+        diag["http_status"]      = res.httpStatus;
+        diag["response_headers"] = res.responseHeaders;
+        diag["response_body"]    = res.responseBody;
+    }
+    String out; serializeJson(doc, out);
+    req->send(code, "application/json", out);
+}
+
+void ConsoleWebServer::_handleBambuCloudGet(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    JsonDocument doc;
+    bool configured = g_bambu_cloud.haveToken();
+    doc["configured"] = configured;
+    doc["region"]     = BambuCloudAuth::regionToString(g_bambu_cloud.region());
+    doc["email"]      = g_bambu_cloud.email();
+    if (configured) {
+        const String& tok = g_bambu_cloud.token();
+        // Surface the token to the UI so the user can copy it. Auth on
+        // this endpoint is the device's fixed key; if the device is in
+        // open-key (Change-Me!) mode, the token is effectively
+        // accessible to anyone on the LAN — same blast radius as the
+        // OrcaSlicer token file the user would otherwise have on disk.
+        doc["token"]      = tok;
+        // Also pre-compute a short preview for the masked default view.
+        doc["token_preview"] = tok.length() > 12
+            ? tok.substring(0, 6) + "…" + tok.substring(tok.length() - 4)
+            : tok;
+        uint32_t exp = BambuCloudAuth::decodeExpiry(tok);
+        doc["expires_at"] = exp;     // Unix timestamp; 0 = unknown
+    }
+    String out; serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+void ConsoleWebServer::_handleBambuCloudLogin(AsyncWebServerRequest* req,
+                                              uint8_t* data, size_t len) {
+    if (!_requireAuth(req)) return;
+    JsonDocument body;
+    if (deserializeJson(body, data, len)) {
+        req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+        return;
+    }
+    String account  = body["account"]  | "";
+    String password = body["password"] | "";
+    auto region = BambuCloudAuth::regionFromString(body["region"] | "global");
+    if (account.isEmpty() || password.isEmpty()) {
+        req->send(400, "application/json", "{\"error\":\"account+password required\"}");
+        return;
+    }
+    auto res = g_bambu_cloud.loginPassword(account, password, region);
+    _sendBambuStepResult(req, res, region, account);
+}
+
+void ConsoleWebServer::_handleBambuCloudLoginCode(AsyncWebServerRequest* req,
+                                                  uint8_t* data, size_t len) {
+    if (!_requireAuth(req)) return;
+    JsonDocument body;
+    if (deserializeJson(body, data, len)) {
+        req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+        return;
+    }
+    String account = body["account"] | "";
+    String code    = body["code"]    | "";
+    auto region = BambuCloudAuth::regionFromString(body["region"] | "global");
+    if (account.isEmpty() || code.isEmpty()) {
+        req->send(400, "application/json", "{\"error\":\"account+code required\"}");
+        return;
+    }
+    auto res = g_bambu_cloud.loginEmailCode(account, code, region);
+    _sendBambuStepResult(req, res, region, account);
+}
+
+void ConsoleWebServer::_handleBambuCloudLoginTfa(AsyncWebServerRequest* req,
+                                                 uint8_t* data, size_t len) {
+    if (!_requireAuth(req)) return;
+    JsonDocument body;
+    if (deserializeJson(body, data, len)) {
+        req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+        return;
+    }
+    String tfaKey  = body["tfa_key"]  | "";
+    String tfaCode = body["tfa_code"] | "";
+    String account = body["account"]  | "";
+    auto region = BambuCloudAuth::regionFromString(body["region"] | "global");
+    if (tfaKey.isEmpty() || tfaCode.isEmpty()) {
+        req->send(400, "application/json", "{\"error\":\"tfa_key+tfa_code required\"}");
+        return;
+    }
+    auto res = g_bambu_cloud.loginTfa(tfaKey, tfaCode, region);
+    _sendBambuStepResult(req, res, region, account);
+}
+
+void ConsoleWebServer::_handleBambuCloudSetToken(AsyncWebServerRequest* req,
+                                                 uint8_t* data, size_t len) {
+    if (!_requireAuth(req)) return;
+    JsonDocument body;
+    if (deserializeJson(body, data, len)) {
+        req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+        return;
+    }
+    String token = body["token"] | "";
+    String email = body["email"] | "";
+    auto region = BambuCloudAuth::regionFromString(body["region"] | "global");
+    if (token.isEmpty()) {
+        req->send(400, "application/json", "{\"error\":\"token required\"}");
+        return;
+    }
+    // Verify it works before persisting — saves the user a debugging
+    // round-trip when they paste a malformed or expired token.
+    if (!g_bambu_cloud.verifyToken(token, region)) {
+        req->send(401, "application/json",
+                  "{\"status\":\"invalid_credentials\","
+                  "\"message\":\"token rejected by /v1/user-service/my/profile\"}");
+        return;
+    }
+    g_bambu_cloud.saveToken(token, region, email);
+    req->send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void ConsoleWebServer::_handleBambuCloudVerify(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    if (!g_bambu_cloud.haveToken()) {
+        req->send(404, "application/json", "{\"error\":\"no token stored\"}");
+        return;
+    }
+    bool ok = g_bambu_cloud.verifyToken(g_bambu_cloud.token(), g_bambu_cloud.region());
+    JsonDocument doc;
+    doc["valid"] = ok;
+    String out; serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+void ConsoleWebServer::_handleBambuCloudClear(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    g_bambu_cloud.clearToken();
     req->send(200, "application/json", "{\"ok\":true}");
 }
 

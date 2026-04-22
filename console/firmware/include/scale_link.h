@@ -111,6 +111,35 @@ public:
     void pushGcodeAnalysis(const String& printer_serial, float total_grams,
                            const JsonDocument& tools);
 
+    // ── Scale-side OTA state (Phase 5) ──────────────────────────
+    //
+    // Cached snapshot of the most recent OtaPending frame the scale pushed
+    // (on console-connect and whenever its pending-state changes). The
+    // console folds this into /api/ota-status so the React UI shows
+    // console + scale in one combined banner without polling the scale.
+    struct ScaleOtaPending {
+        bool     valid = false;        // false until the scale has pushed
+        String   firmware_current;
+        String   firmware_latest;
+        String   frontend_current;
+        String   frontend_latest;
+        bool     firmware_update = false;
+        bool     frontend_update = false;
+        uint32_t last_check_ts   = 0;
+        String   last_check_status;
+        // millis() at which we received the cached snapshot — UI can use
+        // this to fade the panel if the link has been down for too long.
+        uint32_t received_ms     = 0;
+    };
+    const ScaleOtaPending& scaleOtaPending() const { return _scaleOta; }
+
+    // Tell the scale to flash itself NOW using its stored OtaConfig. Maps
+    // to ConsoleToScale::RunOtaUpdate. Drops silently if the link is down.
+    void requestScaleOtaUpdate();
+    // Tell the scale to refresh its manifest immediately. Maps to
+    // ConsoleToScale::CheckOtaUpdates. Drops silently if down.
+    void requestScaleOtaCheck();
+
 private:
     // SSDP discovery comes from the shared g_ssdp_1990 hub — we don't own
     // our own AsyncUDP socket because AsyncUDP can't multiplex two listeners
@@ -148,6 +177,10 @@ private:
     TagCb      _onTag;
     VoidCb     _onButton;
     HandshakeCb _onHandshake;
+
+    // Cached scale-side OTA state — populated by _dispatch on every
+    // OtaPending frame.
+    ScaleOtaPending _scaleOta;
 
     void _connect();
     void _onWsEvent(WStype_t type, uint8_t* payload, size_t length);

@@ -53,6 +53,11 @@ spoolhard/
   shared/
     frontend/          @spoolhard/ui workspace package (Button, StatCard,
                        StatusDot, SubTabBar, LoginPage, AuthProvider, theme tokens, …)
+    firmware/
+      spoolhard_core/  PlatformIO local library used by both products:
+                       manifest-driven OTA, product-signature matcher,
+                       firmware-version marker. Pulled in via
+                       `lib_extra_dirs = ../../shared/firmware`.
 
   flasher/             Browser-based USB flasher (Vite + React + esp-web-tools)
                        — fetches the latest GitHub release and writes both

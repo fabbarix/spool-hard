@@ -4,7 +4,8 @@
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <functional>
-#include "product_signature.h"
+#include "spoolhard/product_signature.h"
+#include "spoolhard/version_marker.h"
 
 class SpoolStore;
 class ScaleLink;
@@ -47,31 +48,6 @@ private:
     bool _uploadAccepted = false;
     const char* _uploadRejectReason = "no upload";  // pointer to literal, never freed
 
-    // Streaming scanner for the firmware-version marker planted by
-    // product_signature.h: "SPOOLHARD-VERSION=<v>\x01" lives in .rodata
-    // somewhere in the binary. We can't use esp_app_desc_t.version (file
-    // offset 48) — the precompiled arduino-esp32 framework writes its own
-    // IDF build string into that slot at framework build time, so the
-    // project's FW_VERSION never lands there. We also can't post-process
-    // the .bin (esp-image SHA256 covers the whole binary), so a string
-    // marker scanned at upload time is the cleanest route.
-    struct VersionMarkerParser {
-        // Two-phase state machine: first match the fixed prefix (KMP-style
-        // partial-index, same shape as ProductSignatureMatcher), then once
-        // the prefix is in we capture bytes verbatim until we see the
-        // 0x01 sentinel — that's the version string.
-        size_t  prefixMatched = 0;
-        bool    capturing     = false;
-        bool    parsed        = false;
-        char    version[33]   = {0};
-        size_t  versionLen    = 0;
-
-        void reset() {
-            prefixMatched = 0; capturing = false; parsed = false;
-            version[0] = 0; versionLen = 0;
-        }
-        void feed(const uint8_t* data, size_t n);
-    };
     VersionMarkerParser _uploadVersion;
 
     // Progress reporting throttle — only fire the callback when the percent
@@ -96,6 +72,7 @@ private:
     void _handleDeviceName(AsyncWebServerRequest* req);
     void _handleOtaConfigGet(AsyncWebServerRequest* req);
     void _handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleOtaStatus(AsyncWebServerRequest* req);
     void _handleReset(AsyncWebServerRequest* req);
     void _handleTestKey(AsyncWebServerRequest* req);
     void _handleFixedKeyConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
@@ -122,6 +99,19 @@ private:
     void _handleDisplayConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handlePrinterAmsMappingPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handlePrinterFtpDebug(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+
+    // Bambu Lab cloud authentication. The login flow is multi-step
+    // (password → optional email-code or TFA → token), so each step
+    // is its own POST. The frontend tracks the in-progress session
+    // and supplies whatever the previous step returned (account /
+    // tfaKey) on the next call.
+    void _handleBambuCloudGet(AsyncWebServerRequest* req);
+    void _handleBambuCloudLogin(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleBambuCloudLoginCode(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleBambuCloudLoginTfa(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleBambuCloudSetToken(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleBambuCloudVerify(AsyncWebServerRequest* req);
+    void _handleBambuCloudClear(AsyncWebServerRequest* req);
 
     // Core-weights + quick-weights (used by the new-spool wizard).
     void _handleCoreWeightsGet(AsyncWebServerRequest* req);

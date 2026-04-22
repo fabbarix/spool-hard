@@ -8,6 +8,35 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.2.5] - 2026-04-22
+
+OTA overhaul + shared firmware library.
+
+- New `shared/firmware/spoolhard_core/` PlatformIO library carries the
+  manifest-driven OTA module (scheduled checker, sha256-verified
+  firmware+frontend update, semver compare), the product-signature
+  matcher, and the firmware-version marker parser. Both products link
+  it via `lib_extra_dirs`; per-product identity (PRODUCT_ID, PRODUCT_NAME,
+  OTA_DEFAULT_URL) now travels in `platformio.ini` build_flags so the
+  library has no dependency on a per-product `config.h`.
+- Scale gets full OTA parity with the console: scheduled manifest
+  checker, NVS-backed `check_enabled` / `check_interval_h`, last-check
+  telemetry, "Check now" + "Update now" buttons, single-product status
+  panel.
+- Scale ↔ console wire protocol gains three messages: `OtaPending`
+  (scale pushes its pending state on connect / on change),
+  `RunOtaUpdate` and `CheckOtaUpdates` (console-driven triggers). The
+  console caches the scale's state and folds it into `/api/ota-status`
+  so the React UI shows console + scale in one combined banner with
+  per-product "Update now" buttons.
+- OTA settings UI: toggles + interval picker collapsed onto a single
+  row to save vertical space; auto-saves on every change (no Save
+  button) — same behaviour on console and scale.
+- New Bambu Cloud authentication section on the console (in progress —
+  Cloudflare WAF blocks the ESP32's mbedTLS fingerprint on direct
+  login, so the shipped path is manual token paste; full step-by-step
+  diagnostics surface the raw response when a step fails).
+
 ## [0.2.3] - 2026-04-22
 
 CI build fix. v0.2.2's release workflow failed at the console build step

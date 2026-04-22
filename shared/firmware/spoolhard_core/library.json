@@ -1,0 +1,10 @@
+{
+  "name": "spoolhard_core",
+  "version": "0.1.0",
+  "description": "Shared firmware code for SpoolHard console + scale: manifest-driven OTA updater, version-marker parser, product-signature matcher, and small wrappers (NTP, etc.). Built once, linked into both products via lib_extra_dirs.",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "build": {
+    "includeDir": "include"
+  }
+}

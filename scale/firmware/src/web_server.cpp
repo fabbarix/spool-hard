@@ -1,6 +1,6 @@
 #include "web_server.h"
 #include "config.h"
-#include "ota.h"
+#include "spoolhard/ota.h"
 #include "load_cell.h"
 #include "console_channel.h"
 #include <Preferences.h>
@@ -163,6 +163,22 @@ void ScaleWebServer::_setupRoutes() {
             _handleOtaConfigPost(req, data, len);
         }
     );
+    // Periodic-check telemetry + manual triggers (Phase 4 parity with the
+    // console UI). Same surface, single-product payload — the scale's UI
+    // only ever flashes the scale itself.
+    _server.on("/api/ota-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        _handleOtaStatus(req);
+    });
+    _server.on("/api/ota-check", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        g_ota_checker.kickNow();
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
+    _server.on("/api/ota-run", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        if (_onOtaRequested) _onOtaRequested();
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
 
     _server.on("/api/restart", HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
@@ -502,9 +518,11 @@ void ScaleWebServer::_handleOtaConfigGet(AsyncWebServerRequest* req) {
     cfg.load();
 
     JsonDocument doc;
-    doc["url"]        = cfg.url;
-    doc["use_ssl"]    = cfg.use_ssl;
-    doc["verify_ssl"] = cfg.verify_ssl;
+    doc["url"]              = cfg.url;
+    doc["use_ssl"]          = cfg.use_ssl;
+    doc["verify_ssl"]       = cfg.verify_ssl;
+    doc["check_enabled"]    = cfg.check_enabled;
+    doc["check_interval_h"] = cfg.check_interval_h;
     String resp;
     serializeJson(doc, resp);
     req->send(200, "application/json", resp);
@@ -521,20 +539,55 @@ void ScaleWebServer::_handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t* d
     OtaConfig cfg;
     cfg.load();
 
-    if (doc["url"].is<const char*>())    cfg.url        = doc["url"].as<String>();
-    if (doc["use_ssl"].is<bool>())       cfg.use_ssl    = doc["use_ssl"];
-    if (doc["verify_ssl"].is<bool>())    cfg.verify_ssl = doc["verify_ssl"];
+    if (doc["url"].is<const char*>())     cfg.url        = doc["url"].as<String>();
+    if (doc["use_ssl"].is<bool>())        cfg.use_ssl    = doc["use_ssl"];
+    if (doc["verify_ssl"].is<bool>())     cfg.verify_ssl = doc["verify_ssl"];
     if (!cfg.use_ssl) cfg.verify_ssl = false;
+    if (doc["check_enabled"].is<bool>())  cfg.check_enabled    = doc["check_enabled"];
+    if (doc["check_interval_h"].is<uint32_t>() || doc["check_interval_h"].is<int>()) {
+        uint32_t h = doc["check_interval_h"].as<uint32_t>();
+        if (h < kOtaCheckIntervalMin) h = kOtaCheckIntervalMin;
+        if (h > kOtaCheckIntervalMax) h = kOtaCheckIntervalMax;
+        cfg.check_interval_h = h;
+    }
 
     cfg.save();
 
     JsonDocument resp_doc;
-    resp_doc["url"]        = cfg.url;
-    resp_doc["use_ssl"]    = cfg.use_ssl;
-    resp_doc["verify_ssl"] = cfg.verify_ssl;
+    resp_doc["url"]              = cfg.url;
+    resp_doc["use_ssl"]          = cfg.use_ssl;
+    resp_doc["verify_ssl"]       = cfg.verify_ssl;
+    resp_doc["check_enabled"]    = cfg.check_enabled;
+    resp_doc["check_interval_h"] = cfg.check_interval_h;
     String resp;
     serializeJson(resp_doc, resp);
     req->send(200, "application/json", resp);
+}
+
+void ScaleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    OtaConfig cfg; cfg.load();
+    auto p = g_ota_checker.pending();
+
+    JsonDocument doc;
+    doc["check_enabled"]     = cfg.check_enabled;
+    doc["check_interval_h"]  = cfg.check_interval_h;
+    doc["last_check_ts"]     = g_ota_checker.lastCheckTs();
+    doc["last_check_status"] = g_ota_checker.lastStatus();
+    doc["check_in_flight"]   = g_ota_checker.checkInFlight();
+
+    // Single-product shape — the scale only knows about itself. Mirrors
+    // the `console` block on the console firmware so a future shared hook
+    // could read either side with the same parser.
+    JsonObject scale = doc["scale"].to<JsonObject>();
+    scale["firmware_current"] = p.firmware_current;
+    scale["firmware_latest"]  = p.firmware_latest;
+    scale["frontend_current"] = p.frontend_current;
+    scale["frontend_latest"]  = p.frontend_latest;
+    scale["pending"]          = p.firmware || p.frontend;
+
+    String s; serializeJson(doc, s);
+    req->send(200, "application/json", s);
 }
 
 void ScaleWebServer::_handleReset(AsyncWebServerRequest* req) {

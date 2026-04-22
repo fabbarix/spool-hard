@@ -1,6 +1,5 @@
 #pragma once
 #include <Arduino.h>
-#include "config.h"   // defines PRODUCT_ID
 
 // Product-signature handling for firmware and frontend (SPIFFS) uploads.
 //
@@ -10,19 +9,22 @@
 //
 //     "SPOOLHARD-PRODUCT=<product-id>"
 //
-// where <product-id> is `PRODUCT_ID` from config.h. For firmware, the C++
-// constant `__spoolhard_product_signature` below places the string into
-// `.rodata`; `__attribute__((used))` stops LTO from stripping it. For SPIFFS,
-// the frontend pre-build script writes a `product.txt` file with the same
-// string into the data/ directory, so the raw filesystem image contains the
-// bytes verbatim.
+// where <product-id> is the consumer's `PRODUCT_ID` build-flag macro
+// (set in each product's platformio.ini build_flags so the shared lib
+// can be built standalone — no per-product config.h on the include
+// path). For firmware, the C++ constant below places the string into
+// `.rodata`; `__attribute__((used))` stops LTO from stripping it. For
+// SPIFFS, the build_frontend.py pre-script writes the same string as
+// a `.spoolhard-product` file into the data/ directory, so the raw
+// filesystem image contains the bytes verbatim.
 //
-// The check is a streaming substring match: each upload chunk is fed through
-// a KMP-style matcher *before* the bytes hit `Update.write()`. If the last
-// chunk arrives and the signature never appeared, the Update is aborted.
+// The check is a streaming substring match: each upload chunk is fed
+// through the KMP-ish matcher below *before* the bytes hit
+// `Update.write()`. If the last chunk arrives and the signature never
+// appeared, the Update is aborted.
 
 #ifndef PRODUCT_ID
-  #error "PRODUCT_ID must be defined in config.h (e.g. \"spoolscale\" or \"console\")"
+  #error "PRODUCT_ID must be set in the consumer's platformio.ini build_flags (e.g. -DPRODUCT_ID=\\\"console\\\")"
 #endif
 
 #define SPOOLHARD_PRODUCT_SIGNATURE "SPOOLHARD-PRODUCT=" PRODUCT_ID
@@ -32,6 +34,20 @@
 // actually land in the built binary even if no C++ code reads them.
 __attribute__((used))
 inline const char __spoolhard_product_signature[] = SPOOLHARD_PRODUCT_SIGNATURE;
+
+// Same trick for the firmware version. We can't rely on the embedded
+// esp_app_desc_t.version field — the precompiled arduino-esp32 framework
+// bakes its own IDF build string into that slot at framework build time
+// and FW_VERSION never lands there. So we plant our own marker that the
+// upload-side parser scans for. The trailing '\x01' is a sentinel that
+// lets the matcher know where the version string ends without having to
+// know its length in advance (FW_VERSION grows as we cut releases).
+//
+// The macro lives here, but the *definition* of the marker bytes is in
+// web_server.cpp so it gets a real (non-inline) symbol and a code-path
+// reference — `inline const char[] __attribute__((used))` was being
+// dropped by --gc-sections regardless of the `used` attribute.
+#define SPOOLHARD_VERSION_MARKER "SPOOLHARD-VERSION=" FW_VERSION "\x01"
 
 // Stream-matches a fixed pattern against a sequence of bytes arriving in
 // arbitrary chunks. One matcher instance per upload session.

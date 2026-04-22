@@ -14,6 +14,26 @@ export interface OtaConfig {
   url: string;
   use_ssl: boolean;
   verify_ssl: boolean;
+  check_enabled: boolean;
+  check_interval_h: number;   // 1 / 6 / 24 / 168
+}
+
+// /api/ota-status — single-product payload from the scale's OtaChecker.
+// Mirrors the console's `console` block but with no peer to aggregate.
+export interface OtaPendingT {
+  firmware_current: string;
+  firmware_latest: string;
+  frontend_current: string;
+  frontend_latest: string;
+  pending: boolean;
+}
+export interface OtaStatus {
+  check_enabled: boolean;
+  check_interval_h: number;
+  last_check_ts: number;
+  last_check_status: string;
+  check_in_flight: boolean;
+  scale: OtaPendingT;
 }
 
 export interface SecurityKeyStatus {

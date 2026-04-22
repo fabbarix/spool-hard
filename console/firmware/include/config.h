@@ -1,14 +1,13 @@
 #pragma once
 
 // ── Product identity ─────────────────────────────────────────
-// Stamped into every built image via product_signature.h so the upload
-// handler can reject a sibling product's firmware/frontend bundle.
-#define PRODUCT_ID   "console"
-#define PRODUCT_NAME "SpoolHard Console"
-
-// ── Firmware / frontend versions ────────────────────────────
-// Populated from console/VERSION at build time by scripts/patch_version.py.
-// The fallbacks below only fire if the pre-script didn't run (ad-hoc build).
+// PRODUCT_ID, PRODUCT_NAME and OTA_DEFAULT_URL are now set in
+// platformio.ini build_flags so the shared spoolhard_core library
+// (which doesn't see this header) can pick them up via -D macros.
+//
+// FW_VERSION / FE_VERSION are stamped in at build time by
+// scripts/patch_version.py from the project's VERSION file. The
+// fallbacks below only fire if the pre-script didn't run.
 #ifndef FW_VERSION
   #define FW_VERSION "dev"
 #endif
@@ -50,10 +49,9 @@
 #define NVS_KEY_FIXED_KEY    "fixed_key"
 #define DEFAULT_FIXED_KEY    "Change-Me!"
 
-#define NVS_NS_OTA           "ota_cfg"
-#define NVS_KEY_OTA_URL      "url"
-#define NVS_KEY_OTA_USE_SSL  "use_ssl"
-#define NVS_KEY_OTA_VERIFY   "verify_ssl"
+// OTA persistence (namespace + keys) is owned by spoolhard_core/src/ota.cpp
+// — see the local-namespace constants there. Both products use the same
+// schema; the macros are not duplicated here to avoid drift.
 
 // Scale link: the peer scale we pair with.
 #define NVS_NS_SCALE         "scale_cfg"
@@ -87,13 +85,17 @@
 // Generic misc settings.
 #define NVS_NS_STORE         "store_cfg"
 
-// ── OTA default URL ─────────────────────────────────────────
-// Default OTA pull URL. Points directly at the firmware.bin asset of
-// the latest GitHub Release of fabbarix/spool-hard. The device-side OTA
-// flow currently fetches a single .bin; manifest-driven discovery (see
-// docs/GITHUB_OTA_PLAN.md) will swap this for the manifest URL once
-// implemented. Override per-device via Config → OTA URL on the web UI.
-#define OTA_DEFAULT_URL   "https://github.com/fabbarix/spool-hard/releases/latest/download/spoolhard-console-firmware.bin"
+// ── Bambu Lab Cloud ─────────────────────────────────────────
+// Bearer token for the Bambu Lab cloud API (api.bambulab.com /
+// api.bambulab.cn). Stored verbatim — JWTs hold their own expiry in the
+// `exp` payload claim, which the firmware decodes for the UI without
+// needing a server-side timestamp. `region` is "global" or "china".
+// `email` is kept only as a UX label so the user knows which account
+// the stored token belongs to; it isn't required for any API call.
+#define NVS_NS_BAMBU_CLOUD   "bambu_cloud"
+#define NVS_KEY_BC_TOKEN     "token"
+#define NVS_KEY_BC_REGION    "region"
+#define NVS_KEY_BC_EMAIL     "email"
 
 // ── LittleFS (user data partition) ──────────────────────────
 #define USERFS_LABEL         "userfs"

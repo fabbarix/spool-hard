@@ -14,9 +14,10 @@
 #include "ui/ui.h"
 #include "ui/ui_wizard.h"
 #include "protocol.h"
-#include "ota.h"
+#include "spoolhard/ota.h"
 #include "sdcard.h"
 #include "bambu_manager.h"
+#include "bambu_cloud.h"
 #include "bambu_discovery.h"
 #include "core_weights.h"
 #include "pending_ams.h"
@@ -138,6 +139,12 @@ void setup() {
     }
     g_sd.begin();
     g_bambu.begin();
+    g_bambu_cloud.begin();
+    // SNTP — gives the OTA checker a real wall-clock for "last
+    // checked at …" timestamps. Falls back to 0 if WiFi isn't up
+    // yet; the checker handles that.
+    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    g_ota_checker.begin();
     // g_bambu_discovery starts after WiFi is initialised (see below).
 
     // Display + LVGL (task is pinned to Core 1 inside begin()).
@@ -720,6 +727,7 @@ void loop() {
     LAT_STEP("bambu",           g_bambu.update());
     LAT_STEP("bambu_discovery", g_bambu_discovery.update());
     LAT_STEP("scale_discovery", g_scale_discovery.update());
+    LAT_STEP("ota_check",       g_ota_checker.update());
 
     // Once per second, rebuild the home-screen AMS tile strip from whichever
     // printer is currently connected. Cheap in absolute terms but not so

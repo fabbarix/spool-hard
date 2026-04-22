@@ -24,6 +24,13 @@ namespace ScaleToConsole {
         PN532Status,
         ScaleVersion,
         OtaProgressUpdate,
+        // Scale's view of what (if anything) needs updating. Struct variant:
+        // {"OtaPending": {firmware_current, firmware_latest, frontend_current,
+        //   frontend_latest, firmware_update, frontend_update,
+        //   last_check_ts, last_check_status}}.
+        // Cached server-side and folded into /api/ota-status so the React UI
+        // can render console + scale in one combined banner.
+        OtaPending,
         Term,
         // Reply to ConsoleToScale::GetCurrentWeight. Struct variant:
         //   {"CurrentWeight": {"weight_g": 1234, "state": "StableLoad"}}
@@ -60,6 +67,11 @@ namespace ConsoleToScale {
         UpdateFirmware,        // {"UpdateFirmware": {...}}
         TagsInStore,           // {"TagsInStore": {"tags"}}
         GetCurrentWeight,      // "GetCurrentWeight"  — scale replies with CurrentWeight
+        // Phase-5 OTA orchestration. Both unit variants — the scale uses
+        // its own stored OtaConfig (manifest URL, ssl flags) so we don't
+        // have to know per-device settings.
+        RunOtaUpdate,          // "RunOtaUpdate"   — flash now using stored config
+        CheckOtaUpdates,       // "CheckOtaUpdates" — kick the manifest checker now
     };
 
     // Build a wire frame for the given message. Callers feed the resulting

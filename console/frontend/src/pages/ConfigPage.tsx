@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Cpu, Scale, Printer, Shield, Wrench, Bug } from 'lucide-react';
+import { Cpu, Scale, Printer, Shield, Wrench, Bug, Cloud } from 'lucide-react';
 import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
 import { WifiSection } from '../components/config/WifiSection';
 import { DeviceNameSection } from '../components/config/DeviceNameSection';
@@ -12,14 +12,16 @@ import { DeviceControlSection } from '../components/config/DeviceControlSection'
 import { DisplaySection } from '../components/config/DisplaySection';
 import { QuickWeightsSection } from '../components/config/QuickWeightsSection';
 import { FilamentsDbSection } from '../components/config/FilamentsDbSection';
+import { BambuCloudSection } from '../components/config/BambuCloudSection';
 import { DebugSection } from '../components/config/DebugSection';
 
-type ConfigTab = 'setup' | 'scale' | 'printers' | 'security' | 'device' | 'debug';
+type ConfigTab = 'setup' | 'scale' | 'printers' | 'cloud' | 'security' | 'device' | 'debug';
 
 const tabs: SubTab<ConfigTab>[] = [
   { id: 'setup',    label: 'Setup',    icon: <Cpu size={14} /> },
   { id: 'scale',    label: 'Scale',    icon: <Scale size={14} /> },
   { id: 'printers', label: 'Printers', icon: <Printer size={14} /> },
+  { id: 'cloud',    label: 'BambuLab Cloud', icon: <Cloud size={14} /> },
   { id: 'security', label: 'Security', icon: <Shield size={14} /> },
   { id: 'device',   label: 'Device',   icon: <Wrench size={14} /> },
   { id: 'debug',    label: 'Debug',    icon: <Bug size={14} /> },
@@ -69,6 +71,8 @@ export function ConfigPage() {
         )}
 
         {activeTab === 'printers' && <PrintersSection />}
+
+        {activeTab === 'cloud' && <BambuCloudSection />}
 
         {activeTab === 'security' && <SecurityKeySection />}
 

@@ -185,6 +185,10 @@ void ScaleLink::_markDisconnected(const char* reason) {
     if (!_connected) return;
     Serial.printf("[ScaleLink] Disconnected (%s)\n", reason);
     _connected = false;
+    // Drop the cached OtaPending — once the link is down we have no idea
+    // whether the scale's pending state has shifted, so the UI should
+    // fall back to "unknown" rather than show stale latest-version data.
+    _scaleOta = ScaleOtaPending{};
     if (_onDisconnect) _onDisconnect();
     _refreshHandshakeState();
 }
@@ -284,6 +288,31 @@ void ScaleLink::_dispatch(const ScaleToConsole::Message& msg) {
             _recordEvent("button", "pressed");
             if (_onButton) _onButton();
             break;
+        case T::OtaPending: {
+            // Phase-5 push from the scale: cache the snapshot so the
+            // console's /api/ota-status can serve it as the "scale" block.
+            _scaleOta.valid             = true;
+            _scaleOta.firmware_current  = msg.doc["firmware_current"]  | "";
+            _scaleOta.firmware_latest   = msg.doc["firmware_latest"]   | "";
+            _scaleOta.frontend_current  = msg.doc["frontend_current"]  | "";
+            _scaleOta.frontend_latest   = msg.doc["frontend_latest"]   | "";
+            _scaleOta.firmware_update   = msg.doc["firmware_update"]   | false;
+            _scaleOta.frontend_update   = msg.doc["frontend_update"]   | false;
+            _scaleOta.last_check_ts     = msg.doc["last_check_ts"]     | 0u;
+            _scaleOta.last_check_status = msg.doc["last_check_status"] | "";
+            _scaleOta.received_ms       = millis();
+            Serial.printf("[ScaleLink] OtaPending: fw %s→%s (%s) fe %s→%s (%s)\n",
+                _scaleOta.firmware_current.c_str(),
+                _scaleOta.firmware_latest.c_str(),
+                _scaleOta.firmware_update ? "update" : "ok",
+                _scaleOta.frontend_current.c_str(),
+                _scaleOta.frontend_latest.c_str(),
+                _scaleOta.frontend_update ? "update" : "ok");
+            _recordEvent("ota", _scaleOta.firmware_update || _scaleOta.frontend_update
+                                   ? "update available"
+                                   : "up to date");
+            break;
+        }
         case T::ScaleVersion: {
             const char* v = msg.doc["version"] | "";
             // The scale also includes its current display-precision here so
@@ -363,6 +392,22 @@ void ScaleLink::requestCurrentWeight() {
 
 void ScaleLink::sendButtonResponse(bool ok) {
     _send(ConsoleToScale::buildTuple(ConsoleToScale::Type::ButtonResponse, ok));
+}
+
+void ScaleLink::requestScaleOtaUpdate() {
+    if (!_connected) {
+        Serial.println("[ScaleLink] requestScaleOtaUpdate: not connected, dropping");
+        return;
+    }
+    _send(ConsoleToScale::build(ConsoleToScale::Type::RunOtaUpdate));
+}
+
+void ScaleLink::requestScaleOtaCheck() {
+    if (!_connected) {
+        Serial.println("[ScaleLink] requestScaleOtaCheck: not connected, dropping");
+        return;
+    }
+    _send(ConsoleToScale::build(ConsoleToScale::Type::CheckOtaUpdates));
 }
 
 void ScaleLink::pushGcodeAnalysis(const String& printer_serial, float total_grams,

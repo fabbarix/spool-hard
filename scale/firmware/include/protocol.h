@@ -26,6 +26,14 @@ namespace ScaleToConsole {
         PN532Status,
         ScaleVersion,
         OtaProgressUpdate,
+        // Scale's view of what (if anything) needs updating, pushed up to
+        // the console so its combined banner can show a single update list.
+        // Struct variant: {"OtaPending": {firmware_current, firmware_latest,
+        // frontend_current, frontend_latest, firmware_update (bool),
+        // frontend_update (bool), last_check_ts (epoch), last_check_status}}.
+        // Pushed once on console-connect and again whenever the pending
+        // state changes (so the console doesn't have to poll us).
+        OtaPending,
         Term,
         // Reply to ConsoleToScale::GetCurrentWeight. Struct variant:
         //   {"CurrentWeight": {"weight_g": 1234, "state": "StableLoad"}}
@@ -58,6 +66,11 @@ namespace ConsoleToScale {
         UpdateFirmware,        // {"UpdateFirmware": {...}}        (encrypted)
         TagsInStore,           // {"TagsInStore": {"tags"}}
         GetCurrentWeight,      // "GetCurrentWeight"  — on-demand read, scale replies with CurrentWeight
+        // Phase-5 OTA orchestration. Both unit variants — the scale uses
+        // its own stored OtaConfig (manifest URL, ssl flags) so the
+        // console doesn't have to know per-device settings.
+        RunOtaUpdate,          // "RunOtaUpdate"   — flash now using stored config
+        CheckOtaUpdates,       // "CheckOtaUpdates" — kick the manifest checker now
     };
 
     struct Message {
