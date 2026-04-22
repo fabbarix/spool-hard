@@ -1,8 +1,14 @@
 name: Deploy flasher to GitHub Pages
 
 # Runs on every push to main that touches the flasher (or its shared
-# dependencies) and on each tagged release. Manual dispatch is also
-# allowed for re-deploys without a code change.
+# dependencies). Tag pushes deliberately don't trigger this — the page
+# fetches the latest release at runtime via the GitHub API, so a tag
+# bump that only changes VERSION/CHANGELOG doesn't change what the
+# flasher serves; the corresponding main commit already triggered a
+# rebuild if the flasher source itself changed. Tag triggers also
+# collide with the github-pages environment's default protection rules
+# (which restrict deployments to the default branch). Manual dispatch
+# is available for re-deploys without a source change.
 on:
   push:
     branches: [main]
@@ -10,8 +16,6 @@ on:
       - 'flasher/**'
       - 'shared/frontend/**'
       - '.github/workflows/deploy-flasher.yml'
-    tags:
-      - 'v*'
   workflow_dispatch:
 
 # Pages deployment needs id-token for the OIDC handshake and pages: write
