@@ -13,12 +13,17 @@ export interface OtaConfigT {
 // is populated from the cached OtaPending frame the scale pushes over
 // the WS link (Phase 5). When the link is down, only `link` and
 // `pending: false` are present.
+export interface OtaInProgressT {
+  kind: 'firmware' | 'frontend' | '';
+  percent: number;
+}
 export interface OtaPendingProductT {
   firmware_current: string;
   firmware_latest: string;
   frontend_current: string;
   frontend_latest: string;
   pending: boolean;
+  in_progress?: OtaInProgressT;
 }
 export type ScaleLinkState = 'online' | 'waiting' | 'offline';
 export interface OtaStatusScaleT extends Partial<OtaPendingProductT> {
@@ -26,6 +31,7 @@ export interface OtaStatusScaleT extends Partial<OtaPendingProductT> {
   pending: boolean;
   last_check_ts?: number;
   last_check_status?: string;
+  in_progress?: OtaInProgressT;
 }
 export interface OtaStatusT {
   check_enabled: boolean;
@@ -65,11 +71,18 @@ export function useSetOtaConfig() {
 
 // Periodic-check telemetry. Polled every 5 s while the page is open
 // so the in-flight indicator and the post-check status flip live.
-export function useOtaStatus() {
+// Faster polling kicks in while an update is running so the percent +
+// reboot detection feel responsive.
+export function useOtaStatus(opts: { fast?: boolean } = {}) {
   return useQuery<OtaStatusT>({
     queryKey: STATUS_KEY,
     queryFn: () => fetch('/api/ota-status').then((r) => r.json()),
-    refetchInterval: 5000,
+    refetchInterval: opts.fast ? 2000 : 5000,
+    // While the device is rebooting mid-update the request fails. React
+    // Query's default `retry: 3 + exponential backoff` would mask the
+    // gap; turning it off makes failure surface immediately so the UI
+    // can render a "Rebooting…" indicator.
+    retry: false,
   });
 }
 

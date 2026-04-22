@@ -581,13 +581,26 @@ void loop() {
         OtaConfig cfg;
         cfg.load();
 
+        // Seed the in-flight tracker so /api/ota-status can surface a
+        // "preparing…" state even before the first manifest fetch returns
+        // a percent. Cleared by otaRun's progress callback as soon as it
+        // ticks for real.
+        g_ota_in_flight = { true, "firmware", 0, millis() };
+
         JsonDocument prog_doc;
+        prog_doc["kind"]    = "firmware";
         prog_doc["percent"] = 0;
         ScaleToConsole::send(ScaleToConsole::Type::OtaProgressUpdate, prog_doc);
 
-        otaRun(cfg, [](int pct) {
+        otaRun(cfg, [](OtaProgress p) {
+            const char* kind =
+                p.kind == OtaProgress::Kind::Frontend ? "frontend" :
+                p.kind == OtaProgress::Kind::Firmware ? "firmware" :
+                                                        "";
+            g_ota_in_flight = { true, kind, p.percent, g_ota_in_flight.started_ms };
             JsonDocument doc;
-            doc["percent"] = pct;
+            if (*kind) doc["kind"] = kind;
+            doc["percent"] = p.percent;
             ScaleToConsole::send(ScaleToConsole::Type::OtaProgressUpdate, doc);
         });
         // otaRun() reboots on success; if we get here it failed — show the

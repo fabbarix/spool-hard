@@ -53,6 +53,15 @@ static lv_obj_t* s_lbl_state      = nullptr;
 static lv_obj_t* s_led_scale      = nullptr;
 static lv_obj_t* s_lbl_scale_text = nullptr;
 static lv_obj_t* s_lbl_ip         = nullptr;
+
+// OTA "update available" banner: a thin strip across the bottom of the
+// home screen. Hidden by default; populated + shown by ui_set_ota_banner().
+// Tapping fires `s_ota_banner_cb` (registered by main.cpp, which kicks the
+// actual update). The container is what receives clicks; the inner label
+// only carries the text.
+static lv_obj_t*       s_ota_banner       = nullptr;
+static lv_obj_t*       s_ota_banner_label = nullptr;
+static ui_ota_tap_cb_t s_ota_banner_cb    = nullptr;
 // Hostname line is split in two so the WiFi glyph can be coloured by link
 // state (green/yellow/orange/grey) while the name itself stays white.
 static lv_obj_t* s_lbl_wifi_icon  = nullptr;   // coloured WiFi symbol
@@ -321,6 +330,27 @@ static void build_home() {
 
     s_lbl_ip = make_label(s_home, "—", COL_TEXT, &spoolhard_mont_14);
     lv_obj_align(s_lbl_ip, LV_ALIGN_BOTTOM_RIGHT, -12, -6);
+
+    // OTA banner — hidden until main.cpp asks us to show it. Sits across
+    // the bottom of the screen, OVER the footer text (which becomes
+    // less important the moment there's an update to apply). Brand-amber
+    // background so the user can't miss it from across the room.
+    s_ota_banner = lv_obj_create(s_home);
+    lv_obj_set_pos(s_ota_banner, 0, 286);
+    lv_obj_set_size(s_ota_banner, 480, 34);
+    lv_obj_set_style_radius(s_ota_banner, 0, 0);
+    lv_obj_set_style_bg_color(s_ota_banner, COL_BRAND, 0);
+    lv_obj_set_style_bg_opa(s_ota_banner, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_ota_banner, 0, 0);
+    lv_obj_set_style_pad_all(s_ota_banner, 0, 0);
+    lv_obj_add_flag(s_ota_banner, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_ota_banner, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_ota_banner, [](lv_event_t*) {
+        if (s_ota_banner_cb) s_ota_banner_cb();
+    }, LV_EVENT_CLICKED, nullptr);
+
+    s_ota_banner_label = make_label(s_ota_banner, "", COL_BODY, &spoolhard_mont_16);
+    lv_obj_center(s_ota_banner_label);
 }
 
 static void on_spool_btn(lv_event_t* e) {
@@ -541,6 +571,20 @@ void ui_init() {
 void ui_show_splash()     { lv_lock(); lv_screen_load(s_splash);   lv_unlock(); }
 void ui_show_onboarding() { lv_lock(); lv_screen_load(s_onboard);  lv_unlock(); }
 void ui_show_home()       { lv_lock(); lv_screen_load(s_home);     lv_unlock(); }
+
+void ui_set_ota_banner(bool show, const char* text) {
+    if (!s_ota_banner) return;  // build_home hasn't run yet (boot race)
+    lv_lock();
+    if (show) {
+        lv_label_set_text(s_ota_banner_label, text ? text : "Update available — tap to install");
+        lv_obj_clear_flag(s_ota_banner, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_ota_banner, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_unlock();
+}
+
+void ui_set_ota_banner_callback(ui_ota_tap_cb_t cb) { s_ota_banner_cb = cb; }
 
 void ui_set_scale_state(scale_lcd_state_t state, const char* scale_name) {
     lv_lock();

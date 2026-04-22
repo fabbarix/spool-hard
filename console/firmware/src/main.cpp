@@ -124,6 +124,10 @@ static bool captureCurrentWeightForSpool(const String& spool_id) {
     return true;
 }
 
+// Forward-declared — setup() registers the banner tap callback before
+// the helper is defined further down (next to _refreshOtaBanner).
+static void _onOtaBannerTap();
+
 // ── Setup ────────────────────────────────────────────────────
 void setup() {
     Serial.begin(DEBUG_BAUD);
@@ -187,6 +191,7 @@ void setup() {
         ui_show_ota_progress(percent, _otaTitleFor(type), label);
     });
     g_web.onOtaRequested([]() { g_pendingOta = true; });
+    ui_set_ota_banner_callback(_onOtaBannerTap);
     g_web.begin();
     g_wifi.begin(g_web.server());
     g_web.start();
@@ -710,6 +715,57 @@ static void _refreshHomeAmsPanel() {
     ui_set_printer_panel(nullptr);
 }
 
+// Combined OTA-pending banner refresh. Reads the console's own pending
+// state from g_ota_checker plus the cached scale push (g_scale.scaleOtaPending)
+// and reflects either / both on the LCD home screen. Hides the banner when
+// nothing is pending. Cheap — one LVGL call only when the message text
+// actually changed.
+static void _refreshOtaBanner() {
+    auto cp = g_ota_checker.pending();
+    const auto& sp = g_scale.scaleOtaPending();
+    bool consolePending = cp.firmware || cp.frontend;
+    bool scalePending   = sp.valid && (sp.firmware_update || sp.frontend_update);
+
+    static String _lastText;
+    if (!consolePending && !scalePending) {
+        if (!_lastText.isEmpty()) {
+            ui_set_ota_banner(false, nullptr);
+            _lastText = "";
+        }
+        return;
+    }
+
+    String text;
+    if (consolePending && scalePending) {
+        text = "Console " + cp.firmware_latest +
+               " + Scale "  + sp.firmware_latest +
+               " — tap to install";
+    } else if (consolePending) {
+        text = "Console " + cp.firmware_latest + " available — tap to install";
+    } else {
+        text = "Scale "   + sp.firmware_latest + " available — tap to install";
+    }
+    if (text != _lastText) {
+        ui_set_ota_banner(true, text.c_str());
+        _lastText = text;
+    }
+}
+
+// Banner-tap handler — fires on either device that has a pending update.
+// Sets g_pendingOta for the console and forwards RunOtaUpdate to the scale.
+// Both can run together: the scale's update runs in its own task; the
+// console reboots after its own otaRun returns.
+static void _onOtaBannerTap() {
+    auto cp = g_ota_checker.pending();
+    const auto& sp = g_scale.scaleOtaPending();
+    if (sp.valid && (sp.firmware_update || sp.frontend_update)) {
+        g_scale.requestScaleOtaUpdate();
+    }
+    if (cp.firmware || cp.frontend) {
+        g_pendingOta = true;
+    }
+}
+
 // ── Loop ─────────────────────────────────────────────────────
 #define LAT_STEP(name, expr) do {                                        \
     uint32_t __t0 = millis();                                            \
@@ -738,6 +794,7 @@ void loop() {
         _lastAmsRefresh = millis();
         LAT_STEP("ams_panel", _refreshHomeAmsPanel());
         LAT_STEP("home_foot", _refreshHomeFooter());
+        LAT_STEP("ota_banner", _refreshOtaBanner());
     }
     uint32_t __loop_dt = millis() - __loop_t0;
     if (__loop_dt > 100) Serial.printf("[LoopLat] total=%lums\n",
@@ -799,9 +856,24 @@ void loop() {
     if (g_pendingOta) {
         g_pendingOta = false;
         OtaConfig cfg; cfg.load();
+        // Seed the in-flight tracker so /api/ota-status reflects the
+        // "preparing…" phase before otaRun's first progress tick lands.
+        g_ota_in_flight = { true, "firmware", 0, millis() };
         ui_show_ota_progress(0, "Updating Firmware", "firmware");
-        otaRun(cfg, [](int pct) { ui_show_ota_progress(pct, nullptr, nullptr); });
+        otaRun(cfg, [](OtaProgress p) {
+            const char* kind =
+                p.kind == OtaProgress::Kind::Frontend ? "frontend" :
+                p.kind == OtaProgress::Kind::Firmware ? "firmware" :
+                                                        "";
+            g_ota_in_flight = { true, kind, p.percent, g_ota_in_flight.started_ms };
+            const char* title =
+                p.kind == OtaProgress::Kind::Frontend ? "Updating Frontend" :
+                p.kind == OtaProgress::Kind::Firmware ? "Updating Firmware" :
+                                                        nullptr;
+            ui_show_ota_progress(p.percent, title, nullptr);
+        });
         // otaRun() reboots on success; if we return, it failed.
+        g_ota_in_flight = {};
         ui_show_home();
     }
 

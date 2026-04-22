@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react';
-import { Globe, RefreshCw, ArrowUpCircle, Cpu, Scale } from 'lucide-react';
+import { Globe, RefreshCw, ArrowUpCircle, Cpu, Scale, CheckCircle2, AlertCircle } from 'lucide-react';
 import {
   useOtaConfig, useSetOtaConfig, useRunOta, useOtaStatus,
   useOtaCheckNow, useRunOtaScale,
   type OtaStatusScaleT, type OtaPendingProductT, type OtaConfigT,
 } from '../../hooks/useOtaConfig';
+import { useOtaUpdater, type UpdaterDerived } from '../../hooks/useOtaUpdater';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { InputField } from '@spoolhard/ui/components/InputField';
 import { Button } from '@spoolhard/ui/components/Button';
@@ -33,11 +34,12 @@ function statusLabel(s: string): { text: string; tone: 'ok' | 'warn' | 'err' | '
   }
 }
 
-// Per-product row: name, fw current → latest, fe current → latest, optional
-// "Update now" button on the right. Used for both console and scale so the
-// banner reads consistently.
+// Per-product row: name, fw current → latest, fe current → latest, plus
+// either an "Update now" button or an in-progress badge driven by the
+// OtaUpdater hook. Used for both console and scale so the banner reads
+// consistently.
 function ProductRow({
-  icon, label, info, pending, onUpdate, busy,
+  icon, label, info, pending, onUpdate, busy, updater,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -45,7 +47,12 @@ function ProductRow({
   pending: boolean;
   onUpdate?: () => void;
   busy?: boolean;
+  updater?: UpdaterDerived;
 }) {
+  const showButton = pending && onUpdate && (!updater || updater.phase === 'idle');
+  const updating   = updater && updater.phase === 'inflight';
+  const success    = updater && updater.phase === 'success';
+  const failed     = updater && updater.phase === 'failed';
   return (
     <div className="flex items-center justify-between gap-3 flex-wrap">
       <div className="flex items-center gap-2 text-sm">
@@ -68,12 +75,39 @@ function ProductRow({
           <span className="text-text-secondary italic">unavailable</span>
         )}
       </div>
-      {pending && onUpdate && (
-        <Button onClick={onUpdate} disabled={busy}>
-          <ArrowUpCircle size={14} className="inline mr-1" />
-          {busy ? 'Starting…' : 'Update now'}
-        </Button>
-      )}
+      <div className="flex items-center gap-2">
+        {updating && (
+          <div className="flex items-center gap-2 text-xs text-text-secondary min-w-[180px]">
+            <span>{updater!.message}</span>
+            {updater!.percent >= 0 ? (
+              <div className="w-24 h-1.5 bg-border rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-brand-500 transition-[width] duration-500"
+                  style={{ width: `${updater!.percent}%` }}
+                />
+              </div>
+            ) : (
+              <RefreshCw size={12} className="animate-spin text-brand-500" />
+            )}
+          </div>
+        )}
+        {success && (
+          <span className="flex items-center gap-1 text-xs text-teal-400">
+            <CheckCircle2 size={14} /> Updated to {updater!.successVersion}
+          </span>
+        )}
+        {failed && (
+          <span className="flex items-center gap-1 text-xs text-red-400">
+            <AlertCircle size={14} /> {updater!.failureReason}
+          </span>
+        )}
+        {showButton && (
+          <Button onClick={onUpdate} disabled={busy}>
+            <ArrowUpCircle size={14} className="inline mr-1" />
+            {busy ? 'Starting…' : 'Update now'}
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
@@ -90,7 +124,13 @@ function ScaleLinkPill({ link }: { link: OtaStatusScaleT['link'] }) {
 
 export function OtaSection() {
   const cfg     = useOtaConfig();
-  const status  = useOtaStatus();
+  // Per-product updaters drive the in-progress UX. They're "active" whenever
+  // their phase isn't 'idle', which we use below to switch to fast-poll mode
+  // on the status query so percent + reboot detection feel responsive.
+  const consoleUpdater = useOtaUpdater();
+  const scaleUpdater   = useOtaUpdater();
+  const fast = consoleUpdater.phase !== 'idle' || scaleUpdater.phase !== 'idle';
+  const status  = useOtaStatus({ fast });
   const save    = useSetOtaConfig();
   const run     = useRunOta();
   const runScale = useRunOtaScale();
@@ -138,6 +178,46 @@ export function OtaSection() {
   const scalePending   = !!scl?.pending;
   const anyPending     = consolePending || scalePending;
 
+  // Feed the updaters from the latest poll. Both observers run on every
+  // status change so the phase machine sees timely transitions to
+  // success/failed/rebooting without polling itself.
+  useEffect(() => {
+    const pollAge = status.dataUpdatedAt ? Date.now() - status.dataUpdatedAt : 9_999_999;
+    consoleUpdater.observe({
+      in_progress: con?.in_progress,
+      current_version: con?.firmware_current,
+      poll_failed: status.isError,
+      poll_age_ms: pollAge,
+    });
+    scaleUpdater.observe({
+      in_progress: scl?.in_progress,
+      current_version: scl?.firmware_current,
+      link: scl?.link,
+      poll_failed: status.isError,
+      poll_age_ms: pollAge,
+    });
+  }, [status.dataUpdatedAt, status.errorUpdatedAt, status.isError,
+      con?.in_progress?.percent, con?.firmware_current,
+      scl?.in_progress?.percent, scl?.firmware_current, scl?.link,
+      consoleUpdater, scaleUpdater]);
+
+  const triggerConsoleUpdate = () => {
+    const expected = con?.firmware_latest ?? '';
+    const original = con?.firmware_current ?? '';
+    consoleUpdater.trigger(expected, original);
+    run.mutate(undefined, {
+      onError: () => consoleUpdater.reset(),
+    });
+  };
+  const triggerScaleUpdate = () => {
+    const expected = scl?.firmware_latest ?? '';
+    const original = scl?.firmware_current ?? '';
+    scaleUpdater.trigger(expected, original);
+    runScale.mutate(undefined, {
+      onError: () => scaleUpdater.reset(),
+    });
+  };
+
   return (
     <SectionCard
       title="OTA Updates"
@@ -156,8 +236,9 @@ export function OtaSection() {
             feLatest:  con.frontend_latest,
           } : null}
           pending={consolePending}
-          onUpdate={() => run.mutate()}
-          busy={run.isPending}
+          onUpdate={triggerConsoleUpdate}
+          busy={run.isPending || consoleUpdater.phase !== 'idle'}
+          updater={consoleUpdater}
         />
         <div className="flex items-center justify-between">
           <ProductRow
@@ -170,8 +251,9 @@ export function OtaSection() {
               feLatest:  scl?.frontend_latest,
             } : null}
             pending={scalePending}
-            onUpdate={() => runScale.mutate()}
-            busy={runScale.isPending}
+            onUpdate={triggerScaleUpdate}
+            busy={runScale.isPending || scaleUpdater.phase !== 'idle'}
+            updater={scaleUpdater}
           />
           <ScaleLinkPill link={scl?.link ?? 'offline'} />
         </div>
@@ -198,18 +280,13 @@ export function OtaSection() {
           </Button>
         </div>
 
-        {anyPending && (
+        {anyPending && consoleUpdater.phase === 'idle' && scaleUpdater.phase === 'idle' && (
           <div className="rounded-md border border-brand-500/30 bg-brand-500/10 p-3 text-sm text-text">
             Update available for{' '}
             {consolePending && scalePending ? 'console + scale'
               : consolePending ? 'console'
               : 'scale'}
             . Use the per-product button above to apply.
-          </div>
-        )}
-        {runScale.isError && (
-          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300">
-            {(runScale.error as Error)?.message || 'Failed to trigger scale update'}
           </div>
         )}
       </div>

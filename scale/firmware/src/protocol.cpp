@@ -145,22 +145,32 @@ void send(Type type, JsonDocument& doc) {
             break;
         }
         case Type::OtaProgressUpdate: {
-            // Map simple percent/text progress into Status{text}.
+            // Map progress into Status{text, percent, kind}. The `text`
+            // field is what older console builds key off (it shows the
+            // updating screen on the LCD); newer builds also read
+            // `percent` and `kind` to drive the web UI's per-product
+            // progress bars.
             JsonDocument inner;
+            JsonDocument status;
+            const char* kind = doc["kind"]    | "";   // "" | "firmware" | "frontend"
+            int         pct  = doc["percent"] | -1;
             if (doc["text"].is<const char*>()) {
-                JsonDocument status;
                 status["text"] = doc["text"].as<const char*>();
-                inner["Status"] = status;
-            } else if (doc["percent"].is<int>()) {
-                JsonDocument status;
-                String t = String("Updating: ") + doc["percent"].as<int>() + "%";
+            } else if (pct >= 0) {
+                const char* label =
+                    !strcmp(kind, "frontend") ? "Updating Frontend"
+                  : !strcmp(kind, "firmware") ? "Updating Firmware"
+                  :                              "Updating";
+                String t = String(label) + ": " + pct + "%";
                 status["text"] = t;
-                inner["Status"] = status;
             } else {
                 // Nothing useful — emit Start as a fallback
                 emitStruct("OtaProgressUpdate", JsonDocument{});
                 return;
             }
+            if (pct >= 0)        status["percent"] = pct;
+            if (kind && *kind)   status["kind"]    = kind;
+            inner["Status"] = status;
             emitStruct("OtaProgressUpdate", inner);
             break;
         }

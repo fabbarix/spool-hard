@@ -8,21 +8,28 @@
 
 BambuCloudAuth g_bambu_cloud;
 
-// Headers the Bambu Lab API expects, copied verbatim from the
-// coelacant1/Bambu-Lab-Cloud-API reference's DEFAULT_HEADERS dict.
-// The API returns 403 to login attempts that don't carry the full
-// OrcaSlicer-shaped X-BBL-* set — every one of these is load-bearing,
-// don't trim them.
-static constexpr const char* kUserAgent       = "bambu_network_agent/01.09.05.01";
-static constexpr const char* kClientName      = "OrcaSlicer";
-static constexpr const char* kClientType      = "slicer";
-static constexpr const char* kClientVersion   = "01.09.05.51";
-static constexpr const char* kClientLanguage  = "en-US";
-static constexpr const char* kClientOs        = "linux";
-static constexpr const char* kClientOsVersion = "6.2.0";
-static constexpr const char* kAgentVersion    = "01.09.05.01";
-static constexpr const char* kAgentOsType     = "linux";
-static constexpr const char* kExecutableInfo  = "{}";
+// Headers the Bambu Lab API expects. The shape matters more than any
+// single value: Cloudflare in front of api.bambulab.com 403s the
+// "bambu_network_agent/…" UA from non-residential IPs while accepting
+// a regular browser UA + Origin/Referer pointing at bambulab.com plus
+// the minimal OrcaSlicer-style X-BBL-* triple. This set mirrors
+// temp/bambu_login.py — confirmed working from the same WAN.
+//
+// Crucially: only the X-BBL-Client-{Name,Type,Version} + X-BBL-OS-Type
+// are actually checked; the longer "agent" set we used to send
+// (X-BBL-OS-Version, X-BBL-Agent-*, X-BBL-Executable-info) was the
+// fingerprint that was getting us blocked.
+static constexpr const char* kUserAgent     =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36";
+static constexpr const char* kAccept        = "application/json, text/plain, */*";
+static constexpr const char* kAcceptLang    = "en-US,en;q=0.9";
+static constexpr const char* kOrigin        = "https://bambulab.com";
+static constexpr const char* kReferer       = "https://bambulab.com/";
+static constexpr const char* kClientName    = "OrcaSlicer";
+static constexpr const char* kClientType    = "slicer";
+static constexpr const char* kClientVersion = "01.09.05.51";
+static constexpr const char* kClientOs      = "linux";
 
 // ── Region helpers ─────────────────────────────────────────────
 
@@ -81,35 +88,32 @@ void BambuCloudAuth::clearToken() {
 // ── Headers / HTTP plumbing ────────────────────────────────────
 
 void BambuCloudAuth::_applyDefaultHeaders(HTTPClient& http) {
-    // BBL fingerprint headers — copied verbatim from the Python ref's
-    // DEFAULT_HEADERS. Cloudflare in front of api.bambulab.com 403s
-    // any login attempt that's missing the OrcaSlicer-shaped set.
+    // Browser-shaped UA + Origin/Referer + minimal X-BBL-* triple.
+    // See the top-of-file note for why the longer "agent" set was
+    // dropped — it was tripping Cloudflare's WAF.
     http.addHeader("User-Agent",            kUserAgent);
+    http.addHeader("Accept",                kAccept);
+    http.addHeader("Accept-Language",       kAcceptLang);
+    http.addHeader("Origin",                kOrigin);
+    http.addHeader("Referer",               kReferer);
     http.addHeader("X-BBL-Client-Name",     kClientName);
     http.addHeader("X-BBL-Client-Type",     kClientType);
     http.addHeader("X-BBL-Client-Version",  kClientVersion);
-    http.addHeader("X-BBL-Language",        kClientLanguage);
     http.addHeader("X-BBL-OS-Type",         kClientOs);
-    http.addHeader("X-BBL-OS-Version",      kClientOsVersion);
-    http.addHeader("X-BBL-Agent-Version",   kAgentVersion);
-    http.addHeader("X-BBL-Agent-OS-Type",   kAgentOsType);
-    http.addHeader("X-BBL-Executable-info", kExecutableInfo);
-    http.addHeader("Accept",                "application/json");
     http.addHeader("Content-Type",          "application/json");
-    // Browser-shaped extras. Cloudflare's bot heuristics weight these
-    // even though the API doesn't read them. Doesn't override the WAF's
-    // TLS-fingerprint check (JA3/JA4) but occasionally bumps us into a
-    // less-suspicious bucket. Belt and braces.
-    http.addHeader("Accept-Language",       "en-US,en;q=0.9");
-    http.addHeader("Accept-Encoding",       "gzip, deflate");
-    http.addHeader("Connection",            "keep-alive");
-    http.addHeader("Cache-Control",         "no-cache");
-    http.addHeader("Pragma",                "no-cache");
+}
+
+String BambuCloudAuth::_baseUrl(Region r, bool useWebsiteHost) {
+    if (useWebsiteHost) {
+        return r == Region::China ? "https://bambulab.cn" : "https://bambulab.com";
+    }
+    return regionBaseUrl(r);
 }
 
 String BambuCloudAuth::_post(Region r, const char* path, const String& jsonBody,
+                             bool useWebsiteHost,
                              String* setCookieOut, String* headersOut) {
-    String url = String(regionBaseUrl(r)) + path;
+    String url = _baseUrl(r, useWebsiteHost) + path;
     WiFiClientSecure client;
     // setInsecure() — we don't ship a Bambu CA bundle. The token alone
     // is sensitive but it's also what you'd type into OrcaSlicer, which
@@ -200,10 +204,11 @@ static constexpr size_t kRawBodyMax = 4096;
 
 // Fill the diagnostics block on a StepResult — called from every
 // login method so the UI's "show details" panel always has data.
-static void _fillDiag(BambuCloudAuth::StepResult& out, const char* path,
-                      BambuCloudAuth::Region r, int httpStatus,
-                      const String& body, const String& headers) {
-    out.requestUrl      = String(BambuCloudAuth::regionBaseUrl(r)) + path;
+// `fullUrl` is the resolved URL we hit (the caller knows whether it
+// went to the api or website host).
+static void _fillDiag(BambuCloudAuth::StepResult& out, const String& fullUrl,
+                      int httpStatus, const String& body, const String& headers) {
+    out.requestUrl      = fullUrl;
     out.httpStatus      = httpStatus;
     out.responseBody    = body.length() > kRawBodyMax
                           ? body.substring(0, kRawBodyMax) + "\n…[truncated]"
@@ -223,8 +228,10 @@ BambuCloudAuth::StepResult BambuCloudAuth::loginPassword(
     serializeJson(req, body);
 
     String headers;
-    String resp = _post(region, "/v1/user-service/user/login", body, nullptr, &headers);
-    _fillDiag(out, "/v1/user-service/user/login", region, _lastHttpStatus, resp, headers);
+    String resp = _post(region, "/v1/user-service/user/login", body,
+                        /*useWebsiteHost=*/false, nullptr, &headers);
+    _fillDiag(out, _baseUrl(region, false) + "/v1/user-service/user/login",
+              _lastHttpStatus, resp, headers);
 
     if (_lastHttpStatus <= 0) {
         out.status  = StepStatus::NetworkError;
@@ -290,8 +297,10 @@ BambuCloudAuth::StepResult BambuCloudAuth::loginEmailCode(
     serializeJson(req, body);
 
     String headers;
-    String resp = _post(region, "/v1/user-service/user/login", body, nullptr, &headers);
-    _fillDiag(out, "/v1/user-service/user/login", region, _lastHttpStatus, resp, headers);
+    String resp = _post(region, "/v1/user-service/user/login", body,
+                        /*useWebsiteHost=*/false, nullptr, &headers);
+    _fillDiag(out, _baseUrl(region, false) + "/v1/user-service/user/login",
+              _lastHttpStatus, resp, headers);
 
     if (_lastHttpStatus <= 0) {
         out.status  = StepStatus::NetworkError;
@@ -329,8 +338,13 @@ BambuCloudAuth::StepResult BambuCloudAuth::loginTfa(
 
     String setCookie;
     String headers;
-    String resp = _post(region, "/api/sign-in/tfa", body, &setCookie, &headers);
-    _fillDiag(out, "/api/sign-in/tfa", region, _lastHttpStatus, resp, headers);
+    // TFA lives on the website host (bambulab.com/api/...), NOT on the
+    // user-service host (api.bambulab.com/...). Mirrors the Python
+    // reference's split.
+    String resp = _post(region, "/api/sign-in/tfa", body,
+                        /*useWebsiteHost=*/true, &setCookie, &headers);
+    _fillDiag(out, _baseUrl(region, true) + "/api/sign-in/tfa",
+              _lastHttpStatus, resp, headers);
 
     if (_lastHttpStatus <= 0) {
         out.status  = StepStatus::NetworkError;

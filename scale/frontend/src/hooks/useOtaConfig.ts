@@ -29,11 +29,14 @@ export function useSetOtaConfig() {
 
 // Periodic-check telemetry. Polled every 5 s while the page is open so the
 // in-flight indicator and the post-check status flip live in the UI.
-export function useOtaStatus() {
+// `fast: true` switches to 2 s polling while an update is mid-flight so the
+// percent + reboot detection feel responsive.
+export function useOtaStatus(opts: { fast?: boolean } = {}) {
   return useQuery<OtaStatus>({
     queryKey: STATUS_KEY,
     queryFn: () => fetch('/api/ota-status').then((r) => r.json()),
-    refetchInterval: 5000,
+    refetchInterval: opts.fast ? 2000 : 5000,
+    retry: false,
   });
 }
 

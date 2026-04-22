@@ -188,7 +188,8 @@ void ScaleLink::_markDisconnected(const char* reason) {
     // Drop the cached OtaPending — once the link is down we have no idea
     // whether the scale's pending state has shifted, so the UI should
     // fall back to "unknown" rather than show stale latest-version data.
-    _scaleOta = ScaleOtaPending{};
+    _scaleOta         = ScaleOtaPending{};
+    _scaleOtaInFlight = ScaleOtaInFlight{};
     if (_onDisconnect) _onDisconnect();
     _refreshHandshakeState();
 }
@@ -344,8 +345,26 @@ void ScaleLink::_dispatch(const ScaleToConsole::Message& msg) {
             }
             break;
         }
+        case T::OtaProgressUpdate: {
+            // Wire shape: {"OtaProgressUpdate": {"Status": {text, percent, kind}}}
+            // We read the structured fields when present; the human-
+            // readable `text` is also surfaced in the recorded event.
+            JsonVariantConst st = msg.doc["Status"];
+            if (!st.is<JsonObject>()) break;
+            int pct = st["percent"] | -1;
+            const char* kind = st["kind"] | "";
+            if (pct >= 0) {
+                _scaleOtaInFlight.valid          = true;
+                _scaleOtaInFlight.kind           = kind;
+                _scaleOtaInFlight.percent        = pct;
+                _scaleOtaInFlight.last_update_ms = millis();
+            }
+            const char* text = st["text"] | "";
+            if (text && *text) _recordEvent("ota", text);
+            break;
+        }
         default:
-            break;  // PN532Status, OtaProgress, ButtonPressed, Term
+            break;  // PN532Status, ButtonPressed, Term
     }
 }
 

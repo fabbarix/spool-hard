@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
-import { Globe, RefreshCw, ArrowUpCircle } from 'lucide-react';
+import { Globe, RefreshCw, ArrowUpCircle, CheckCircle2, AlertCircle } from 'lucide-react';
 import {
   useOtaConfig, useSetOtaConfig, useOtaStatus, useOtaCheckNow, useRunOta,
 } from '../../hooks/useOtaConfig';
+import { useOtaUpdater } from '../../hooks/useOtaUpdater';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { InputField } from '@spoolhard/ui/components/InputField';
 import { Button } from '@spoolhard/ui/components/Button';
@@ -34,7 +35,8 @@ function statusLabel(s: string): { text: string; tone: 'ok' | 'warn' | 'err' | '
 
 export function OtaSection() {
   const cfg     = useOtaConfig();
-  const status  = useOtaStatus();
+  const updater = useOtaUpdater();
+  const status  = useOtaStatus({ fast: updater.phase !== 'idle' });
   const save    = useSetOtaConfig();
   const run     = useRunOta();
   const check   = useOtaCheckNow();
@@ -79,6 +81,25 @@ export function OtaSection() {
   const pending      = !!sc?.pending;
 
   const lbl = statusLabel(status.data?.last_check_status ?? '');
+
+  // Feed the updater on every status refresh so its phase machine sees
+  // the latest in_progress percent, current_version (for success
+  // detection), and poll failures (rebooting cue).
+  useEffect(() => {
+    const pollAge = status.dataUpdatedAt ? Date.now() - status.dataUpdatedAt : 9_999_999;
+    updater.observe({
+      in_progress: sc?.in_progress,
+      current_version: sc?.firmware_current,
+      poll_failed: status.isError,
+      poll_age_ms: pollAge,
+    });
+  }, [status.dataUpdatedAt, status.errorUpdatedAt, status.isError,
+      sc?.in_progress?.percent, sc?.firmware_current, updater]);
+
+  const triggerUpdate = () => {
+    updater.trigger(fwLatest ?? '', fwCurrent ?? '');
+    run.mutate(undefined, { onError: () => updater.reset() });
+  };
 
   return (
     <SectionCard
@@ -125,17 +146,42 @@ export function OtaSection() {
             Check now
           </Button>
         </div>
-        {pending && (
+        {pending && updater.phase === 'idle' && (
           <div className="rounded-md border border-brand-500/30 bg-brand-500/10 p-3 text-sm text-text mt-2 flex items-center justify-between gap-2 flex-wrap">
             <span>
               Update available
               {fwLatest && fwLatest !== fwCurrent && <> · firmware <span className="font-mono text-brand-500">{fwLatest}</span></>}
               {feLatest && feLatest !== feCurrent && <> · frontend <span className="font-mono text-brand-500">{feLatest}</span></>}
             </span>
-            <Button onClick={() => run.mutate()} disabled={run.isPending}>
+            <Button onClick={triggerUpdate} disabled={run.isPending}>
               <ArrowUpCircle size={14} className="inline mr-1" />
-              {run.isPending ? 'Starting…' : 'Update now'}
+              Update now
             </Button>
+          </div>
+        )}
+        {updater.phase === 'inflight' && (
+          <div className="rounded-md border border-brand-500/30 bg-brand-500/10 p-3 text-sm text-text mt-2 flex items-center gap-3 flex-wrap">
+            <span className="text-text-secondary">{updater.message}</span>
+            {updater.percent >= 0 ? (
+              <div className="flex-1 min-w-[120px] h-1.5 bg-border rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-brand-500 transition-[width] duration-500"
+                  style={{ width: `${updater.percent}%` }}
+                />
+              </div>
+            ) : (
+              <RefreshCw size={14} className="animate-spin text-brand-500" />
+            )}
+          </div>
+        )}
+        {updater.phase === 'success' && (
+          <div className="rounded-md border border-teal-500/30 bg-teal-500/10 p-3 text-sm text-teal-300 mt-2 flex items-center gap-2">
+            <CheckCircle2 size={14} /> Updated to {updater.successVersion}
+          </div>
+        )}
+        {updater.phase === 'failed' && (
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300 mt-2 flex items-center gap-2">
+            <AlertCircle size={14} /> {updater.failureReason}
           </div>
         )}
       </div>

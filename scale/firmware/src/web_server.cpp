@@ -585,6 +585,11 @@ void ScaleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
     scale["frontend_current"] = p.frontend_current;
     scale["frontend_latest"]  = p.frontend_latest;
     scale["pending"]          = p.firmware || p.frontend;
+    if (g_ota_in_flight.valid) {
+        JsonObject ip = scale["in_progress"].to<JsonObject>();
+        ip["kind"]    = g_ota_in_flight.kind;
+        ip["percent"] = g_ota_in_flight.percent;
+    }
 
     String s; serializeJson(doc, s);
     req->send(200, "application/json", s);

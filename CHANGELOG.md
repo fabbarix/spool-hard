@@ -8,6 +8,30 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.2.6] - 2026-04-22
+
+OTA UX polish + Bambu Cloud login fix.
+
+- Console LCD home screen now carries a non-modal "update available"
+  banner across the bottom (Phase 3). The text reflects whichever
+  products have updates pending — console, scale, or both — and a tap
+  triggers the matching OTA(s) without leaving the home screen.
+- "Update Now" buttons in the web UI now show progress feedback the
+  whole way through: "Starting…" → "Updating firmware/frontend: X%" →
+  "Rebooting…" → "✓ Updated to vX.Y.Z". Buttons are disabled while an
+  update is in flight, status polling speeds up to 2 s for the
+  duration, and React Query's auto-retry is off so connection failures
+  during the reboot surface immediately as the rebooting cue.
+- Server-side `OtaInFlight` tracker + extended `OtaProgressUpdate`
+  wire frame (now carries `kind` + `percent`) so the console can
+  surface the scale's flashing progress in the same banner.
+- Bambu Cloud login redesigned to match the working
+  `temp/bambu_login.py` reference — browser-shaped User-Agent +
+  Origin/Referer headers, dropped the "agent" fingerprint headers
+  that were tripping Cloudflare's WAF, and routed TFA to the website
+  host (`bambulab.com/api/sign-in/tfa`) rather than the user-service
+  host. Direct password login should work again.
+
 ## [0.2.5] - 2026-04-22
 
 OTA overhaul + shared firmware library.

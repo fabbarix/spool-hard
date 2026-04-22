@@ -133,6 +133,18 @@ public:
     };
     const ScaleOtaPending& scaleOtaPending() const { return _scaleOta; }
 
+    // Mirror of the most recent OtaProgressUpdate frame the scale pushed
+    // while flashing itself. The web layer reads it via scaleOtaInFlight()
+    // to render a progress bar on the console's combined OTA banner.
+    // `valid == false` once the link drops or after a long idle window.
+    struct ScaleOtaInFlight {
+        bool        valid       = false;
+        String      kind;          // "" | "firmware" | "frontend"
+        int         percent      = 0;
+        uint32_t    last_update_ms = 0;   // millis() at last frame
+    };
+    const ScaleOtaInFlight& scaleOtaInFlight() const { return _scaleOtaInFlight; }
+
     // Tell the scale to flash itself NOW using its stored OtaConfig. Maps
     // to ConsoleToScale::RunOtaUpdate. Drops silently if the link is down.
     void requestScaleOtaUpdate();
@@ -181,6 +193,10 @@ private:
     // Cached scale-side OTA state — populated by _dispatch on every
     // OtaPending frame.
     ScaleOtaPending _scaleOta;
+
+    // Cached scale-side OTA-in-flight state — updated on each
+    // OtaProgressUpdate frame the scale pushes during a self-flash.
+    ScaleOtaInFlight _scaleOtaInFlight;
 
     void _connect();
     void _onWsEvent(WStype_t type, uint8_t* payload, size_t length);

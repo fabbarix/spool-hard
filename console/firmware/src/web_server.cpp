@@ -883,6 +883,11 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
     console["frontend_current"] = p.frontend_current;
     console["frontend_latest"]  = p.frontend_latest;
     console["pending"]          = p.firmware || p.frontend;
+    if (g_ota_in_flight.valid) {
+        JsonObject ip = console["in_progress"].to<JsonObject>();
+        ip["kind"]    = g_ota_in_flight.kind;
+        ip["percent"] = g_ota_in_flight.percent;
+    }
 
     // Scale block: cached from the most recent OtaPending frame the scale
     // pushed. `link == "online"` only when the WS link is up AND we've
@@ -903,6 +908,14 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
     } else {
         scale["link"]    = linkUp ? "waiting" : "offline";
         scale["pending"] = false;
+    }
+    if (_scale) {
+        const auto& sif = _scale->scaleOtaInFlight();
+        if (sif.valid) {
+            JsonObject ip = scale["in_progress"].to<JsonObject>();
+            ip["kind"]    = sif.kind;
+            ip["percent"] = sif.percent;
+        }
     }
 
     String s; serializeJson(doc, s);

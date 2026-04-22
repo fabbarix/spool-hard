@@ -26,6 +26,7 @@ constexpr const char* kKeyLastFe          = "lk_fe";
 }
 
 OtaChecker g_ota_checker;
+OtaInFlight g_ota_in_flight;
 
 // ── OtaConfig persistence ────────────────────────────────────
 

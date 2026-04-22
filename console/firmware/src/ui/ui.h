@@ -84,6 +84,16 @@ void ui_set_printer_panel(const UiPrinterSnapshot* snap);
 // WifiProvisioning module exposes.
 void ui_set_onboarding(const char* ap_ssid, const char* security_key, const char* ip_or_mdns);
 
+// ── OTA "update available" banner ──────────────────────────────
+// Non-modal strip across the bottom of the home screen, hidden by default.
+// `text` is the message to display ("Console v0.2.5 update available — tap to install");
+// `show=false` hides the banner. Safe to call from any task.
+void ui_set_ota_banner(bool show, const char* text);
+// Wires the tap action — main.cpp registers a callback that kicks off the
+// actual OTA flow. Tap is a no-op if no callback is set.
+typedef void (*ui_ota_tap_cb_t)(void);
+void ui_set_ota_banner_callback(ui_ota_tap_cb_t cb);
+
 // ── Spool detail / weigh screen ─────────────────────────────
 // Auto-opened when a tag is scanned locally on the console's PN532.
 // Users can capture the scale's current weight as either the spool's

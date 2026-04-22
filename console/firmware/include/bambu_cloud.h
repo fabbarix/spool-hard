@@ -95,17 +95,21 @@ private:
     String  _email;
     Region  _region = Region::Global;
 
-    // Underlying HTTPS POST/GET against api.bambulab.{com,cn}. Uses
-    // WiFiClientSecure with the system cert bundle. Returns an empty
-    // String on transport failure; the JSON status_code is captured
+    // Underlying HTTPS POST/GET. `useWebsiteHost` switches between the
+    // two Bambu hosts: false → api.bambulab.{com,cn} (user-service +
+    // profile endpoints), true → bambulab.{com,cn} (website /api routes
+    // — TFA lives here, not on the user-service host). Returns an empty
+    // String on transport failure; the HTTP status_code is captured
     // out-of-band via `lastHttpStatus`. `headersOut` is filled with
     // a "Name: value\n…" dump of the headers we collected (used by
     // the diagnostics-on-error UI path).
     int     _lastHttpStatus = 0;
     String  _post(Region r, const char* path, const String& jsonBody,
-                  String* setCookieOut = nullptr,
-                  String* headersOut   = nullptr);
+                  bool   useWebsiteHost = false,
+                  String* setCookieOut  = nullptr,
+                  String* headersOut    = nullptr);
     String  _get (Region r, const char* path, const String& bearerToken);
+    static String _baseUrl(Region r, bool useWebsiteHost);
 
     // Common header helpers (mirror the Python ref's User-Agent etc.).
     void    _applyDefaultHeaders(class HTTPClient& http);

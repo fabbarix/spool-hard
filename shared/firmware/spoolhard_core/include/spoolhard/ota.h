@@ -147,3 +147,19 @@ bool otaRun(const OtaConfig& cfg,
 // Back-compat overload for the LCD + web callers that pass a
 // percent-only callback. Same semantics; Kind is inferred internally.
 bool otaRun(const OtaConfig& cfg, std::function<void(int)> progressCb);
+
+// "An OTA is running RIGHT NOW" tracker. Each product's main.cpp updates
+// this from the otaRun() progress callback so the web layer's
+// /api/ota-status can surface it (driving the React frontend's progress
+// bar + button-disabled state). Kind strings are static literals
+// ("firmware" / "frontend" / "") so no allocation churn on hot updates.
+//
+// `started_ms` is millis() at the start of the run — used by the UI to
+// fall back to "rebooting…" if no progress arrives in time.
+struct OtaInFlight {
+    bool        valid      = false;
+    const char* kind       = "";
+    int         percent    = 0;
+    uint32_t    started_ms = 0;
+};
+extern OtaInFlight g_ota_in_flight;

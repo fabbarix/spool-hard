@@ -20,12 +20,17 @@ export interface OtaConfig {
 
 // /api/ota-status — single-product payload from the scale's OtaChecker.
 // Mirrors the console's `console` block but with no peer to aggregate.
+export interface OtaInProgressT {
+  kind: 'firmware' | 'frontend' | '';
+  percent: number;
+}
 export interface OtaPendingT {
   firmware_current: string;
   firmware_latest: string;
   frontend_current: string;
   frontend_latest: string;
   pending: boolean;
+  in_progress?: OtaInProgressT;
 }
 export interface OtaStatus {
   check_enabled: boolean;
