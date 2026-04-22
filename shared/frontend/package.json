@@ -1,0 +1,19 @@
+{
+  "name": "@spoolhard/ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./components/*": "./src/components/*.tsx",
+    "./providers/*": "./src/providers/*.tsx",
+    "./types/*": "./src/types/*.ts",
+    "./utils/*": "./src/utils/*.ts",
+    "./theme.css": "./src/app.css"
+  },
+  "peerDependencies": {
+    "react": "^19",
+    "react-dom": "^19",
+    "@tanstack/react-query": "^5",
+    "lucide-react": "*"
+  }
+}

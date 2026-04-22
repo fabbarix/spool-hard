@@ -1,0 +1,150 @@
+#pragma once
+#include <ESPAsyncWebServer.h>
+#include <AsyncWebSocket.h>
+#include <ArduinoJson.h>
+#include <FS.h>
+#include <functional>
+#include "product_signature.h"
+
+class SpoolStore;
+class ScaleLink;
+
+class ConsoleWebServer {
+public:
+    void begin();        // register routes
+    void start();        // server.begin()
+
+    AsyncWebServer& server() { return _server; }
+
+    void broadcastDebug(const String& type, const JsonDocument& payload);
+
+    void setStore(SpoolStore* s)      { _store = s; }
+    void setScaleLink(ScaleLink* s)   { _scale = s; }
+
+    void onUploadStarted(std::function<void(const char*)> cb) { _onUploadStarted = std::move(cb); }
+    void onUploadProgress(std::function<void(int percent, const char* type, const char* label)> cb)
+                                                              { _onUploadProgress = std::move(cb); }
+    void onOtaRequested(std::function<void()> cb)             { _onOtaRequested = std::move(cb); }
+
+private:
+    AsyncWebServer _server{80};
+    AsyncWebSocket _ws{"/ws"};
+
+    SpoolStore* _store = nullptr;
+    ScaleLink*  _scale = nullptr;
+
+    std::function<void(const char*)> _onUploadStarted;
+    std::function<void(int, const char*, const char*)> _onUploadProgress;
+    std::function<void()>            _onOtaRequested;
+
+    // Per-upload signature check state. Arduino's Update lib is a singleton,
+    // so one matcher is enough. Invariant: `_uploadAccepted` defaults to false
+    // and is only flipped true on a clean final-chunk where the signature was
+    // seen AND Update.end() committed. Any other path — no upload at all,
+    // connection dropped mid-stream, wrong product, failed commit — leaves it
+    // false so the response handler serves 400.
+    ProductSignatureMatcher _uploadMatcher;
+    bool _uploadAccepted = false;
+    const char* _uploadRejectReason = "no upload";  // pointer to literal, never freed
+
+    // Streaming scanner for the firmware-version marker planted by
+    // product_signature.h: "SPOOLHARD-VERSION=<v>\x01" lives in .rodata
+    // somewhere in the binary. We can't use esp_app_desc_t.version (file
+    // offset 48) — the precompiled arduino-esp32 framework writes its own
+    // IDF build string into that slot at framework build time, so the
+    // project's FW_VERSION never lands there. We also can't post-process
+    // the .bin (esp-image SHA256 covers the whole binary), so a string
+    // marker scanned at upload time is the cleanest route.
+    struct VersionMarkerParser {
+        // Two-phase state machine: first match the fixed prefix (KMP-style
+        // partial-index, same shape as ProductSignatureMatcher), then once
+        // the prefix is in we capture bytes verbatim until we see the
+        // 0x01 sentinel — that's the version string.
+        size_t  prefixMatched = 0;
+        bool    capturing     = false;
+        bool    parsed        = false;
+        char    version[33]   = {0};
+        size_t  versionLen    = 0;
+
+        void reset() {
+            prefixMatched = 0; capturing = false; parsed = false;
+            version[0] = 0; versionLen = 0;
+        }
+        void feed(const uint8_t* data, size_t n);
+    };
+    VersionMarkerParser _uploadVersion;
+
+    // Progress reporting throttle — only fire the callback when the percent
+    // has advanced at least PROGRESS_STEP points since the last report.
+    int _uploadLastReportedPct = -1;
+    uint32_t _uploadContentLength = 0;
+    String   _uploadLabel;   // refreshed once the version is known
+
+    void _setupRoutes();
+
+    /// Check Authorization: Bearer header against the stored fixed key.
+    /// Returns true and lets the caller continue if auth is not required
+    /// (no key set, or key == DEFAULT_FIXED_KEY). Otherwise sends 401 and
+    /// returns false — the caller must simply `return;`.
+    bool _requireAuth(AsyncWebServerRequest* req);
+
+    /// /api/auth-status — always 200, never 401. Reports whether the device
+    /// has a non-default key set and whether the request's credentials pass.
+    void _handleAuthStatus(AsyncWebServerRequest* req);
+
+    // Config endpoints (ported from scale)
+    void _handleDeviceName(AsyncWebServerRequest* req);
+    void _handleOtaConfigGet(AsyncWebServerRequest* req);
+    void _handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleReset(AsyncWebServerRequest* req);
+    void _handleTestKey(AsyncWebServerRequest* req);
+    void _handleFixedKeyConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleWifiStatus(AsyncWebServerRequest* req);
+    void _handleFirmwareInfo(AsyncWebServerRequest* req);
+
+    // Console-specific
+    void _handleSpoolsList(AsyncWebServerRequest* req);
+    void _handleSpoolGet(AsyncWebServerRequest* req);
+    void _handleSpoolPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleSpoolDelete(AsyncWebServerRequest* req);
+    void _handleScaleLinkStatus(AsyncWebServerRequest* req);
+    void _handleScaleSecretGet(AsyncWebServerRequest* req);
+    void _handleScaleSecretPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handlePrintersList(AsyncWebServerRequest* req);
+    void _handlePrinterGet(AsyncWebServerRequest* req);
+    void _handlePrinterPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handlePrinterDelete(AsyncWebServerRequest* req);
+    void _handleDiscoveryPrinters(AsyncWebServerRequest* req);
+    void _handleDiscoveryScales(AsyncWebServerRequest* req);
+    void _handlePrinterAnalyzeStart(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handlePrinterAnalysisGet(AsyncWebServerRequest* req);
+    void _handleDisplayConfigGet(AsyncWebServerRequest* req);
+    void _handleDisplayConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handlePrinterAmsMappingPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handlePrinterFtpDebug(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+
+    // Core-weights + quick-weights (used by the new-spool wizard).
+    void _handleCoreWeightsGet(AsyncWebServerRequest* req);
+    void _handleCoreWeightsPut(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleCoreWeightsDelete(AsyncWebServerRequest* req);
+    void _handleQuickWeightsGet(AsyncWebServerRequest* req);
+    void _handleQuickWeightsPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+
+    // Filaments library (SD-resident SQLite DB sourced from bambu-filaments).
+    // Upload writes straight to /sd/filaments.db — GET streams it back to the
+    // browser so sql.js can query it client-side. The File handle below is
+    // held across streaming-upload chunks; reset on each new upload.
+    File        _filamentsUploadFile;
+    size_t      _filamentsUploadBytes = 0;
+    bool        _filamentsUploadOk    = false;
+    const char* _filamentsUploadErr   = "no upload";
+
+public:
+    // Debug toggles (session-only; default off on every boot). Exposed as
+    // public so hot-path code in bambu_printer etc. can check them without
+    // a function call. When enabled, the producer forwards the raw JSON to
+    // the /ws debug channel — the Config → Debug UI subscribes and renders.
+    bool _logAmsRaw = false;
+};
+
+extern ConsoleWebServer g_web;   // defined in main.cpp

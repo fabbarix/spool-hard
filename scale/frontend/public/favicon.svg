@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- SpoolHard Scale favicon. Bold blocky silhouette so it survives at
+       16×16 in a browser tab. Brand palette per docs/UI_UX_DESIGN_SYSTEM.md:
+         #0b1220 — instrument-panel dark
+         #f0b429 — amber "data"
+         #2dd4bf — teal "OK / health" -->
+
+  <!-- Dark rounded-square canvas (matches the UI's surface treatment). -->
+  <rect width="64" height="64" rx="14" fill="#0b1220"/>
+
+  <!-- Filament spool, in amber. Three stacked rects render as
+       top-flange + cylindrical body + bottom-flange — recognisable as
+       "spool" without the wound-filament detail surviving at 16 px. -->
+  <rect x="16" y="12" width="32" height="6"  rx="1" fill="#f0b429"/>
+  <rect x="20" y="18" width="24" height="20"        fill="#f0b429"/>
+  <rect x="16" y="38" width="32" height="6"  rx="1" fill="#f0b429"/>
+
+  <!-- Scale platform underneath, in teal. The horizontal bar sells
+       "this thing measures weight"; the centre post anchors the spool
+       visually so the two halves don't float apart. -->
+  <rect x="30" y="44" width="4"  height="6"  fill="#2dd4bf"/>
+  <rect x="8"  y="50" width="48" height="4" rx="2" fill="#2dd4bf"/>
+</svg>

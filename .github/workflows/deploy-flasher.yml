@@ -1,0 +1,65 @@
+name: Deploy flasher to GitHub Pages
+
+# Runs on every push to main that touches the flasher (or its shared
+# dependencies) and on each tagged release. Manual dispatch is also
+# allowed for re-deploys without a code change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flasher/**'
+      - 'shared/frontend/**'
+      - '.github/workflows/deploy-flasher.yml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Pages deployment needs id-token for the OIDC handshake and pages: write
+# for the upload. contents:read is for the actions/checkout step.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one in-flight deploy at a time; if a newer one queues up, cancel
+# the older one rather than racing.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm install
+      - run: npm run build --workspace=@spoolhard/flasher
+
+      # Custom domain — write a CNAME file into the artifact root if the
+      # repo variable PAGES_CUSTOM_DOMAIN is set (e.g. `flasher.spoolhard.io`).
+      # GitHub Pages reads CNAME from the artifact and sets the custom
+      # domain on each deploy. Configure the variable in
+      # Settings → Secrets and variables → Actions → Variables.
+      - name: Plant CNAME (if configured)
+        if: vars.PAGES_CUSTOM_DOMAIN != ''
+        run: echo "${{ vars.PAGES_CUSTOM_DOMAIN }}" > flasher/dist/CNAME
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: flasher/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

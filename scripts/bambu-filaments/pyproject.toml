@@ -1,0 +1,19 @@
+[project]
+name = "bambu-filaments"
+version = "0.1.0"
+description = "Bambu filament JSON to SQLite transformation tool"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.13.2",
+]
+
+[project.scripts]
+filament-to-db = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false

@@ -1,0 +1,13 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# 16MB flash layout: dual 3MB OTA app slots + 3MB SPIFFS (frontend bundle,
+# overwritten by `pio run -t uploadfs`) + 7MB LittleFS "userfs" for user
+# data (spool database etc.) which survives frontend/firmware updates.
+# userfs uses subtype 0x83 (raw hex — the ESP-IDF enum lacks `littlefs`),
+# so PlatformIO's SPIFFS tooling picks the `spiffs` partition unambiguously.
+# Arduino's LittleFS.begin() mounts by partition label regardless of subtype.
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x300000,
+app1,     app,  ota_1,   0x310000, 0x300000,
+spiffs,   data, spiffs,  0x610000, 0x300000,
+userfs,   data, 0x83,    0x910000, 0x6f0000,
