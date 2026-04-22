@@ -18,20 +18,39 @@ FIRMWARE_DIR="$PRODUCT_DIR/firmware"
 FRONTEND_DIR="$PRODUCT_DIR/frontend"
 DATA_DIR="$FIRMWARE_DIR/data"
 BUILD_DIR="$FIRMWARE_DIR/.pio/build/esp32-s3"
+# Capture the caller's $PWD before we cd anywhere — any relative
+# --output-dir from the caller is resolved against this, not against
+# whatever directory the script happens to be in when it writes.
+INVOKE_DIR="$PWD"
 
 OUTPUT_DIR="$PRODUCT_DIR/release"
 BASE_URL=""
+# Asset-name prefix used inside the generated manifest URLs. CI uploads
+# the per-product binaries flattened into a single GitHub Release with
+# names like `spoolhard-scale-firmware.bin`; pass `--asset-prefix
+# spoolhard-scale-` here so the manifests reference those names. Local
+# builds leave the prefix empty.
+ASSET_PREFIX=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base-url)   BASE_URL="$2";     shift 2 ;;
-    --output-dir) OUTPUT_DIR="$2";   shift 2 ;;
+    --base-url)     BASE_URL="$2";     shift 2 ;;
+    --output-dir)   OUTPUT_DIR="$2";   shift 2 ;;
+    --asset-prefix) ASSET_PREFIX="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--base-url URL] [--output-dir DIR]"
+      echo "Usage: $0 [--base-url URL] [--output-dir DIR] [--asset-prefix PREFIX]"
       exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
+
+# Promote OUTPUT_DIR to absolute. The build steps `cd` into firmware/
+# and frontend/ later on, so a relative path here would land in the
+# wrong place when we write artifacts.
+case "$OUTPUT_DIR" in
+  /*) ;;                          # already absolute
+  *)  OUTPUT_DIR="$INVOKE_DIR/$OUTPUT_DIR" ;;
+esac
 
 VERSION_FILE="$PRODUCT_DIR/VERSION"
 if [[ ! -f "$VERSION_FILE" ]]; then
@@ -103,17 +122,19 @@ SP_SHA=$(sha256sum "$OUTPUT_DIR/frontend.bin"   | cut -d' ' -f1)
 
 if [ -z "$BASE_URL" ]; then BASE_URL="https://REPLACE_WITH_ACTUAL_URL"; fi
 
+# `$BASE_URL/$ASSET_PREFIX<file>` is what each manifest URL becomes; with
+# the prefix empty (local builds) it collapses to `$BASE_URL/<file>`.
 cat > "$OUTPUT_DIR/manifest.json" <<EOF
 {
   "firmware": {
     "version": "$FW_VERSION",
-    "url": "$BASE_URL/firmware.bin",
+    "url": "$BASE_URL/${ASSET_PREFIX}firmware.bin",
     "size": $FW_SIZE,
     "sha256": "$FW_SHA"
   },
   "frontend": {
     "version": "$FE_VERSION",
-    "url": "$BASE_URL/frontend.bin",
+    "url": "$BASE_URL/${ASSET_PREFIX}frontend.bin",
     "size": $SP_SIZE,
     "sha256": "$SP_SHA"
   }
@@ -134,11 +155,11 @@ cat > "$OUTPUT_DIR/flasher-manifest.json" <<EOF
     {
       "chipFamily": "ESP32-S3",
       "parts": [
-        { "path": "$BASE_URL/bootloader.bin", "offset": 0 },
-        { "path": "$BASE_URL/partitions.bin", "offset": 32768 },
-        { "path": "$BASE_URL/boot_app0.bin",  "offset": 57344 },
-        { "path": "$BASE_URL/firmware.bin",   "offset": 65536 },
-        { "path": "$BASE_URL/frontend.bin",   "offset": 6356992 }
+        { "path": "$BASE_URL/${ASSET_PREFIX}bootloader.bin", "offset": 0 },
+        { "path": "$BASE_URL/${ASSET_PREFIX}partitions.bin", "offset": 32768 },
+        { "path": "$BASE_URL/${ASSET_PREFIX}boot_app0.bin",  "offset": 57344 },
+        { "path": "$BASE_URL/${ASSET_PREFIX}firmware.bin",   "offset": 65536 },
+        { "path": "$BASE_URL/${ASSET_PREFIX}frontend.bin",   "offset": 6356992 }
       ]
     }
   ]

@@ -1,101 +1,165 @@
-name: Release Build
+name: Release on tag
 
+# Fires when a `v*` tag is pushed (typically via the local
+# update_changelog.sh + bump-VERSION + commit + git tag flow). Builds
+# both products' release artifacts, builds the filaments DB from the
+# upstream BambuStudio profiles, renames everything to the
+# `spoolhard-<product>-<file>` convention the flasher app expects, and
+# attaches it all to a GitHub Release with notes pulled from
+# CHANGELOG.md.
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
-      base_url:
-        description: 'Base URL for OTA manifest download links'
-        default: ''
+      tag:
+        description: 'Existing tag to (re-)release'
+        required: true
 
+# Need contents:write to create/edit the release.
 permissions:
   contents: write
 
+# Opt JS actions in to Node 24 ahead of the June-2026 cutover.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
         with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
+          # The PIO build doesn't depend on history; the changelog
+          # extractor only needs HEAD. Shallow clone is fine.
+          fetch-depth: 1
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # ── Resolve the tag we're releasing ─────────────────────
+      # `github.ref_name` is set on the push:tags trigger; the dispatch
+      # path takes the user-supplied input. Either way we need that
+      # tag's source checked out so the VERSION files match.
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+            git fetch --tags origin
+            git checkout "tags/$TAG"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          echo "tag=${TAG}"   >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${TAG} (asset URL prefix: ${BASE}/)"
+
+      # ── Toolchains ──────────────────────────────────────────
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install PlatformIO
-        run: pip install platformio
+      - uses: astral-sh/setup-uv@v6
 
-      - name: Extract version from tag
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Determine base URL
-        id: url
-        run: |
-          if [ -n "${{ github.event.inputs.base_url }}" ]; then
-            echo "base_url=${{ github.event.inputs.base_url }}" >> "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "base_url=https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "base_url=https://PLACEHOLDER" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build release
-        run: |
-          ./scripts/release.sh \
-            --base-url "${{ steps.url.outputs.base_url }}" \
-            --output-dir release
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      # PlatformIO core + the framework downloads it pulls on first
+      # run are heavy (>500 MB). Cache by platformio.ini hash so the
+      # framework cache hits across builds; bust on dependency changes.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
         with:
-          name: spoolhard-scale-${{ steps.version.outputs.tag }}
-          path: release/
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('**/platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/firmware.bin
-            release/spiffs.bin
-            release/manifest.json
-          body: |
-            ## SpoolHard Scale ${{ steps.version.outputs.tag }}
+      - run: pip install --upgrade platformio
+      - run: npm ci
 
-            ### Installation
+      # ── Build per-product artifacts ─────────────────────────
+      # Both products run with --asset-prefix so the manifest URLs
+      # they generate already point at the names we'll upload as.
+      - name: Build console
+        run: |
+          ./console/scripts/release.sh \
+            --base-url     "${{ steps.meta.outputs.base }}" \
+            --asset-prefix "spoolhard-console-" \
+            --output-dir   release/console
 
-            **Via browser upload:** Open `http://<scale-ip>/` > Configuration > Direct Upload, then drop the `.bin` files.
+      - name: Build scale
+        run: |
+          ./scale/scripts/release.sh \
+            --base-url     "${{ steps.meta.outputs.base }}" \
+            --asset-prefix "spoolhard-scale-" \
+            --output-dir   release/scale
 
-            **Via serial:**
-            ```bash
-            esptool.py --chip esp32s3 write_flash 0x10000 firmware.bin
-            esptool.py --chip esp32s3 write_flash 0x610000 spiffs.bin
-            ```
+      - name: Build filaments DB
+        run: ./scripts/build_filaments_db.sh release
 
-            **Via OTA:** Point the scale's OTA URL to this release's manifest:
-            ```
-            ${{ steps.url.outputs.base_url }}/manifest.json
-            ```
+      # ── Stage assets with the prefixed names ────────────────
+      # GitHub Releases is a flat namespace, so we flatten + rename
+      # each per-product dir into out/. filaments.db is shared and
+      # uploaded without a prefix.
+      - name: Stage release assets
+        run: |
+          mkdir -p out
+          for product in console scale; do
+            for f in release/$product/*; do
+              cp "$f" "out/spoolhard-${product}-$(basename "$f")"
+            done
+          done
+          cp release/filaments.db out/filaments.db
+          echo "── Final asset list ──"
+          ls -la out
 
-            ### Artifacts
-            | File | Description |
-            |------|-------------|
-            | `firmware.bin` | Backend firmware (ESP32-S3) |
-            | `spiffs.bin` | Frontend SPIFFS image (React SPA) |
-            | `manifest.json` | OTA update manifest |
+      # ── Release notes from CHANGELOG.md ─────────────────────
+      # Pull the section between this version's heading and the next
+      # `## [` heading. Falls back to a generic note if the section
+      # can't be found (e.g. tag pre-dates a CHANGELOG entry).
+      - name: Extract changelog section
+        run: |
+          VERSION="${{ steps.meta.outputs.tag }}"
+          VERSION="${VERSION#v}"
+          if [[ -f CHANGELOG.md ]]; then
+            awk -v ver="$VERSION" '
+              /^## \[/ {
+                if (hit) { exit }
+                if ($0 ~ "\\[" ver "\\]") { hit=1; print; next }
+              }
+              hit { print }
+            ' CHANGELOG.md > notes.md
+          fi
+          if [[ ! -s notes.md ]]; then
+            echo "Release ${{ steps.meta.outputs.tag }}" > notes.md
+            echo "" >> notes.md
+            echo "_(no CHANGELOG.md entry for this tag)_" >> notes.md
+          fi
+          echo "── Release notes ──"
+          cat notes.md
+
+      # ── Publish ─────────────────────────────────────────────
+      # `--clobber` lets a re-run replace assets without erroring on
+      # the second pass. If the release already exists (manual create
+      # or workflow re-run), we update the assets and notes in place
+      # rather than recreating the release.
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+            gh release edit   "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file notes.md \
+              out/*
+          fi
