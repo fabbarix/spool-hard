@@ -1,0 +1,63 @@
+name: PIO cache warm
+
+# GitHub Actions caches are scoped to the ref that saved them. Tag-push
+# runs from `refs/tags/v0.2.6` can't see a cache saved by a run on
+# `refs/tags/v0.2.5` — only caches saved on the default branch (main) or
+# the run's own ref are restorable from another ref.
+#
+# This job runs on every push to main and primes the PlatformIO cache
+# (espressif32 platform + framework + toolchains, ~1 GB) so the
+# release-on-tag workflow inherits a warm cache instead of re-installing
+# everything from scratch each time. The actual build output is thrown
+# away — only the cached `~/.platformio` tree matters.
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only warm when something that affects the PIO install changes.
+      # Source-only commits don't need a re-warm.
+      - '**/platformio.ini'
+      - '.github/workflows/pio-cache-warm.yml'
+  workflow_dispatch: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Same key + paths as release.yml's cache step. The release job's
+      # `restore-keys` fallback (`pio-${{ runner.os }}-`) will pick up
+      # whatever this job saved on main, even when the platformio.ini
+      # hash differs.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('**/platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - run: pip install --upgrade platformio
+
+      # Build both products. Frontend isn't needed for cache-warming —
+      # the spoolhard_core lib + per-product platformio resolve covers
+      # the full PIO install set.
+      - name: Build console
+        working-directory: console/firmware
+        run: pio run -e esp32-s3
+      - name: Build scale
+        working-directory: scale/firmware
+        run: pio run -e esp32-s3
