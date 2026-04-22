@@ -27,18 +27,26 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+# Opt actions in to Node.js 24 ahead of the June-2026 forced cutover —
+# silences the deprecation warning emitted on every run by actions still
+# bundling Node 20 (checkout, setup-node, etc.).
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
 
-      - run: npm install
+      # `npm ci` honours the lockfile exactly — the right call in CI vs
+      # `npm install` which can drift the tree.
+      - run: npm ci
       - run: npm run build --workspace=@spoolhard/flasher
 
       # Custom domain — write a CNAME file into the artifact root if the
