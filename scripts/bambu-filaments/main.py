@@ -1,40 +1,34 @@
+"""Build the SpoolHard filaments.jsonl from BambuStudio profile JSONs.
+
+Replaces the older filaments.db (SQLite) pipeline. The console firmware
+reads JSONL natively — no SQLite client needed on-device — and the React
+frontend parses the same file via fetch + JSON.parse, dropping the
+~1MB sql.js WASM dependency that the SQLite path required.
+
+The on-disk shape per row mirrors the firmware's FilamentRecord struct
+(console/firmware/include/filament_record.h); see jsonl_writer.py for
+the schema details.
+"""
+
 from parser import FilamentParser
-from database import FilamentDatabase
+from jsonl_writer import write_jsonl
 import os
 
+
 def main():
-    db_path = "filaments.db"
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    
+    out_path = "filaments.jsonl"
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
     parser = FilamentParser(".")
     print("Loading all JSON files...")
     parser.load_all()
-    
-    db = FilamentDatabase(db_path)
-    
-    # We want to store EVERYTHING in the registry as a delta, 
-    # not just the final filaments, so we can reconstruct chains.
-    all_names = list(parser.registry.keys())
-    print(f"Found {len(all_names)} entities. Inserting as deltas...")
-    
-    for name in all_names:
-        try:
-            raw_data = parser.registry[name]
-            delta_data = parser.get_delta_properties(name)
-            path = parser.name_to_path[name]
-            db.insert_filament(name, raw_data, delta_data, path)
-        except Exception as e:
-            print(f"Error processing {name}: {e}")
+    print(f"Found {len(parser.registry)} entities. Resolving + writing JSONL...")
 
-    # Collapse printer/nozzle variants (Bambu ships ~1600 rows that share
-    # ~98 filament_ids) down to one canonical @base row per filament.
-    # Inheritance resolution still works — the shared ancestor templates
-    # (fdm_filament_*) are left untouched.
-    db.dedupe_variants()
+    written = write_jsonl(parser, out_path)
+    size = os.path.getsize(out_path)
+    print(f"Done! Wrote {written} resolved filament rows to {out_path} ({size} bytes)")
 
-    db.finalize()
-    print(f"Done! Database created at {db_path}")
 
 if __name__ == "__main__":
     main()

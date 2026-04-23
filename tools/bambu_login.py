@@ -42,6 +42,8 @@ class BambuCloud:
             return None
 
         data = response.json()
+        print(f"[*] Received login response")
+        print(json.dumps(data, indent=2))
 
         # Handle Verification Code or TFA
         login_type = data.get("loginType")
@@ -81,6 +83,8 @@ class BambuCloud:
             else:
                 print(f"[!] TFA failed: {response.text}")
                 return None
+        print(f"[*] Received token info")
+        print(json.dumps(data, indent=2))
 
         if "accessToken" in data:
             return data["accessToken"]

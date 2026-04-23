@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the SpoolHard filaments.db SQLite database from the upstream
-# BambuStudio profiles.
+# Build the SpoolHard filaments.jsonl from upstream BambuStudio profiles.
 #
 # Sparse-clones JUST `resources/profiles/BBL/filament/` from
 # bambulab/BambuStudio (the multi-GB full repo would otherwise have to
 # come down), feeds the JSONs to scripts/bambu-filaments/main.py, and
-# writes the resulting filaments.db into the output directory. The
-# console firmware loads this DB at runtime via the web UI's filaments
+# writes the resulting filaments.jsonl into the output directory. The
+# console firmware loads this file at runtime via the web UI's filaments
 # upload — bundling it as a separate release artifact lets users grab a
-# fresh DB without reflashing.
+# fresh copy without reflashing.
+#
+# Replaces the older filaments.db (SQLite) pipeline. Script name kept for
+# CI compatibility; the artifact it produces is now JSONL.
 #
 # Usage:
-#   ./scripts/build_filaments_db.sh                  # writes release/filaments.db
-#   ./scripts/build_filaments_db.sh path/to/out/dir  # writes <dir>/filaments.db
+#   ./scripts/build_filaments_db.sh                  # writes release/filaments.jsonl
+#   ./scripts/build_filaments_db.sh path/to/out/dir  # writes <dir>/filaments.jsonl
 #   ./scripts/build_filaments_db.sh --ref <branch>   # use non-master branch
 #
 # Requires: git, uv (https://github.com/astral-sh/uv), Python ≥ 3.10.
@@ -39,7 +41,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/release}"
-OUTPUT_DB="$OUTPUT_DIR/filaments.db"
+OUTPUT_FILE="$OUTPUT_DIR/filaments.jsonl"
 
 WORK_DIR="$(mktemp -d)"
 trap "rm -rf $WORK_DIR" EXIT
@@ -62,22 +64,24 @@ COUNT=$(find "$PROFILE_DIR" -name '*.json' | wc -l)
 COMMIT=$(git -C "$WORK_DIR/bs" rev-parse --short HEAD)
 echo "   pulled $COUNT JSON profiles (BambuStudio @ $COMMIT)"
 
-echo "── Parsing → SQLite..."
+echo "── Resolving inheritance → JSONL..."
 mkdir -p "$OUTPUT_DIR"
-# main.py uses cwd as the input directory and writes filaments.db to cwd
-# too. PYTHONPATH lets it import its sibling parser/database modules from
-# the parser dir. uv handles the pydantic dependency.
+# main.py uses cwd as the input directory and writes filaments.jsonl to
+# cwd. PYTHONPATH lets it import its sibling parser/jsonl_writer modules
+# from the parser dir. uv handles the pydantic dependency.
 ( cd "$PROFILE_DIR" && \
     PYTHONPATH="$PARSER_DIR" uv --quiet --project "$PARSER_DIR" run \
         python "$PARSER_DIR/main.py" )
 
-mv "$PROFILE_DIR/filaments.db" "$OUTPUT_DB"
+mv "$PROFILE_DIR/filaments.jsonl" "$OUTPUT_FILE"
 
-SIZE=$(du -h "$OUTPUT_DB" | cut -f1)
-SHA=$(sha256sum "$OUTPUT_DB" | cut -d' ' -f1)
+SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
+SHA=$(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)
+ROWS=$(wc -l < "$OUTPUT_FILE")
 echo
 echo "══════════════════════════════════════════════════════"
-echo "  filaments.db  →  $OUTPUT_DB"
+echo "  filaments.jsonl  →  $OUTPUT_FILE"
+echo "  rows:    $ROWS"
 echo "  size:    $SIZE"
 echo "  sha256:  $SHA"
 echo "  source:  bambulab/BambuStudio @ $COMMIT"

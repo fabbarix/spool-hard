@@ -2,7 +2,7 @@ name: Release on tag
 
 # Fires when a `v*` tag is pushed (typically via the local
 # update_changelog.sh + bump-VERSION + commit + git tag flow). Builds
-# both products' release artifacts, builds the filaments DB from the
+# both products' release artifacts, builds the filaments JSONL from the
 # upstream BambuStudio profiles, renames everything to the
 # `spoolhard-<product>-<file>` convention the flasher app expects, and
 # attaches it all to a GitHub Release with notes pulled from
@@ -100,13 +100,14 @@ jobs:
             --asset-prefix "spoolhard-scale-" \
             --output-dir   release/scale
 
-      - name: Build filaments DB
+      - name: Build filaments JSONL
         run: ./scripts/build_filaments_db.sh release
 
       # ── Stage assets with the prefixed names ────────────────
       # GitHub Releases is a flat namespace, so we flatten + rename
-      # each per-product dir into out/. filaments.db is shared and
-      # uploaded without a prefix.
+      # each per-product dir into out/. filaments.jsonl is shared
+      # (only the console consumes it today, but it's product-agnostic
+      # data) and uploaded without a per-product prefix.
       - name: Stage release assets
         run: |
           mkdir -p out
@@ -115,7 +116,7 @@ jobs:
               cp "$f" "out/spoolhard-${product}-$(basename "$f")"
             done
           done
-          cp release/filaments.db out/filaments.db
+          cp release/filaments.jsonl out/filaments.jsonl
           echo "── Final asset list ──"
           ls -la out
 
