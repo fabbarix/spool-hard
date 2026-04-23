@@ -8,6 +8,11 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.3.0] - 2026-04-22
+
+- feat: bambu-filaments build pipeline emits filaments.jsonl (replaces SQLite); cloud-helper tools
+- feat: Filaments tab + AMS tray_info_idx sync + per-spool empty marker + per-(filament, nozzle) PA + remote /api/logs
+
 ## [0.2.7] - 2026-04-22
 
 Bambu Cloud login: paste-blob workflow + soft-verify.
