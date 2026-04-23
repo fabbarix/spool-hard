@@ -185,10 +185,19 @@ void ScaleLink::_markDisconnected(const char* reason) {
     if (!_connected) return;
     Serial.printf("[ScaleLink] Disconnected (%s)\n", reason);
     _connected = false;
-    // Drop the cached OtaPending — once the link is down we have no idea
-    // whether the scale's pending state has shifted, so the UI should
-    // fall back to "unknown" rather than show stale latest-version data.
-    _scaleOta         = ScaleOtaPending{};
+    // Keep the cached OtaPending across disconnects. Earlier code wiped
+    // the cache on every disconnect, which meant a link flap (the WS
+    // bounces every few minutes under load) reset the frontend to
+    // "scale waiting" until the scale's next push landed — sometimes
+    // many seconds. Versions almost never change on a flap, so showing
+    // the last-known snapshot with the offline pill is strictly more
+    // useful than blanking it. The scale force-pushes a fresh
+    // OtaPending on every reconnect (g_pendingPushPending), so any
+    // genuine version change updates promptly.
+    //
+    // The in-flight tracker DOES clear — a half-completed scale OTA
+    // can't be resumed across a link drop, so showing "60% installing"
+    // when the link is down would be a lie.
     _scaleOtaInFlight = ScaleOtaInFlight{};
     if (_onDisconnect) _onDisconnect();
     _refreshHandshakeState();

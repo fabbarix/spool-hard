@@ -180,7 +180,6 @@ export function OtaSection() {
   const lbl = statusLabel(status.data?.last_check_status ?? '');
 
   const consolePending = !!con?.pending;
-  const scaleOnline    = scl?.link === 'online';
   const scalePending   = !!scl?.pending;
   const anyPending     = consolePending || scalePending;
 
@@ -250,7 +249,14 @@ export function OtaSection() {
           icon={<Scale size={14} />}
           label="Scale"
           badge={<ScaleLinkPill link={scl?.link ?? 'offline'} />}
-          info={scaleOnline ? {
+          // Version info is rendered whenever the firmware has a cached
+          // OtaPending snapshot — even when the WS link is currently
+          // offline or in the brief reconnect-waiting window. The
+          // backend keeps the snapshot across link drops; the link pill
+          // alone tells the user about liveness. Earlier we hid versions
+          // unless link === 'online', which collapsed to "unavailable"
+          // on every flap.
+          info={scl?.firmware_current ? {
             fwCurrent: scl?.firmware_current,
             fwLatest:  scl?.firmware_latest,
             feCurrent: scl?.frontend_current,

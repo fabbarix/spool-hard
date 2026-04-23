@@ -977,15 +977,20 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
         ip["percent"] = g_ota_in_flight.percent;
     }
 
-    // Scale block: cached from the most recent OtaPending frame the scale
-    // pushed. `link == "online"` only when the WS link is up AND we've
-    // received at least one snapshot since connect; "offline" otherwise so
-    // the UI can dim the panel rather than imply there's nothing to update.
+    // Scale block: link state and the cached OtaPending snapshot are
+    // reported independently. Earlier code only emitted version fields
+    // when (linkUp && sop.valid), which had the awkward effect of
+    // showing "unavailable" + "scale waiting" during the brief window
+    // between WS reconnect and the scale's first push — and on every
+    // link flap. Now: link reflects the live WS state; versions come
+    // from the cache whenever it's been seeded at least once. The
+    // cache survives disconnects (see ScaleLink::_markDisconnected) so
+    // the UI keeps the last-known snapshot until a fresh one arrives.
     JsonObject scale = doc["scale"].to<JsonObject>();
     bool linkUp = _scale && _scale->isConnected();
     const auto& sop = _scale ? _scale->scaleOtaPending() : ScaleLink::ScaleOtaPending{};
-    if (linkUp && sop.valid) {
-        scale["link"]              = "online";
+    scale["link"] = linkUp ? (sop.valid ? "online" : "waiting") : "offline";
+    if (sop.valid) {
         scale["firmware_current"]  = sop.firmware_current;
         scale["firmware_latest"]   = sop.firmware_latest;
         scale["frontend_current"]  = sop.frontend_current;
@@ -994,7 +999,6 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
         scale["last_check_status"] = sop.last_check_status;
         scale["pending"]           = sop.firmware_update || sop.frontend_update;
     } else {
-        scale["link"]    = linkUp ? "waiting" : "offline";
         scale["pending"] = false;
     }
     if (_scale) {
