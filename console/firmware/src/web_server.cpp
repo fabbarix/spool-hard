@@ -366,6 +366,37 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleCloudFilamentByName(req);
     });
+    _server.on("/api/bambu-cloud/public-cache", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCloudPublicCacheGet(req);
+    });
+    _server.on("/api/bambu-cloud/public-cache/refresh", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCloudPublicCacheRefresh(req);
+    });
+    _server.on("/api/bambu-cloud/public-cache", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCloudPublicCacheDelete(req);
+    });
+    _server.on("/api/bambu-cloud/public-cache/upload", HTTP_POST,
+        [this](AsyncWebServerRequest* req) {
+            // Final response handler — `_cacheUploadFile` is closed in
+            // the chunk handler when `final` lands. If the file's there,
+            // this is a success. The frontend re-polls the cache-status
+            // endpoint to get entry count + bytes (avoids depending on
+            // helpers defined later in the TU).
+            if (g_sd.isMounted() && SD.exists(CLOUD_PUBLIC_CACHE_PATH)) {
+                req->send(200, "application/json", "{\"ok\":true}");
+            } else {
+                req->send(400, "application/json",
+                          "{\"error\":\"upload landed nowhere — SD missing or write failed\"}");
+            }
+        },
+        [this](AsyncWebServerRequest* req, const String& filename, size_t index,
+               uint8_t* data, size_t len, bool final) {
+            _handleCloudPublicCacheUpload(req, filename, index, data, len, final);
+        }
+    );
 
     _server.on("/api/user-filaments", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentsList(req);
@@ -1742,6 +1773,129 @@ void ConsoleWebServer::_handleUserFilamentCloudDetail(AsyncWebServerRequest* req
     req->send(200, "application/json", body);
 }
 
+// ── Public-catalog cache ───────────────────────────────────────
+//
+// Bambu's edge unreliably filters the public-catalog response for the
+// device's request signature, so once we get a working response we
+// persist a slim {name, setting_id} JSONL on SD and serve all
+// subsequent name lookups from there. Refresh is user-initiated.
+namespace {
+
+struct PublicCacheStats {
+    bool     present  = false;
+    size_t   bytes    = 0;
+    uint32_t mtime_s  = 0;
+    int      entries  = -1;   // -1 = not counted
+};
+
+PublicCacheStats statCache() {
+    PublicCacheStats s;
+    if (!g_sd.isMounted()) return s;
+    File f = SD.open(CLOUD_PUBLIC_CACHE_PATH, FILE_READ);
+    if (!f) return s;
+    s.present = true;
+    s.bytes   = f.size();
+    s.mtime_s = f.getLastWrite();
+    int n = 0;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        if (line.length() > 1) ++n;
+    }
+    s.entries = n;
+    f.close();
+    return s;
+}
+
+// Streaming line scan — avoids loading 85 KB of names into RAM. Returns
+// true and fills `settingIdOut` on first match.
+bool scanCacheForName(const String& name, String& settingIdOut) {
+    if (!g_sd.isMounted()) return false;
+    File f = SD.open(CLOUD_PUBLIC_CACHE_PATH, FILE_READ);
+    if (!f) return false;
+    bool found = false;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        if (line.length() < 5) continue;
+        // Cheap pre-filter: only deserialise lines that contain the
+        // exact name substring. Saves ~98% of the JSON parses on misses.
+        if (line.indexOf(name) < 0) continue;
+        JsonDocument row;
+        if (deserializeJson(row, line)) continue;
+        const char* n = row["name"] | "";
+        if (name.equals(n)) {
+            settingIdOut = row["setting_id"].as<String>();
+            found = true;
+            break;
+        }
+    }
+    f.close();
+    return found;
+}
+
+enum class RefreshResult { Ok, Empty, Unreachable, Rejected, IoError };
+
+// Pull the public list, filter-parse, write the slim {name, setting_id}
+// JSONL to SD. On `Empty` (cloud returned `public:[]`, the typical
+// edge-filter case) the existing cache file is preserved — we never
+// wipe a working catalog with a known-bad response.
+RefreshResult refreshPublicCache(int& entriesOut, String& errMsgOut) {
+    entriesOut = 0;
+    String listPath = "/v1/iot-service/api/slicer/setting?version=02.04.00.70&public=true";
+    dlog("CloudFil", "public-cache refresh: fetching (psram_free=%u)",
+         (unsigned)ESP.getFreePsram());
+    auto resp = g_bambu_cloud.apiGet(g_bambu_cloud.region(), listPath.c_str(),
+                                      g_bambu_cloud.token());
+    dlog("CloudFil", "public-cache refresh: HTTP=%d, body=%u bytes",
+         resp.httpStatus, (unsigned)resp.body.length());
+    if (resp.cfBlocked) { errMsgOut = "cloudflare blocked the request"; return RefreshResult::Unreachable; }
+    if (resp.httpStatus <= 0) { errMsgOut = "transport failure"; return RefreshResult::Unreachable; }
+    if (resp.httpStatus >= 400) { errMsgOut = String("HTTP ") + resp.httpStatus; return RefreshResult::Rejected; }
+
+    JsonDocument filter;
+    filter["filament"]["public"][0]["name"]       = true;
+    filter["filament"]["public"][0]["setting_id"] = true;
+    JsonDocument doc;
+    DeserializationError jerr = deserializeJson(doc, resp.body,
+                                                 DeserializationOption::Filter(filter));
+    resp.body = String();
+    if (jerr) { errMsgOut = String("JSON parse: ") + jerr.c_str(); return RefreshResult::Rejected; }
+
+    JsonArrayConst arr = doc["filament"]["public"].as<JsonArrayConst>();
+    if (arr.size() == 0) {
+        // Edge filtered us — keep the existing cache untouched.
+        errMsgOut = "cloud returned empty public catalog (Bambu's edge "
+                    "filters this for the device's request signature)";
+        return RefreshResult::Empty;
+    }
+
+    if (!g_sd.isMounted()) { errMsgOut = "SD not mounted"; return RefreshResult::IoError; }
+    // Write to a temp file and rename, so a partial write doesn't corrupt
+    // an existing cache.
+    const char* tmpPath = CLOUD_PUBLIC_CACHE_PATH ".tmp";
+    File out = SD.open(tmpPath, FILE_WRITE);
+    if (!out) { errMsgOut = "SD open .tmp failed"; return RefreshResult::IoError; }
+    int n = 0;
+    for (JsonObjectConst e : arr) {
+        const char* nm = e["name"]       | "";
+        const char* sd_ = e["setting_id"] | "";
+        if (!*nm || !*sd_) continue;
+        JsonDocument row;
+        row["name"]       = nm;
+        row["setting_id"] = sd_;
+        String line; serializeJson(row, line);
+        out.print(line); out.print('\n');
+        ++n;
+    }
+    out.close();
+    SD.remove(CLOUD_PUBLIC_CACHE_PATH);
+    SD.rename(tmpPath, CLOUD_PUBLIC_CACHE_PATH);
+    entriesOut = n;
+    dlog("CloudFil", "public-cache refresh: wrote %d entries to %s", n, CLOUD_PUBLIC_CACHE_PATH);
+    return RefreshResult::Ok;
+}
+
+}  // namespace
+
 void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
     if (!g_bambu_cloud.haveToken()) {
         req->send(400, "application/json",
@@ -1770,93 +1924,51 @@ void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
         req->send(200, "application/json", out);
     };
 
-    // ── 1. Fetch the public catalog. ~580 KB on the wire — relies on
-    //      arduino-esp32's PSRAM-backed String allocator. The free heap
-    //      after this call drops by ~580 KB; before fetching we log a
-    //      sanity-check on PSRAM availability so a runaway request
-    //      doesn't silently OOM.
-    // Dotted-zero-padded version is required to unlock the public catalog
-    // — see bambu_cloud_filaments.cpp:kSlicerVersion comment.
-    String listPath = "/v1/iot-service/api/slicer/setting?version=02.04.00.70&public=true";
-    String listUrl  = String(BambuCloudAuth::regionBaseUrl(g_bambu_cloud.region())) + listPath;
-    dlog("CloudFil", "filament-by-name: fetching public list (psram_free=%u)",
-         (unsigned)ESP.getFreePsram());
-    auto listResp = g_bambu_cloud.apiGet(g_bambu_cloud.region(), listPath.c_str(),
-                                          g_bambu_cloud.token());
-    dlog("CloudFil", "filament-by-name: list HTTP=%d, body=%u bytes",
-         listResp.httpStatus, (unsigned)listResp.body.length());
-    if (listResp.cfBlocked || listResp.httpStatus <= 0) {
-        envelopeError("unreachable", "list public", listUrl, listResp.httpStatus,
-                      listResp.cfBlocked, listResp.body);
-        return;
-    }
-    if (listResp.httpStatus >= 400) {
-        envelopeError("rejected", "list public", listUrl, listResp.httpStatus,
-                      false, listResp.body);
-        return;
-    }
-
-    // ── 2. Filter-parse — keep only the {name, setting_id} pairs from
-    //      filament.public. Cuts the working JsonDocument from ~580 KB
-    //      to ~85 KB.
-    JsonDocument filter;
-    filter["filament"]["public"][0]["name"]       = true;
-    filter["filament"]["public"][0]["setting_id"] = true;
-    filter["filament"]["private"][0]["name"]      = true;
-    filter["filament"]["private"][0]["setting_id"] = true;
-    JsonDocument doc;
-    DeserializationError jerr = deserializeJson(doc, listResp.body,
-                                                 DeserializationOption::Filter(filter));
-    listResp.body = String();   // free the 580 KB now that we've parsed it
-    if (jerr) {
-        envelopeError("rejected", "list public (JSON parse failed)", listUrl, 200, false, jerr.c_str());
-        return;
-    }
-    unsigned npub  = doc["filament"]["public"].as<JsonArrayConst>().size();
-    unsigned npriv = doc["filament"]["private"].as<JsonArrayConst>().size();
-    dlog("CloudFil", "filament-by-name: filter ok — public=%u private=%u entries",
-         npub, npriv);
-    if (npub == 0) {
-        // Bambu's edge selectively returns `filament.public:[]` for our
-        // request signature even when `?public=true` is set. Same call
-        // from a desktop returns 1600 entries; the firmware (different
-        // TLS fingerprint, no slicer-session cookies) gets nothing.
-        // Surface the mismatch so the UI can show a meaningful message
-        // — "couldn't load public catalog from cloud" — instead of just
-        // "no preset matches".
-        envelopeError("rejected",
-                      "list public (cloud returned empty public catalog — "
-                      "Bambu's edge filters this for the device's request signature)",
-                      listUrl, 200, false, "");
-        return;
-    }
-
-    // ── 3. Walk the filtered list. The catalog has a few thousand
-    //      entries; linear scan is fine.
+    // ── 1. Cache lookup. Most calls land here without a cloud round-trip
+    //      after the user's first successful refresh.
     String matchedId;
-    for (JsonObjectConst e : doc["filament"]["public"].as<JsonArrayConst>()) {
-        const char* candidate = e["name"] | "";
-        if (name.equals(candidate)) {
-            matchedId = e["setting_id"].as<String>();
-            break;
+    PublicCacheStats stats = statCache();
+    if (stats.present) {
+        if (scanCacheForName(name, matchedId)) {
+            dlog("CloudFil", "filament-by-name: cache hit '%s' -> %s",
+                 name.c_str(), matchedId.c_str());
         }
     }
+
+    // ── 2. Cache miss (or no cache yet) — try a one-shot refresh from
+    //      the cloud. If Bambu's edge filters us, the existing cache (if
+    //      any) is preserved and we surface a clear rejection.
+    String listUrl = String(BambuCloudAuth::regionBaseUrl(g_bambu_cloud.region())) +
+                     "/v1/iot-service/api/slicer/setting?version=02.04.00.70&public=true";
     if (matchedId.isEmpty()) {
-        // Try the user's private list too — some inheritance chains
-        // bottom out in another preset they also own.
-        for (JsonObjectConst e : doc["filament"]["private"].as<JsonArrayConst>()) {
-            const char* candidate = e["name"] | "";
-            if (name.equals(candidate)) {
-                matchedId = e["setting_id"].as<String>();
-                break;
-            }
+        int n; String why;
+        RefreshResult rr = refreshPublicCache(n, why);
+        if (rr == RefreshResult::Unreachable) {
+            envelopeError("unreachable", "list public — " + why, listUrl, 0, false, "");
+            return;
         }
-    }
-    if (matchedId.isEmpty()) {
-        dlog("CloudFil", "filament-by-name: no public preset named '%s'", name.c_str());
-        req->send(404, "application/json",
-                  "{\"error\":\"no preset matches that name\"}");
-        return;
+        if (rr == RefreshResult::Rejected) {
+            envelopeError("rejected", "list public — " + why, listUrl, 200, false, "");
+            return;
+        }
+        if (rr == RefreshResult::Empty) {
+            envelopeError("rejected",
+                          "list public — " + why,
+                          listUrl, 200, false, "");
+            return;
+        }
+        if (rr == RefreshResult::IoError) {
+            envelopeError("rejected", "cache write — " + why, listUrl, 200, false, "");
+            return;
+        }
+        // Fresh cache landed — try the lookup again.
+        if (!scanCacheForName(name, matchedId)) {
+            dlog("CloudFil", "filament-by-name: refreshed cache (%d entries) but no name match for '%s'",
+                 n, name.c_str());
+            req->send(404, "application/json",
+                      "{\"error\":\"no preset matches that name\"}");
+            return;
+        }
     }
     dlog("CloudFil", "filament-by-name: matched '%s' -> %s",
          name.c_str(), matchedId.c_str());
@@ -1896,6 +2008,95 @@ void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
     }
     String body; serializeJson(resp, body);
     req->send(200, "application/json", body);
+}
+
+void ConsoleWebServer::_handleCloudPublicCacheGet(AsyncWebServerRequest* req) {
+    PublicCacheStats s = statCache();
+    JsonDocument doc;
+    doc["present"] = s.present;
+    if (s.present) {
+        doc["bytes"]   = (uint32_t)s.bytes;
+        doc["mtime_s"] = s.mtime_s;
+        doc["entries"] = s.entries;
+    }
+    doc["path"] = CLOUD_PUBLIC_CACHE_PATH;
+    String out; serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+void ConsoleWebServer::_handleCloudPublicCacheRefresh(AsyncWebServerRequest* req) {
+    if (!g_bambu_cloud.haveToken()) {
+        req->send(400, "application/json",
+                  "{\"error\":\"no Bambu Cloud token configured\"}");
+        return;
+    }
+    int n = 0;
+    String why;
+    RefreshResult rr = refreshPublicCache(n, why);
+    JsonDocument doc;
+    switch (rr) {
+        case RefreshResult::Ok:
+            doc["status"]  = "ok";
+            doc["entries"] = n;
+            break;
+        case RefreshResult::Empty:
+            doc["status"]  = "empty";
+            doc["error"]   = why;
+            doc["preserved_existing_cache"] = statCache().present;
+            break;
+        case RefreshResult::Unreachable:
+            doc["status"] = "unreachable";
+            doc["error"]  = why;
+            break;
+        case RefreshResult::Rejected:
+            doc["status"] = "rejected";
+            doc["error"]  = why;
+            break;
+        case RefreshResult::IoError:
+            doc["status"] = "io_error";
+            doc["error"]  = why;
+            break;
+    }
+    String out; serializeJson(doc, out);
+    int code = (rr == RefreshResult::Ok) ? 200 : 200; // always 200 — frontend reads `status`
+    req->send(code, "application/json", out);
+}
+
+void ConsoleWebServer::_handleCloudPublicCacheUpload(AsyncWebServerRequest* req,
+                                                     const String& filename, size_t index,
+                                                     uint8_t* data, size_t len, bool final) {
+    (void)req; (void)filename;
+    if (index == 0) {
+        if (!g_sd.isMounted()) return;
+        // Stage to .tmp; rename on `final` so a partial upload doesn't
+        // wipe the existing cache. Same atomic-swap pattern as
+        // refreshPublicCache().
+        const char* tmpPath = CLOUD_PUBLIC_CACHE_PATH ".tmp";
+        SD.remove(tmpPath);
+        _cacheUploadFile = SD.open(tmpPath, FILE_WRITE);
+    }
+    if (_cacheUploadFile && len) _cacheUploadFile.write(data, len);
+    if (final) {
+        if (_cacheUploadFile) {
+            _cacheUploadFile.close();
+            const char* tmpPath = CLOUD_PUBLIC_CACHE_PATH ".tmp";
+            SD.remove(CLOUD_PUBLIC_CACHE_PATH);
+            SD.rename(tmpPath, CLOUD_PUBLIC_CACHE_PATH);
+            dlog("CloudFil", "public-cache upload: %s", CLOUD_PUBLIC_CACHE_PATH);
+        }
+    }
+}
+
+void ConsoleWebServer::_handleCloudPublicCacheDelete(AsyncWebServerRequest* req) {
+    bool removed = false;
+    if (g_sd.isMounted() && SD.exists(CLOUD_PUBLIC_CACHE_PATH)) {
+        removed = SD.remove(CLOUD_PUBLIC_CACHE_PATH);
+    }
+    JsonDocument doc;
+    doc["ok"]      = true;
+    doc["removed"] = removed;
+    String out; serializeJson(doc, out);
+    req->send(200, "application/json", out);
 }
 
 // ── Printer CRUD + state ────────────────────────────────────

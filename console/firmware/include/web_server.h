@@ -118,6 +118,23 @@ private:
     // printer-specific @<printer> variants the local stock library
     // doesn't ship.
     void _handleCloudFilamentByName(AsyncWebServerRequest* req);
+    // Cached name→setting_id index of Bambu's public filament catalog,
+    // persisted on SD as JSONL. Bambu's edge unreliably filters
+    // `filament.public` out of the public-list response for the
+    // device's request signature, so we cache the working result the
+    // first time we get one and use it for subsequent name lookups.
+    // The user can force a refresh from the BambuLab Cloud config tab.
+    void _handleCloudPublicCacheGet(AsyncWebServerRequest* req);
+    void _handleCloudPublicCacheRefresh(AsyncWebServerRequest* req);
+    void _handleCloudPublicCacheDelete(AsyncWebServerRequest* req);
+    // Direct JSONL upload — fallback for when Bambu's edge persistently
+    // filters the device's request signature. The user dumps the
+    // catalog from a desktop curl and posts the file here. Same wire
+    // format the refresh endpoint writes.
+    void _handleCloudPublicCacheUpload(AsyncWebServerRequest* req,
+                                       const String& filename, size_t index,
+                                       uint8_t* data, size_t len, bool final);
+    File _cacheUploadFile;
     void _handleScaleLinkStatus(AsyncWebServerRequest* req);
     void _handleScaleSecretGet(AsyncWebServerRequest* req);
     void _handleScaleSecretPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);

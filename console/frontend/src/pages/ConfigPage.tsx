@@ -13,6 +13,7 @@ import { DisplaySection } from '../components/config/DisplaySection';
 import { QuickWeightsSection } from '../components/config/QuickWeightsSection';
 import { FilamentsDbSection } from '../components/config/FilamentsDbSection';
 import { BambuCloudSection } from '../components/config/BambuCloudSection';
+import { CloudPublicCacheSection } from '../components/config/CloudPublicCacheSection';
 import { BackupRestoreSection } from '../components/config/BackupRestoreSection';
 import { DebugSection } from '../components/config/DebugSection';
 
@@ -73,7 +74,12 @@ export function ConfigPage() {
 
         {activeTab === 'printers' && <PrintersSection />}
 
-        {activeTab === 'cloud' && <BambuCloudSection />}
+        {activeTab === 'cloud' && (
+          <div className="space-y-4">
+            <BambuCloudSection />
+            <CloudPublicCacheSection />
+          </div>
+        )}
 
         {activeTab === 'security' && <SecurityKeySection />}
 

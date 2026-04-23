@@ -59,6 +59,16 @@
 // spools.jsonl) — see UserFilamentsStore.
 #define USER_FILAMENTS_PATH  "/user_filaments.jsonl"
 
+// Cached slim view of Bambu Cloud's public filament catalog —
+// {"name","setting_id"} pairs, one per line. ~85 KB for the full
+// ~1600 entries. Populated on the first successful walk of
+// `/v1/iot-service/api/slicer/setting?public=true` (Bambu's edge
+// unreliably filters this for the device's request signature) and
+// re-used for subsequent inheritance lookups so we don't have to
+// fight the WAF on every name resolve. Refresh is user-initiated
+// from the Config UI — never auto-overwritten with an empty result.
+#define CLOUD_PUBLIC_CACHE_PATH  "/cloud_filaments_pub.jsonl"
+
 // ── NVS namespaces ──────────────────────────────────────────
 #define NVS_NS_WIFI          "wifi_cfg"
 #define NVS_KEY_SSID         "ssid"
