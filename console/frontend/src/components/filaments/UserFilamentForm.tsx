@@ -4,7 +4,7 @@ import { Button } from '@spoolhard/ui/components/Button';
 import { InputField } from '@spoolhard/ui/components/InputField';
 import {
   useUpsertUserFilament,
-  useCloudFilamentByName,
+  useCloudFilamentByName, useCloudFilamentById,
   cloudBodyToFilamentEntry,
   resolveUserFilament,
   type UserFilament,
@@ -69,21 +69,30 @@ export function UserFilamentForm({
     return stockDb.data.entries.find((e) => e.setting_id === id) ?? null;
   }, [form.parent_setting_id, stockDb.data]);
 
-  // Cloud-side parent (Bambu's `inherits` chain). Captured into
-  // `cloud_inherits` during sync — for cloud-synced customs this is
-  // typically the @<printer>-variant preset, which is NOT in our local
-  // stock library (the build pipeline only emits @base entries). The
-  // public-catalog cache makes this lookup fast after the first hit.
-  // Only fetched when we have no stock parent — if the user explicitly
-  // picked a local stock parent via the picker, we honour that choice.
+  // Cloud-side parent. Two paths in priority order:
+  //   1. `cloud_inherits` — a HUMAN NAME like "Bambu PETG Basic @BBL X1C
+  //      0.8 nozzle" captured during sync from the preset's
+  //      `setting.inherits` field. Resolved via the public-catalog
+  //      cache → name → setting_id → detail.
+  //   2. `base_id` — Bambu's own parent identifier ("GFSG00_02") on the
+  //      user filament. Useful when the cloud detail had no `inherits`
+  //      (some "Flow Rate Calibrated" presets carry only flow_ratio +
+  //      vendor as their override delta, no inherits string). One direct
+  //      detail call; no name resolution needed.
+  // Either path is gated behind a stock-parent check — explicit picker
+  // choice always wins.
   const cloudInherits = form.cloud_inherits ?? '';
-  const cloudParentQ = useCloudFilamentByName(
+  const cloudByName = useCloudFilamentByName(
     cloudInherits, !!cloudInherits && !stockParent,
   );
+  const baseId = form.base_id ?? '';
+  const useBaseIdFallback = !stockParent && !cloudInherits && !!baseId;
+  const cloudById = useCloudFilamentById(baseId, useBaseIdFallback);
   const cloudParent: FilamentEntry | null = useMemo(() => {
-    if (cloudParentQ.data?.status !== 'ok') return null;
-    return cloudBodyToFilamentEntry(cloudParentQ.data.body);
-  }, [cloudParentQ.data]);
+    if (cloudByName.data?.status === 'ok') return cloudBodyToFilamentEntry(cloudByName.data.body);
+    if (cloudById.data?.status   === 'ok') return cloudBodyToFilamentEntry(cloudById.data.body);
+    return null;
+  }, [cloudByName.data, cloudById.data]);
 
   // Stock parent (explicit user pick) wins; cloud parent (implicit via
   // sync) is the fallback. The resolver only consumes one parent, so

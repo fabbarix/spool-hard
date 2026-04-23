@@ -366,6 +366,10 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleCloudFilamentByName(req);
     });
+    _server.on("/api/bambu-cloud/preset", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCloudPresetById(req);
+    });
     _server.on("/api/bambu-cloud/public-cache", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCloudPublicCacheGet(req);
@@ -2003,6 +2007,63 @@ void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
         d["response_body"] = detailResp.body.length() > 512
                              ? detailResp.body.substring(0, 512) + "...[truncated]"
                              : detailResp.body;
+    } else {
+        resp["body"] = inner;
+    }
+    String body; serializeJson(resp, body);
+    req->send(200, "application/json", body);
+}
+
+void ConsoleWebServer::_handleCloudPresetById(AsyncWebServerRequest* req) {
+    if (!g_bambu_cloud.haveToken()) {
+        req->send(400, "application/json",
+                  "{\"error\":\"no Bambu Cloud token configured\"}");
+        return;
+    }
+    if (!req->hasParam("id")) {
+        req->send(400, "application/json",
+                  "{\"error\":\"missing ?id=<cloud setting_id>\"}");
+        return;
+    }
+    String id = req->getParam("id")->value();
+    String path = "/v1/iot-service/api/slicer/setting/" + id;
+    String url  = String(BambuCloudAuth::regionBaseUrl(g_bambu_cloud.region())) + path;
+    auto r = g_bambu_cloud.apiGet(g_bambu_cloud.region(), path.c_str(), g_bambu_cloud.token());
+    dlog("CloudFil", "preset-by-id %s -> HTTP %d (%u bytes)",
+         id.c_str(), r.httpStatus, (unsigned)r.body.length());
+
+    auto envelopeError = [&](const char* status, const String& stage,
+                             int httpStatus, bool cfBlocked, const String& body) {
+        JsonDocument resp;
+        resp["status"] = status;
+        JsonObject d = resp["diagnostics"].to<JsonObject>();
+        d["stage"]         = stage;
+        d["request_url"]   = url;
+        d["http_status"]   = httpStatus;
+        d["cf_blocked"]    = cfBlocked;
+        d["response_body"] = body.length() > 512 ? body.substring(0, 512) + "...[truncated]" : body;
+        String out; serializeJson(resp, out);
+        req->send(200, "application/json", out);
+    };
+    if (r.cfBlocked || r.httpStatus <= 0) {
+        envelopeError("unreachable", "preset-by-id " + id, r.httpStatus, r.cfBlocked, r.body);
+        return;
+    }
+    if (r.httpStatus >= 400) {
+        envelopeError("rejected", "preset-by-id " + id, r.httpStatus, false, r.body);
+        return;
+    }
+    JsonDocument resp;
+    resp["status"] = "ok";
+    resp["resolved_setting_id"] = id;
+    JsonDocument inner;
+    if (deserializeJson(inner, r.body)) {
+        resp["status"] = "rejected";
+        JsonObject d = resp["diagnostics"].to<JsonObject>();
+        d["stage"]         = "preset-by-id " + id + " (JSON parse failed)";
+        d["request_url"]   = url;
+        d["http_status"]   = r.httpStatus;
+        d["response_body"] = r.body.length() > 512 ? r.body.substring(0, 512) + "...[truncated]" : r.body;
     } else {
         resp["body"] = inner;
     }

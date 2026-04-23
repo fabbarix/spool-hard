@@ -342,6 +342,28 @@ export function useCloudFilamentByName(name: string, enabled: boolean) {
   });
 }
 
+// Direct detail fetch by cloud setting_id. Used when a custom has a
+// `base_id` pointing at the parent in Bambu's public catalog (e.g.
+// "GFSG00_02") but no captured `cloud_inherits` to drive the by-name
+// path. One cloud round-trip; React Query caches per-id so opening
+// the same row twice is free.
+export function useCloudFilamentById(cloud_id: string, enabled: boolean) {
+  return useQuery<CloudDetailResponse>({
+    queryKey: ['bambu-cloud-preset-by-id', cloud_id],
+    enabled,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    queryFn: async () => {
+      const r = await fetch(`/api/bambu-cloud/preset?id=${encodeURIComponent(cloud_id)}`);
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j?.error || `HTTP ${r.status}`);
+      }
+      return (await r.json()) as CloudDetailResponse;
+    },
+  });
+}
+
 export function useCloudFilamentDetail(setting_id: string, enabled: boolean) {
   return useQuery<CloudDetailResponse>({
     queryKey: ['user-filament-cloud-detail', setting_id],

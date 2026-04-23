@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   FlaskConical, Library, User as UserIcon,
   Plus, Trash2, ChevronDown, ChevronRight, Cloud, CloudUpload, RefreshCw, Thermometer, Gauge, Eye,
@@ -9,7 +9,8 @@ import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
 import {
   useUserFilaments, useDeleteUserFilament,
   useCloudSyncFilaments, useCloudPushFilament, useCloudFilamentDetail,
-  useCloudFilamentByName,
+  useCloudFilamentByName, useCloudFilamentById,
+  cloudBodyToFilamentEntry,
   resolveUserFilament,
   type UserFilament,
 } from '../hooks/useUserFilaments';
@@ -296,15 +297,33 @@ function UserFilamentRow({
   // "Show cloud details" toggle, and only for cloud-synced rows.
   const detail = useCloudFilamentDetail(r.setting_id, showCloudDetail && !!r.cloud_setting_id);
 
-  // Resolve unset fields against the parent stock entry, if any.
-  // We only fetch the stock library when the row is open — the
-  // closed-row summary uses raw fields (it shows material + vendor +
-  // max temp, all of which are usually set on the custom or parent-
-  // inheritance is moot because the parent's metadata also lacks them).
+  // Resolve unset fields against a parent — same priority order as the
+  // edit form:
+  //   1. Local stock parent (parent_setting_id from the picker)
+  //   2. Cloud parent by name (cloud_inherits from sync)
+  //   3. Cloud parent by id  (base_id, used when sync didn't capture
+  //      an inherits chain — common for "Flow Rate Calibrated" customs
+  //      whose only override is filament_flow_ratio)
+  // All lookups are gated behind `open` so closed rows don't trigger
+  // any cloud calls. React Query dedupes per-key, so adjacent rows
+  // sharing the same parent only fire one cloud call.
   const stockDb = useFilamentsDb();
-  const parent  = open && r.parent_setting_id
+  const stockParent = open && r.parent_setting_id
     ? stockDb.data?.entries.find((e) => e.setting_id === r.parent_setting_id) ?? null
     : null;
+  const cloudInherits = r.cloud_inherits ?? '';
+  const cloudByNameQ = useCloudFilamentByName(
+    cloudInherits, open && !!cloudInherits && !stockParent,
+  );
+  const baseId = r.base_id ?? '';
+  const useBaseIdFallback = open && !stockParent && !cloudInherits && !!baseId;
+  const cloudByIdQ = useCloudFilamentById(baseId, useBaseIdFallback);
+  const cloudParent = useMemo(() => {
+    if (cloudByNameQ.data?.status === 'ok') return cloudBodyToFilamentEntry(cloudByNameQ.data.body);
+    if (cloudByIdQ.data?.status   === 'ok') return cloudBodyToFilamentEntry(cloudByIdQ.data.body);
+    return null;
+  }, [cloudByNameQ.data, cloudByIdQ.data]);
+  const parent  = stockParent ?? cloudParent;
   const resolved = open ? resolveUserFilament(r, parent) : null;
 
   // Sync state pill: matches updated_at vs cloud_synced_at to detect

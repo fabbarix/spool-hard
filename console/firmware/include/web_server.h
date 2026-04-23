@@ -118,6 +118,11 @@ private:
     // printer-specific @<printer> variants the local stock library
     // doesn't ship.
     void _handleCloudFilamentByName(AsyncWebServerRequest* req);
+    // Generic detail proxy by cloud setting_id (e.g. "GFSG00_02"). Used
+    // by the form/row when a custom has a `base_id` pointing at a public
+    // catalog entry but no captured `cloud_inherits` to drive a name
+    // lookup. One cloud call, no name->id walk required.
+    void _handleCloudPresetById(AsyncWebServerRequest* req);
     // Cached name→setting_id index of Bambu's public filament catalog,
     // persisted on SD as JSONL. Bambu's edge unreliably filters
     // `filament.public` out of the public-list response for the
