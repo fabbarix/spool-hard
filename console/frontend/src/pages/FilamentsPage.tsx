@@ -9,6 +9,7 @@ import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
 import {
   useUserFilaments, useDeleteUserFilament,
   useCloudSyncFilaments, useCloudPushFilament, useCloudFilamentDetail,
+  useCloudFilamentByName,
   resolveUserFilament,
   type UserFilament,
 } from '../hooks/useUserFilaments';
@@ -567,6 +568,7 @@ function CloudDetailPanel({
   const body    = data.body ?? {};
   const setting = (body.setting ?? {}) as Record<string, unknown>;
   const settingKeys = Object.keys(setting).sort();
+  const inheritsName = setting['inherits'] as string | undefined;
 
   return (
     <div className="rounded-md border border-surface-border bg-surface-body/40 p-3 space-y-2 text-xs">
@@ -590,12 +592,13 @@ function CloudDetailPanel({
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1 font-mono">
         {body.name        && <Kv k="name"        v={String(body.name)} />}
         {body.base_id     && <Kv k="base_id"     v={String(body.base_id)} />}
-        {(setting['inherits'] as string | undefined) && (
-          <Kv k="inherits"    v={String(setting['inherits'])} highlight />
-        )}
+        {inheritsName     && <Kv k="inherits"    v={inheritsName} highlight />}
         {body.nickname    && <Kv k="nickname"    v={String(body.nickname)} />}
         {body.type        && <Kv k="type"        v={String(body.type)} />}
       </div>
+      {inheritsName && (
+        <CloudParentResolver name={inheritsName} />
+      )}
       {settingKeys.length > 0 && (
         <details className="font-mono">
           <summary className="cursor-pointer text-text-muted">
@@ -642,4 +645,53 @@ function formatSettingValue(v: unknown): string {
   if (typeof v === 'number')  return String(v);
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   return JSON.stringify(v);
+}
+
+// "Resolve from cloud" affordance for the parent name shown in a
+// cloud-detail panel. Calls /api/bambu-cloud/filament-by-name which
+// walks Bambu's public catalog on the device and returns the matched
+// preset's full detail.
+//
+// CAVEAT: the firmware-side fetch of the public catalog is unreliable
+// — Bambu's edge filters the response based on the requesting client's
+// signature (TLS fingerprint, headers). From a desktop the call returns
+// ~1600 public filament presets; from the device it usually returns an
+// empty `public:[]`. The endpoint surfaces this distinctly via its
+// `rejected` status with a "cloud returned empty public catalog"
+// stage, so the panel can show a useful message instead of a generic
+// 404. Try button is offered anyway — it works some of the time, and
+// when it does the parent's full setting blob is rendered nested.
+function CloudParentResolver({ name }: { name: string }) {
+  const [enabled, setEnabled] = useState(false);
+  const q = useCloudFilamentByName(name, enabled);
+
+  if (!enabled) {
+    return (
+      <div className="text-[11px] text-text-muted">
+        <button
+          onClick={() => setEnabled(true)}
+          className="text-brand-400 hover:text-brand-300 underline-offset-2 hover:underline transition-colors"
+        >
+          Try fetching parent from cloud
+        </button>
+        {' '}— Bambu's edge sometimes hides the public catalog from the
+        device; if so you'll see a "no public catalog" message instead.
+      </div>
+    );
+  }
+
+  return (
+    <div className="border-t border-surface-border pt-2 space-y-2">
+      <div className="text-[11px] text-text-muted">
+        Resolved parent: <span className="text-brand-400 font-mono">{name}</span>
+      </div>
+      <CloudDetailPanel
+        isFetching={q.isFetching}
+        isError={q.isError}
+        error={q.error as Error | undefined}
+        data={q.data}
+        onRefetch={() => q.refetch()}
+      />
+    </div>
+  );
 }

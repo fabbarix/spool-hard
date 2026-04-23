@@ -362,6 +362,10 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleUserFilamentCloudDetail(req);
     });
+    _server.on("/api/bambu-cloud/filament-by-name", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCloudFilamentByName(req);
+    });
 
     _server.on("/api/user-filaments", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentsList(req);
@@ -1731,6 +1735,162 @@ void ConsoleWebServer::_handleUserFilamentCloudDetail(AsyncWebServerRequest* req
         d["request_url"]   = url;
         d["http_status"]   = r.httpStatus;
         d["response_body"] = r.body.length() > 512 ? r.body.substring(0, 512) + "...[truncated]" : r.body;
+    } else {
+        resp["body"] = inner;
+    }
+    String body; serializeJson(resp, body);
+    req->send(200, "application/json", body);
+}
+
+void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
+    if (!g_bambu_cloud.haveToken()) {
+        req->send(400, "application/json",
+                  "{\"error\":\"no Bambu Cloud token configured\"}");
+        return;
+    }
+    if (!req->hasParam("name")) {
+        req->send(400, "application/json",
+                  "{\"error\":\"missing ?name=<preset name>\"}");
+        return;
+    }
+    String name = req->getParam("name")->value();
+
+    auto envelopeError = [&](const char* status, const String& stage,
+                             const String& url, int httpStatus,
+                             bool cfBlocked, const String& body) {
+        JsonDocument resp;
+        resp["status"] = status;
+        JsonObject d = resp["diagnostics"].to<JsonObject>();
+        d["stage"]         = stage;
+        d["request_url"]   = url;
+        d["http_status"]   = httpStatus;
+        d["cf_blocked"]    = cfBlocked;
+        d["response_body"] = body.length() > 512 ? body.substring(0, 512) + "...[truncated]" : body;
+        String out; serializeJson(resp, out);
+        req->send(200, "application/json", out);
+    };
+
+    // ── 1. Fetch the public catalog. ~580 KB on the wire — relies on
+    //      arduino-esp32's PSRAM-backed String allocator. The free heap
+    //      after this call drops by ~580 KB; before fetching we log a
+    //      sanity-check on PSRAM availability so a runaway request
+    //      doesn't silently OOM.
+    // Dotted-zero-padded version is required to unlock the public catalog
+    // — see bambu_cloud_filaments.cpp:kSlicerVersion comment.
+    String listPath = "/v1/iot-service/api/slicer/setting?version=02.04.00.70&public=true";
+    String listUrl  = String(BambuCloudAuth::regionBaseUrl(g_bambu_cloud.region())) + listPath;
+    dlog("CloudFil", "filament-by-name: fetching public list (psram_free=%u)",
+         (unsigned)ESP.getFreePsram());
+    auto listResp = g_bambu_cloud.apiGet(g_bambu_cloud.region(), listPath.c_str(),
+                                          g_bambu_cloud.token());
+    dlog("CloudFil", "filament-by-name: list HTTP=%d, body=%u bytes",
+         listResp.httpStatus, (unsigned)listResp.body.length());
+    if (listResp.cfBlocked || listResp.httpStatus <= 0) {
+        envelopeError("unreachable", "list public", listUrl, listResp.httpStatus,
+                      listResp.cfBlocked, listResp.body);
+        return;
+    }
+    if (listResp.httpStatus >= 400) {
+        envelopeError("rejected", "list public", listUrl, listResp.httpStatus,
+                      false, listResp.body);
+        return;
+    }
+
+    // ── 2. Filter-parse — keep only the {name, setting_id} pairs from
+    //      filament.public. Cuts the working JsonDocument from ~580 KB
+    //      to ~85 KB.
+    JsonDocument filter;
+    filter["filament"]["public"][0]["name"]       = true;
+    filter["filament"]["public"][0]["setting_id"] = true;
+    filter["filament"]["private"][0]["name"]      = true;
+    filter["filament"]["private"][0]["setting_id"] = true;
+    JsonDocument doc;
+    DeserializationError jerr = deserializeJson(doc, listResp.body,
+                                                 DeserializationOption::Filter(filter));
+    listResp.body = String();   // free the 580 KB now that we've parsed it
+    if (jerr) {
+        envelopeError("rejected", "list public (JSON parse failed)", listUrl, 200, false, jerr.c_str());
+        return;
+    }
+    unsigned npub  = doc["filament"]["public"].as<JsonArrayConst>().size();
+    unsigned npriv = doc["filament"]["private"].as<JsonArrayConst>().size();
+    dlog("CloudFil", "filament-by-name: filter ok — public=%u private=%u entries",
+         npub, npriv);
+    if (npub == 0) {
+        // Bambu's edge selectively returns `filament.public:[]` for our
+        // request signature even when `?public=true` is set. Same call
+        // from a desktop returns 1600 entries; the firmware (different
+        // TLS fingerprint, no slicer-session cookies) gets nothing.
+        // Surface the mismatch so the UI can show a meaningful message
+        // — "couldn't load public catalog from cloud" — instead of just
+        // "no preset matches".
+        envelopeError("rejected",
+                      "list public (cloud returned empty public catalog — "
+                      "Bambu's edge filters this for the device's request signature)",
+                      listUrl, 200, false, "");
+        return;
+    }
+
+    // ── 3. Walk the filtered list. The catalog has a few thousand
+    //      entries; linear scan is fine.
+    String matchedId;
+    for (JsonObjectConst e : doc["filament"]["public"].as<JsonArrayConst>()) {
+        const char* candidate = e["name"] | "";
+        if (name.equals(candidate)) {
+            matchedId = e["setting_id"].as<String>();
+            break;
+        }
+    }
+    if (matchedId.isEmpty()) {
+        // Try the user's private list too — some inheritance chains
+        // bottom out in another preset they also own.
+        for (JsonObjectConst e : doc["filament"]["private"].as<JsonArrayConst>()) {
+            const char* candidate = e["name"] | "";
+            if (name.equals(candidate)) {
+                matchedId = e["setting_id"].as<String>();
+                break;
+            }
+        }
+    }
+    if (matchedId.isEmpty()) {
+        dlog("CloudFil", "filament-by-name: no public preset named '%s'", name.c_str());
+        req->send(404, "application/json",
+                  "{\"error\":\"no preset matches that name\"}");
+        return;
+    }
+    dlog("CloudFil", "filament-by-name: matched '%s' -> %s",
+         name.c_str(), matchedId.c_str());
+
+    // ── 4. Fetch the matched preset's detail. Reuses the same path the
+    //      cloud-detail handler uses, so the wire shape is identical.
+    String detailPath = "/v1/iot-service/api/slicer/setting/" + matchedId;
+    String detailUrl  = String(BambuCloudAuth::regionBaseUrl(g_bambu_cloud.region())) + detailPath;
+    auto detailResp = g_bambu_cloud.apiGet(g_bambu_cloud.region(), detailPath.c_str(),
+                                            g_bambu_cloud.token());
+    if (detailResp.cfBlocked || detailResp.httpStatus <= 0) {
+        envelopeError("unreachable", "detail " + matchedId, detailUrl,
+                      detailResp.httpStatus, detailResp.cfBlocked, detailResp.body);
+        return;
+    }
+    if (detailResp.httpStatus >= 400) {
+        envelopeError("rejected", "detail " + matchedId, detailUrl,
+                      detailResp.httpStatus, false, detailResp.body);
+        return;
+    }
+
+    JsonDocument resp;
+    resp["status"] = "ok";
+    resp["resolved_setting_id"] = matchedId;
+    JsonDocument inner;
+    if (deserializeJson(inner, detailResp.body)) {
+        resp["status"] = "rejected";
+        JsonObject d = resp["diagnostics"].to<JsonObject>();
+        d["stage"]         = "detail " + matchedId + " (JSON parse failed)";
+        d["request_url"]   = detailUrl;
+        d["http_status"]   = detailResp.httpStatus;
+        d["response_body"] = detailResp.body.length() > 512
+                             ? detailResp.body.substring(0, 512) + "...[truncated]"
+                             : detailResp.body;
     } else {
         resp["body"] = inner;
     }

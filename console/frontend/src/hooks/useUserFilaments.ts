@@ -255,6 +255,35 @@ export interface CloudDetailResponse {
   };
   diagnostics?: CloudDiagnostics;
 }
+// Resolve a parent preset by its NAME (the `inherits` field on a cloud
+// detail body) all the way to its full detail. The firmware walks
+// Bambu's public catalog, finds the matching name, then fetches that
+// preset's detail. Returns the same envelope as useCloudFilamentDetail
+// so the same panel can render either result.
+//
+// CAVEAT: Bambu's edge filters the public-catalog response based on
+// the requesting client's signature. From a desktop the call returns
+// ~1600 public filament presets; from the device it usually returns
+// `public:[]`, in which case the firmware surfaces a `rejected`
+// envelope explaining the cause rather than a generic 404. Worth
+// trying — it occasionally succeeds — but don't promise it works.
+export function useCloudFilamentByName(name: string, enabled: boolean) {
+  return useQuery<CloudDetailResponse>({
+    queryKey: ['bambu-cloud-filament-by-name', name],
+    enabled,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    queryFn: async () => {
+      const r = await fetch(`/api/bambu-cloud/filament-by-name?name=${encodeURIComponent(name)}`);
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j?.error || `HTTP ${r.status}`);
+      }
+      return (await r.json()) as CloudDetailResponse;
+    },
+  });
+}
+
 export function useCloudFilamentDetail(setting_id: string, enabled: boolean) {
   return useQuery<CloudDetailResponse>({
     queryKey: ['user-filament-cloud-detail', setting_id],

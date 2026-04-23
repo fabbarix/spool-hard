@@ -7,7 +7,12 @@ namespace BambuCloudFilaments {
 // Slicer-version we send on the list query. The cloud uses this to
 // decide what shape to send back. Hardcoded to a recent BambuStudio
 // release; doesn't need to match what's running on a desktop.
-static constexpr const char* kSlicerVersion = "2.4.0.5";
+// Bambu's API differentiates the response shape on this string. Sniffed
+// from bambuddy + verified against api.bambulab.com: the dotted-zero-padded
+// "02.XX.XX.XX" format unlocks the public catalog (~1600 filament
+// entries) on /slicer/setting; the freeform "2.4.0.5" silently returns
+// public:[] regardless of `?public=true`. Keep this padded.
+static constexpr const char* kSlicerVersion = "02.04.00.70";
 
 // Body cap for diagnostics — keeps NVS / response budget bounded.
 // 512B is enough to pin down most cloud-side error messages.

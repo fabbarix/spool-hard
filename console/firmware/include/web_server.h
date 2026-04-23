@@ -107,6 +107,17 @@ private:
     // the brief stall is acceptable; if it becomes a hot path move it
     // to the cloud-sync FreeRTOS task pattern.
     void _handleUserFilamentCloudDetail(AsyncWebServerRequest* req);
+    // Resolve an `inherits` name from a user-filament's cloud detail
+    // (e.g. "Bambu PETG Basic @BBL X1C 0.8 nozzle") all the way to its
+    // parent preset's full detail. Walks Bambu's public catalog
+    // (~580 KB / 1600 entries; landed in PSRAM via the apiGet String)
+    // with an ArduinoJson Filter to extract just name + setting_id,
+    // finds the match, then fetches that preset's detail through the
+    // same path the user-filament cloud-detail uses. Lets the UI render
+    // a nested "parent" panel for any inheritance chain — including the
+    // printer-specific @<printer> variants the local stock library
+    // doesn't ship.
+    void _handleCloudFilamentByName(AsyncWebServerRequest* req);
     void _handleScaleLinkStatus(AsyncWebServerRequest* req);
     void _handleScaleSecretGet(AsyncWebServerRequest* req);
     void _handleScaleSecretPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
