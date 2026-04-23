@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "config.h"
 #include "spoolhard/ota.h"
+#include "spoolhard/backup.h"
 #include "load_cell.h"
 #include "console_channel.h"
 #include <Preferences.h>
@@ -316,6 +317,66 @@ void ScaleWebServer::_setupRoutes() {
     _server.on("/api/firmware-info", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleFirmwareInfo(req);
     });
+
+    // ── Backup / restore ─────────────────────────────────────
+    // Same wire format the console uses; see spoolhard_core/backup.h.
+    // Auth-gated because the file contains every secret the scale knows.
+    _server.on("/api/backup", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleBackupGet(req);
+    });
+    _server.on("/api/restore", HTTP_POST,
+        [this](AsyncWebServerRequest* req) {
+            if (!_restoreReady) {
+                req->send(400, "application/json",
+                          "{\"error\":\"upload incomplete or rejected\"}");
+                return;
+            }
+            JsonDocument doc;
+            DeserializationError jerr = deserializeJson(doc, _restoreBuffer);
+            _restoreBuffer = String();
+            _restoreReady  = false;
+            if (jerr) {
+                req->send(400, "application/json",
+                          "{\"error\":\"backup is not valid JSON\"}");
+                return;
+            }
+            String why;
+            if (!SpoolhardBackup::validate(doc, "spoolscale", why)) {
+                String body = String("{\"error\":\"") + why + "\"}";
+                req->send(400, "application/json", body);
+                return;
+            }
+            SpoolhardBackup::Source src;
+            src.nvs_namespaces = {
+                NVS_NS_WIFI, NVS_NS_CALIBRATION, NVS_NS_NFC, NVS_NS_SCALE,
+                "ota_cfg",
+            };
+            // Scale persists ALL user state in NVS — no on-disk databases
+            // to bundle. SPIFFS holds the bundled frontend assets, which
+            // ship with the firmware and are explicitly out of scope.
+            SpoolhardBackup::RestoreReport rep;
+            bool ok = SpoolhardBackup::applyRestore(src, doc, rep);
+            JsonDocument resp;
+            resp["ok"]               = ok;
+            resp["nvs_keys_set"]     = rep.nvs_keys_set;
+            resp["nvs_keys_skipped"] = rep.nvs_keys_skipped;
+            resp["files_written"]    = rep.files_written;
+            resp["files_skipped"]    = rep.files_skipped;
+            resp["errors"]           = rep.errors;
+            if (!rep.first_error.isEmpty()) resp["first_error"] = rep.first_error;
+            String body; serializeJson(resp, body);
+            req->send(ok ? 200 : 500, "application/json", body);
+            if (ok && (rep.nvs_keys_set || rep.files_written)) {
+                delay(1000); ESP.restart();
+            }
+        },
+        nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len,
+               size_t index, size_t total) {
+            _handleRestorePost(req, data, len, index, total);
+        }
+    );
 
     // ── Direct binary upload: firmware ────────────────────────
 
@@ -754,4 +815,55 @@ void ScaleWebServer::_handleFirmwareInfo(AsyncWebServerRequest* req) {
     String resp;
     serializeJson(doc, resp);
     req->send(200, "application/json", resp);
+}
+
+// ── Backup / restore ─────────────────────────────────────────
+
+void ScaleWebServer::_handleBackupGet(AsyncWebServerRequest* req) {
+    Preferences prefs;
+    prefs.begin(NVS_NS_WIFI, true);
+    String device = prefs.getString(NVS_KEY_DEVICE_NAME, "SpoolHardScale");
+    prefs.end();
+
+    SpoolhardBackup::Source src;
+    src.nvs_namespaces = {
+        NVS_NS_WIFI, NVS_NS_CALIBRATION, NVS_NS_NFC, NVS_NS_SCALE,
+        "ota_cfg",
+    };
+    // No FS mounts — all scale state lives in NVS.
+
+    JsonDocument doc;
+    SpoolhardBackup::buildBackup(src, "spoolscale", device, FW_VERSION, doc, nullptr);
+
+    String body;
+    serializeJson(doc, body);
+
+    char filename[96];
+    snprintf(filename, sizeof(filename),
+             "attachment; filename=\"spoolhard-scale-%s-backup.json\"",
+             device.c_str());
+    AsyncWebServerResponse* resp =
+        req->beginResponse(200, "application/json", body);
+    resp->addHeader("Content-Disposition", filename);
+    req->send(resp);
+}
+
+void ScaleWebServer::_handleRestorePost(AsyncWebServerRequest* req,
+                                        uint8_t* data, size_t len,
+                                        size_t index, size_t total) {
+    if (index == 0) {
+        if (!_requireAuth(req)) {
+            _restoreReady = false;
+            return;
+        }
+        _restoreBuffer = String();
+        _restoreReady  = false;
+        if (total > 0 && total < 1 * 1024 * 1024) {
+            _restoreBuffer.reserve(total);
+        }
+    }
+    if (len > 0) _restoreBuffer.concat((const char*)data, len);
+    if (index + len >= total) {
+        _restoreReady = true;
+    }
 }

@@ -69,6 +69,15 @@ private:
     void _handleScaleConfigGet(AsyncWebServerRequest* req);
     void _handleScaleConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
 
+    // Backup / restore — same wire format as the console; see
+    // spoolhard_core/backup.h. Restore parses the upload, applies it,
+    // then reboots so the new state takes effect cleanly.
+    void _handleBackupGet(AsyncWebServerRequest* req);
+    void _handleRestorePost(AsyncWebServerRequest* req,
+                            uint8_t* data, size_t len, size_t index, size_t total);
+    String _restoreBuffer;
+    bool   _restoreReady = false;
+
     // Per-upload state. Only one upload runs at a time (Arduino's Update lib
     // is a singleton), so a single matcher + rejection flag is sufficient.
     ProductSignatureMatcher _uploadMatcher;

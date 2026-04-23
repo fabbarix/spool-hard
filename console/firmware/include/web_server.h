@@ -143,6 +143,20 @@ private:
     bool        _filamentsUploadOk    = false;
     const char* _filamentsUploadErr   = "no upload";
 
+    // Backup / restore. The download endpoint serializes a single JSON
+    // document with every NVS namespace + filesystem file the console
+    // owns; restore parses an upload of the same shape and writes
+    // everything back. See spoolhard_core/backup.h for the wire format.
+    void _handleBackupGet(AsyncWebServerRequest* req);
+    void _handleRestorePost(AsyncWebServerRequest* req,
+                            uint8_t* data, size_t len, size_t index, size_t total);
+    // Restore is delivered in chunks (the file can be ~hundreds of KB);
+    // accumulate into PSRAM until the final chunk lands, then parse +
+    // apply in the response handler. Reset on every new upload.
+    String _restoreBuffer;
+    bool   _restoreReady = false;
+    String _restoreError;
+
 public:
     // Debug toggles (session-only; default off on every boot). Exposed as
     // public so hot-path code in bambu_printer etc. can check them without

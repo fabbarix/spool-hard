@@ -6,6 +6,7 @@ import { SecurityKeySection } from '../components/config/SecurityKeySection';
 import { ScaleSection } from '../components/config/ScaleSection';
 import { OtaSection } from '../components/config/OtaSection';
 import { DirectUploadSection } from '../components/config/DirectUploadSection';
+import { BackupRestoreSection } from '../components/config/BackupRestoreSection';
 import { DeviceControlSection } from '../components/config/DeviceControlSection';
 
 type ConfigTab = 'setup' | 'scale' | 'security' | 'device';
@@ -78,6 +79,7 @@ export function ConfigPage() {
           <div className="space-y-4">
             <OtaSection />
             <DirectUploadSection />
+            <BackupRestoreSection />
             <DeviceControlSection />
           </div>
         )}

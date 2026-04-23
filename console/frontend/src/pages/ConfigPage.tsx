@@ -13,6 +13,7 @@ import { DisplaySection } from '../components/config/DisplaySection';
 import { QuickWeightsSection } from '../components/config/QuickWeightsSection';
 import { FilamentsDbSection } from '../components/config/FilamentsDbSection';
 import { BambuCloudSection } from '../components/config/BambuCloudSection';
+import { BackupRestoreSection } from '../components/config/BackupRestoreSection';
 import { DebugSection } from '../components/config/DebugSection';
 
 type ConfigTab = 'setup' | 'scale' | 'printers' | 'cloud' | 'security' | 'device' | 'debug';
@@ -81,6 +82,7 @@ export function ConfigPage() {
             <OtaSection />
             <DirectUploadSection />
             <FilamentsDbSection />
+            <BackupRestoreSection />
             <DeviceControlSection />
           </div>
         )}
