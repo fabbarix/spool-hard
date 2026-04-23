@@ -21,6 +21,12 @@ struct SpoolRecord {
     int32_t weight_new        = -1;  // weight when added
     int32_t weight_current    = -1;  // last measured
 
+    // User-flagged "this spool is empty / used up — keep around as a record
+    // but stop offering it for new prints". The web UI hides empty spools
+    // from the list by default (toggle to show), and the LCD wizard's
+    // template-pick flow treats them as eligible references for shape only.
+    bool is_empty = false;
+
     float   consumed_since_add    = 0.f;
     float   consumed_since_weight = 0.f;
 
@@ -42,6 +48,17 @@ struct SpoolRecord {
     // printer's slicer profile matches. Empty string means "don't set" and
     // the printer keeps whatever tray_info_idx it had.
     String slicer_filament;
+
+    // Bambu Cloud preset id this spool was created from. Conventions:
+    //   "PFUS<hash>" — synced to Bambu Cloud (server-issued)
+    //   "PFUL<hash>" — local-only user filament (we generate)
+    //   ""           — no preset linked (legacy spool created before the
+    //                  Filaments tab landed, or via direct edit)
+    // The id resolves through FilamentsStore to the full preset record,
+    // letting the spool inherit material/temps/density without pinning a
+    // copy. Per-spool overrides (above) still win over the preset's values
+    // at push time.
+    String setting_id;
 
     // Freeform user note, mirrors yanshay/SpoolEase's SpoolRecord.note.
     String note;

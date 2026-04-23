@@ -1,66 +1,54 @@
-import { useEffect, useState } from 'react';
-import { Trash2, ChevronDown, ChevronRight, Gauge, Package, Scale } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Trash2, ChevronDown, ChevronRight, Gauge, BatteryLow } from 'lucide-react';
 import { Card } from '@spoolhard/ui/components/Card';
 import { Button } from '@spoolhard/ui/components/Button';
-import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
 import { useSpools, useSpoolDelete, type SpoolRecord } from '../hooks/useSpools';
 import { SpoolDetailPanel } from '../components/spools/SpoolDetailPanel';
-import { CoreWeightsSection } from '../components/config/CoreWeightsSection';
 
 const PAGE_SIZE = 25;
 
-type SpoolsTab = 'list' | 'core-weights';
-
-const tabs: SubTab<SpoolsTab>[] = [
-  { id: 'list',         label: 'Spools',       icon: <Package size={14} /> },
-  { id: 'core-weights', label: 'Core weights', icon: <Scale   size={14} /> },
-];
-
-function getInitialTab(): SpoolsTab {
-  const params = new URLSearchParams(window.location.search);
-  const t = params.get('tab');
-  if (t && tabs.some((tab) => tab.id === t)) return t as SpoolsTab;
-  return 'list';
-}
-
+// SpoolsPage used to wrap a SubTabBar with [Spools | Core weights]; the
+// Core weights view was promoted to a top-level "Empty weights" tab in
+// App.tsx, leaving Spools as a single section. The wrapper is now a
+// thin pass-through to SpoolsListSection.
 export function SpoolsPage() {
-  const [activeTab, setActiveTab] = useState<SpoolsTab>(getInitialTab);
-
-  const navigate = (t: SpoolsTab) => {
-    const url = new URL(window.location.href);
-    url.searchParams.set('tab', t);
-    window.history.replaceState(null, '', url.toString());
-    setActiveTab(t);
-  };
-
-  useEffect(() => {
-    const onPop = () => setActiveTab(getInitialTab());
-    window.addEventListener('popstate', onPop);
-    return () => window.removeEventListener('popstate', onPop);
-  }, []);
-
   return (
-    <div className="space-y-4">
-      <SubTabBar tabs={tabs} active={activeTab} onChange={navigate} />
-
-      <div className="animate-in">
-        {activeTab === 'list'         && <SpoolsListSection />}
-        {activeTab === 'core-weights' && <CoreWeightsSection />}
-      </div>
+    <div className="space-y-4 animate-in">
+      <SpoolsListSection />
     </div>
   );
 }
 
 function SpoolsListSection() {
   const [offset, setOffset] = useState(0);
+  const [showEmpty, setShowEmpty] = useState(false);
   const { data, isLoading } = useSpools(offset, PAGE_SIZE);
   const del = useSpoolDelete();
 
-  const rows = data?.rows ?? [];
-  const total = data?.total ?? 0;
+  const rawRows = data?.rows ?? [];
+  // Filter on the client because the backend has no "include empty" flag
+  // — the page is paginated by the firmware though, so empty spools still
+  // count toward the offset/total. Honest with the user: show the filtered
+  // count and the underlying total side-by-side.
+  const rows = useMemo(
+    () => (showEmpty ? rawRows : rawRows.filter((r) => !r.is_empty)),
+    [rawRows, showEmpty],
+  );
+  const total      = data?.total ?? 0;
+  const emptyCount = rawRows.filter((r) => r.is_empty).length;
 
   const actions = (
-    <>
+    <div className="flex items-center gap-3">
+      <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={showEmpty}
+          onChange={(e) => setShowEmpty(e.target.checked)}
+          className="accent-brand-500"
+        />
+        Show empty
+        {emptyCount > 0 && <span className="text-text-muted/70">({emptyCount})</span>}
+      </label>
       <Button
         variant="secondary"
         onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
@@ -75,15 +63,21 @@ function SpoolsListSection() {
       >
         Next
       </Button>
-    </>
+    </div>
   );
 
   return (
     <Card title={`Spools (${total})`} actions={actions}>
       {isLoading && <div className="text-sm text-text-muted">Loading…</div>}
-      {!isLoading && rows.length === 0 && (
+      {!isLoading && rows.length === 0 && rawRows.length === 0 && (
         <div className="text-sm text-text-muted py-8 text-center">
           No spools yet — scan a SpoolHard-tagged spool to add one.
+        </div>
+      )}
+      {!isLoading && rows.length === 0 && rawRows.length > 0 && (
+        <div className="text-sm text-text-muted py-8 text-center">
+          All {rawRows.length} spools on this page are marked empty. Toggle
+          "Show empty" to see them.
         </div>
       )}
 
@@ -116,10 +110,15 @@ function SpoolRow({ r, onDelete }: { r: SpoolRecord; onDelete: () => void }) {
           style={{ background: r.color_code ? `#${r.color_code}` : '#444' }}
         />
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium text-text-primary truncate flex items-center gap-2">
+          <div className={`text-sm font-medium truncate flex items-center gap-2 ${r.is_empty ? 'text-text-muted' : 'text-text-primary'}`}>
             {r.brand || 'Unknown'} · {r.material_type || '—'}
             {r.material_subtype && ` (${r.material_subtype})`}
             {r.color_name && ` · ${r.color_name}`}
+            {r.is_empty && (
+              <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded px-1.5 py-0.5">
+                <BatteryLow size={10} /> Empty
+              </span>
+            )}
             {kValues.length > 0 && (
               <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-brand-400">
                 <Gauge size={10} /> K ×{kValues.length}
@@ -128,6 +127,7 @@ function SpoolRow({ r, onDelete }: { r: SpoolRecord; onDelete: () => void }) {
           </div>
           <div className="text-xs text-text-muted font-mono truncate">
             {r.tag_id} · {r.data_origin || 'Unknown'}
+            {r.slicer_filament && <> · <span title="AMS tray_info_idx — auto-synced from the printer">idx:{r.slicer_filament}</span></>}
           </div>
         </div>
         {typeof r.weight_current === 'number' && r.weight_current >= 0 && (

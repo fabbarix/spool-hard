@@ -84,6 +84,20 @@ private:
     void _handleSpoolGet(AsyncWebServerRequest* req);
     void _handleSpoolPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handleSpoolDelete(AsyncWebServerRequest* req);
+    // User filament CRUD (locally-managed presets stored on SD).
+    void _handleUserFilamentsList(AsyncWebServerRequest* req);
+    void _handleUserFilamentGet(AsyncWebServerRequest* req);
+    void _handleUserFilamentPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    void _handleUserFilamentDelete(AsyncWebServerRequest* req);
+    // Bambu Cloud sync (Phase C). The full-library pull runs on a
+    // FreeRTOS task to keep the AsyncTCP event loop unblocked — the
+    // POST handler returns 202 immediately and the frontend polls
+    // `/cloud-sync/status` for the eventual result. Both routes
+    // inherit the soft-fail pattern from the token paste flow: a CF
+    // block lands as `status:"unreachable"`, not a hard HTTP error.
+    void _handleUserFilamentsCloudSync(AsyncWebServerRequest* req);
+    void _handleUserFilamentsCloudSyncStatus(AsyncWebServerRequest* req);
+    void _handleUserFilamentCloudPush(AsyncWebServerRequest* req);
     void _handleScaleLinkStatus(AsyncWebServerRequest* req);
     void _handleScaleSecretGet(AsyncWebServerRequest* req);
     void _handleScaleSecretPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);

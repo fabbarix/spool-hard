@@ -33,3 +33,11 @@ bool ui_wizard_active();
 // a "Full" / "Used" / "Empty" step is showing its live-weight readout.
 // Mirrors the existing ui_set_spool_live_weight contract.
 void ui_wizard_on_weight(float grams, const char* state);
+
+// Fired right after the wizard's Save step persists the new SpoolRecord,
+// just before close_wizard() tears the screens down. main.cpp wires this
+// to arm PendingAms (so the next AMS-load auto-assigns to the new spool)
+// AND switch the LCD from "home" to the spool-detail screen, matching
+// the existing-tag-scan flow ("waits for AMS load").
+typedef void (*ui_wizard_save_cb_t)(const String& spool_id);
+void ui_wizard_set_save_callback(ui_wizard_save_cb_t cb);

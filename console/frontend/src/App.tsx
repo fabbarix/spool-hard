@@ -8,21 +8,27 @@ import { Header } from './components/layout/Header';
 import { NavTabs } from './components/layout/NavTabs';
 import { DashboardPage } from './pages/DashboardPage';
 import { SpoolsPage } from './pages/SpoolsPage';
+import { EmptyWeightsPage } from './pages/EmptyWeightsPage';
+import { FilamentsPage } from './pages/FilamentsPage';
 import { ConfigPage } from './pages/ConfigPage';
 
-export type Tab = 'dashboard' | 'spools' | 'config';
+export type Tab = 'dashboard' | 'spools' | 'empty-weights' | 'filaments' | 'config';
 
 function pathToTab(): Tab {
   const p = window.location.pathname;
-  if (p.startsWith('/config')) return 'config';
-  if (p.startsWith('/spools')) return 'spools';
+  if (p.startsWith('/config'))         return 'config';
+  if (p.startsWith('/filaments'))      return 'filaments';
+  if (p.startsWith('/empty-weights'))  return 'empty-weights';
+  if (p.startsWith('/spools'))         return 'spools';
   return 'dashboard';
 }
 
 const tabPaths: Record<Tab, string> = {
-  dashboard: '/',
-  spools: '/spools',
-  config: '/configuration',
+  dashboard:      '/',
+  spools:         '/spools',
+  'empty-weights':'/empty-weights',
+  filaments:      '/filaments',
+  config:         '/configuration',
 };
 
 export default function App() {
@@ -58,9 +64,11 @@ export default function App() {
               <Header />
               <NavTabs activeTab={tab} onTabChange={navigate} />
               <main className="mx-auto max-w-[1100px] p-4">
-                {tab === 'dashboard' && <DashboardPage />}
-                {tab === 'spools'    && <SpoolsPage />}
-                {tab === 'config'    && <ConfigPage />}
+                {tab === 'dashboard'     && <DashboardPage />}
+                {tab === 'spools'        && <SpoolsPage />}
+                {tab === 'empty-weights' && <EmptyWeightsPage />}
+                {tab === 'filaments'     && <FilamentsPage />}
+                {tab === 'config'        && <ConfigPage />}
               </main>
             </div>
             <ReconnectOverlay />

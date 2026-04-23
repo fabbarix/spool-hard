@@ -26,6 +26,10 @@ export interface SpoolRecord {
   weight_core?: number;
   weight_new?: number;
   weight_current?: number;
+  // User-flagged "this spool is empty / used up". Hidden by default in
+  // the spool list (toggle with "Show empty"); persists on the firmware
+  // SpoolRecord so the LCD wizard can dim/skip these in template flows.
+  is_empty?: boolean;
   consumed_since_add?: number;
   consumed_since_weight?: number;
   // Print settings. -1 (or omitted) → firmware falls back to material-default
@@ -39,6 +43,11 @@ export interface SpoolRecord {
   // Bambu tray_info_idx (e.g. "GFL99"). Matches the slicer_filament field in
   // yanshay/SpoolEase's SpoolRecord; sent verbatim on AMS assignment push.
   slicer_filament?: string;
+  // Reference to the filament preset this spool was created from. Resolves
+  // through /api/user-filaments (or the stock filaments DB) to the full
+  // preset record. PFUL<hash> for local-only, PFUS<hash> for cloud-synced,
+  // empty for legacy spools created before the Filaments tab landed.
+  setting_id?: string;
   note?: string;
   data_origin?: string;
   tag_type?: string;

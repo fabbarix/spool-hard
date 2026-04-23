@@ -244,6 +244,7 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
 
         _parseAms(ams, _state);
         _persistKValues();
+        _persistTrayInfoIdx();
         _autoRestoreKValues();
 
         // Optional raw-AMS broadcast to the debug WebSocket — user-toggled
@@ -400,6 +401,37 @@ void BambuPrinter::_pushKRestore(int ams_id, int slot_id, const AmsTray& tr, flo
     _mqtt->publish(topic.c_str(), payload.c_str());
     Serial.printf("[Bambu %s] auto-restore K=%.3f to AMS %d/%d (nozzle %.1f)\n",
                   _cfg.serial.c_str(), k, ams_id, slot_id, nozzle);
+}
+
+void BambuPrinter::_persistTrayInfoIdx() {
+    // For every AMS slot mapped to a spool, if Bambu reports a non-empty
+    // tray_info_idx that differs from the spool's stored slicer_filament,
+    // adopt the printer's value. The printer treats tray_info_idx as the
+    // canonical "what filament is in this slot" identifier — when the
+    // user picks a filament from the touchscreen panel after loading a
+    // SpoolHard tag, that pick lands here. Without this sync, the spool
+    // record would silently disagree with the printer forever.
+    //
+    // Only writes when the value actually changes — store.upsert is a
+    // full-line rewrite on JSONL, no point churning the SD card.
+    auto syncTray = [&](const AmsTray& tr) {
+        if (tr.mapped_spool_id.isEmpty() || tr.tray_info_idx.isEmpty()) return;
+        SpoolRecord rec;
+        if (!g_store.findById(tr.mapped_spool_id, rec)) return;
+        if (rec.slicer_filament == tr.tray_info_idx) return;
+        Serial.printf("[Bambu %s] tray_info_idx sync for spool %s: '%s' → '%s'\n",
+                      _cfg.serial.c_str(), rec.id.c_str(),
+                      rec.slicer_filament.c_str(), tr.tray_info_idx.c_str());
+        rec.slicer_filament = tr.tray_info_idx;
+        g_store.upsert(rec);
+    };
+
+    for (int u = 0; u < _state.ams_count; ++u) {
+        for (int t = 0; t < 4; ++t) {
+            syncTray(_state.ams[u].trays[t]);
+        }
+    }
+    syncTray(_state.vt_tray);
 }
 
 void BambuPrinter::_persistKValues() {

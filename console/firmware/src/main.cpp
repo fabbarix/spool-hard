@@ -11,6 +11,8 @@
 #include "scale_link.h"
 #include "nfc_reader.h"
 #include "store.h"
+#include "user_filaments_store.h"
+#include "stock_filaments_store.h"
 #include "ui/ui.h"
 #include "ui/ui_wizard.h"
 #include "protocol.h"
@@ -32,6 +34,8 @@ ConsoleWebServer         g_web;   // extern-visible so bambu_printer.cpp can bro
 ScaleLink                g_scale;   // extern-visible for bambu_printer.cpp (pushGcodeAnalysis)
 static NfcReader         g_nfc;
 SpoolStore               g_store;   // extern-visible for bambu_printer.cpp (AMS → spool lookup)
+UserFilamentsStore       g_user_filaments;   // extern-visible for web_server.cpp
+StockFilamentsStore      g_stock_filaments;  // extern-visible for web_server + LCD wizard
 
 static bool    g_pendingOta = false;
 static bool    g_showedHome = false;
@@ -167,6 +171,10 @@ void setup() {
 
     // Load spool DB.
     g_store.begin();
+    // User-managed filament presets (SD-backed; no-op if SD didn't mount).
+    g_user_filaments.begin();
+    // Stock filament library — read-only JSONL on SD, RAM-cached.
+    g_stock_filaments.begin();
 
     // Bring up HTTP server + WiFi provisioning.
     g_web.setStore(&g_store);
@@ -192,6 +200,27 @@ void setup() {
     });
     g_web.onOtaRequested([]() { g_pendingOta = true; });
     ui_set_ota_banner_callback(_onOtaBannerTap);
+
+    // After the new-spool wizard saves a record, mirror the existing-tag
+    // rescan flow: open the spool-detail screen + arm PendingAms so the
+    // next AMS-load auto-assigns to the just-created spool.
+    ui_wizard_set_save_callback([](const String& spool_id) {
+        SpoolRecord rec;
+        if (!g_store.findById(spool_id, rec)) {
+            ui_show_home();
+            return;
+        }
+        showSpoolDetail(rec);
+        g_scale.requestCurrentWeight();
+        PendingAms::arm(rec.id);
+        ui_set_spool_ams_status(LV_SYMBOL_REFRESH "  AMS: waiting for load…");
+        // Mirror the active-spool context the existing-tag path sets up
+        // so the scale button + auto-close timers behave identically for
+        // a freshly-created spool as for a rescanned one.
+        g_activeSpoolId         = rec.id;
+        g_activeSpoolOpenedMs   = millis();
+        g_activeSpoolExpiresAt  = millis() + PendingAms::kDefaultExpiryMs;
+    });
     g_web.begin();
     g_wifi.begin(g_web.server());
     g_web.start();
@@ -856,23 +885,58 @@ void loop() {
     if (g_pendingOta) {
         g_pendingOta = false;
         OtaConfig cfg; cfg.load();
+
+        // Pull the target versions out of the cached manifest so the
+        // LCD's "vX.Y.Z" subtitle reflects what's actually being
+        // flashed, instead of the static "firmware" placeholder. Empty
+        // fallbacks for the cold-start case where the user could (in
+        // theory) trigger an update before the checker has run.
+        auto manifest = g_ota_checker.lastManifest();
+        String fwLabel = manifest.firmware_version.length()
+                         ? "v" + manifest.firmware_version
+                         : "firmware";
+        String feLabel = manifest.frontend_version.length()
+                         ? "v" + manifest.frontend_version
+                         : "frontend";
+
+        // Disable the screen-sleep timer for the duration of the
+        // update — calling wake() per tick handles the common case but
+        // a long pause between firmware verify and frontend start (or a
+        // slow manifest fetch) could otherwise let the screen blank
+        // mid-flash. Restored on the failure-return path; on success
+        // the device reboots so persisted NVS value is what we read on
+        // next boot.
+        uint32_t prevSleepS = ConsoleDisplay::sleepTimeout();
+        ConsoleDisplay::setSleepTimeout(0);
+
         // Seed the in-flight tracker so /api/ota-status reflects the
         // "preparing…" phase before otaRun's first progress tick lands.
         g_ota_in_flight = { true, "firmware", 0, millis() };
-        ui_show_ota_progress(0, "Updating Firmware", "firmware");
-        otaRun(cfg, [](OtaProgress p) {
+        ui_show_ota_progress(0, "Updating Firmware", fwLabel.c_str());
+
+        otaRun(cfg, [fwLabel, feLabel](OtaProgress p) {
             const char* kind =
                 p.kind == OtaProgress::Kind::Frontend ? "frontend" :
                 p.kind == OtaProgress::Kind::Firmware ? "firmware" :
                                                         "";
             g_ota_in_flight = { true, kind, p.percent, g_ota_in_flight.started_ms };
-            const char* title =
-                p.kind == OtaProgress::Kind::Frontend ? "Updating Frontend" :
-                p.kind == OtaProgress::Kind::Firmware ? "Updating Firmware" :
-                                                        nullptr;
-            ui_show_ota_progress(p.percent, title, nullptr);
+            const char* title = nullptr;
+            const char* ver   = nullptr;
+            if (p.kind == OtaProgress::Kind::Frontend) {
+                title = "Updating Frontend";
+                ver   = feLabel.c_str();
+            } else if (p.kind == OtaProgress::Kind::Firmware) {
+                title = "Updating Firmware";
+                ver   = fwLabel.c_str();
+            }
+            // Belt-and-braces with setSleepTimeout(0) above — wake on
+            // every tick keeps the backlight pinned even if a future
+            // refactor drops the timeout override.
+            ConsoleDisplay::wake();
+            ui_show_ota_progress(p.percent, title, ver);
         });
         // otaRun() reboots on success; if we return, it failed.
+        ConsoleDisplay::setSleepTimeout(prevSleepS);
         g_ota_in_flight = {};
         ui_show_home();
     }

@@ -77,6 +77,23 @@ public:
     enum class VerifyResult { Verified, Rejected, Unreachable };
     VerifyResult verifyToken(const String& token, Region region);
 
+    // Generic auth'd HTTP helpers — exposed so sibling modules
+    // (BambuCloudFilaments) can hit other api.bambulab.com endpoints
+    // without re-implementing the browser-shaped headers + CF detector.
+    // All three accept an explicit token + region (no implicit state)
+    // and return a pre-classified result. `httpStatus == 0` means the
+    // request never landed (transport error). `cfBlocked == true` means
+    // the response body matched looksLikeCloudflareBlock.
+    struct ApiResult {
+        int    httpStatus = 0;
+        String body;
+        bool   cfBlocked  = false;
+    };
+    ApiResult apiGet   (Region r, const char* path, const String& bearer);
+    ApiResult apiPost  (Region r, const char* path, const String& bearer,
+                        const String& jsonBody);
+    ApiResult apiDelete(Region r, const char* path, const String& bearer);
+
     // True if `body` looks like a Cloudflare hard-block reject page
     // (the static "Sorry, you have been blocked" template Cloudflare
     // serves when bot management denies the TLS handshake or request).

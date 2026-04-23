@@ -9,9 +9,11 @@ export default defineConfig({
     emptyOutDir: true,
     target: 'es2020',
     // SPIFFS caps object names at 32 bytes (CONFIG_SPIFFS_OBJ_NAME_LEN).
-    // Default Vite names like "/assets/sql-wasm-UFUCzYNW.wasm.gz" (33 B)
-    // silently fail to land on device. Shorten the dir to "a/" and trim the
-    // hash suffix — keeps cache-busting while staying well under the cap.
+    // Default Vite names like "/assets/some-long-asset-name.css.gz" can run
+    // over 32 B and silently fail to land on device. Shorten the dir to "a/"
+    // and trim the hash suffix — keeps cache-busting while staying well
+    // under the cap. (Originally introduced for the sql-wasm asset that has
+    // since been removed; the rule still matters for future large assets.)
     assetsDir: 'a',
     rollupOptions: {
       output: {

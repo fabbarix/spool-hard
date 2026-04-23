@@ -41,6 +41,24 @@
 #define SD_MISO_PIN      38
 #define SD_MOUNT         "/sd"
 
+// Stock filament library — flat JSONL emitted by the build pipeline
+// (scripts/build_filaments_db.sh). One row per resolved-instantiation
+// preset, ~100 rows / ~32KB. Replaces the older filaments.db (SQLite)
+// — the firmware loads all rows into RAM at boot, frontend parses the
+// same file via fetch + JSON.parse.
+// Paths are relative to the SD root — Arduino's SD library does NOT
+// prefix mounts with "/sd/" the way LittleFS / Linux do. Writing to
+// "/sd/foo" silently fails because there's no `sd` directory at the
+// SD root. Keep these as bare "/<file>" paths and the upload route at
+// `web_server.cpp:_filamentsUploadFile = SD.open(FILAMENTS_RELPATH, ...)`
+// stays consistent with the readers below.
+#define FILAMENTS_PATH       "/filaments.jsonl"
+
+// User-managed filament presets — persisted next to the stock filaments
+// on SD so it survives stock-library uploads. JSONL format (mirrors
+// spools.jsonl) — see UserFilamentsStore.
+#define USER_FILAMENTS_PATH  "/user_filaments.jsonl"
+
 // ── NVS namespaces ──────────────────────────────────────────
 #define NVS_NS_WIFI          "wifi_cfg"
 #define NVS_KEY_SSID         "ssid"

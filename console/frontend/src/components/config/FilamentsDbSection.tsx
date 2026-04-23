@@ -8,21 +8,29 @@ import {
   useFilamentsDbDelete,
 } from '../../hooks/useFilamentsDb';
 
-// SQLite file header magic — a well-formed file starts with exactly these
-// 16 bytes. Cheap client-side guard against uploading a random .bin.
-const SQLITE_MAGIC = 'SQLite format 3\0';
-
-async function validateFilamentsDb(file: File): Promise<FileValidation> {
-  if (file.size < 16) return { ok: false, error: 'File too small to be a SQLite database' };
+// Cheap client-side guard against uploading a random .bin: the file must
+// be valid JSONL with at least one line that parses as an object carrying
+// the `setting_id` key. We only inspect the first ~1KB so the check stays
+// fast even if the user picks a multi-MB file.
+async function validateFilamentsJsonl(file: File): Promise<FileValidation> {
+  if (file.size < 8) return { ok: false, error: 'File too small to be filaments.jsonl' };
   if (file.size > 16 * 1024 * 1024) {
     return { ok: false, error: `File (${(file.size / 1024 / 1024).toFixed(1)} MB) exceeds 16 MB cap` };
   }
-  const head = new Uint8Array(await file.slice(0, 16).arrayBuffer());
-  const headStr = new TextDecoder().decode(head);
-  if (headStr !== SQLITE_MAGIC) {
-    return { ok: false, error: 'Not a SQLite database (missing "SQLite format 3" magic).' };
+  const head = new TextDecoder().decode(
+    new Uint8Array(await file.slice(0, 1024).arrayBuffer()),
+  );
+  const firstLine = head.split('\n')[0]?.trim();
+  if (!firstLine) return { ok: false, error: 'File is empty.' };
+  try {
+    const obj = JSON.parse(firstLine);
+    if (typeof obj !== 'object' || obj === null || !obj.setting_id) {
+      return { ok: false, error: 'First row missing setting_id — wrong file format.' };
+    }
+  } catch {
+    return { ok: false, error: 'First line isn\'t valid JSON — not a filaments.jsonl file.' };
   }
-  return { ok: true, info: `SQLite database · ${(file.size / 1024).toFixed(0)} KB` };
+  return { ok: true, info: `Filaments JSONL · ${(file.size / 1024).toFixed(0)} KB` };
 }
 
 function formatAge(mtime_s?: number): string {
@@ -43,13 +51,13 @@ export function FilamentsDbSection() {
     <SectionCard
       title="Filaments Library"
       icon={<Database size={16} />}
-      description="Upload a bambu-filaments SQLite database to the SD card. The spool detail page will use it to pre-fill brand / material / temps / filament ID when you click 'Load from library'."
+      description="Upload a flat filaments.jsonl (built from the BambuStudio profiles) to the SD card. The spool detail page + LCD spool wizard use it to pre-fill brand / material / temps / filament ID when you click 'Load from library'."
     >
       <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-4 items-start">
         <DropZone
-          label="filaments.db"
+          label="filaments.jsonl"
           icon={<Database size={24} strokeWidth={1.5} />}
-          validate={validateFilamentsDb}
+          validate={validateFilamentsJsonl}
           onUpload={(file) => upload.mutate(file)}
           isPending={upload.isPending}
           isSuccess={upload.isSuccess}
@@ -90,9 +98,11 @@ export function FilamentsDbSection() {
       </div>
 
       <div className="pt-2 text-[11px] text-text-muted leading-relaxed">
-        Generate <span className="font-mono">filaments.db</span> from the
-        <a href="https://github.com/" className="underline ml-1">bambu-filaments</a> tool:
-        <span className="block font-mono mt-1">uv run python main.py</span>
+        Build <span className="font-mono">filaments.jsonl</span> from the
+        upstream BambuStudio profiles:
+        <span className="block font-mono mt-1">./scripts/build_filaments_db.sh</span>
+        Each release also bundles a fresh copy as
+        {' '}<span className="font-mono">spoolhard-console-filaments.jsonl</span>.
       </div>
     </SectionCard>
   );

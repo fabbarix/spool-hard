@@ -39,10 +39,15 @@ function statusLabel(s: string): { text: string; tone: 'ok' | 'warn' | 'err' | '
 // OtaUpdater hook. Used for both console and scale so the banner reads
 // consistently.
 function ProductRow({
-  icon, label, info, pending, onUpdate, busy, updater,
+  icon, label, badge, info, pending, onUpdate, busy, updater,
 }: {
   icon: React.ReactNode;
   label: string;
+  // Optional decoration shown to the right of the label, before the
+  // version info — used by the scale row to surface its WS link state
+  // without pushing the "Update now" button out of alignment with the
+  // console row's button.
+  badge?: React.ReactNode;
   info: { fwCurrent?: string; fwLatest?: string; feCurrent?: string; feLatest?: string } | null;
   pending: boolean;
   onUpdate?: () => void;
@@ -58,6 +63,7 @@ function ProductRow({
       <div className="flex items-center gap-2 text-sm">
         <span className="text-text-secondary">{icon}</span>
         <span className="text-text font-medium">{label}</span>
+        {badge}
         {info ? (
           <>
             <span className="text-text-secondary">fw</span>
@@ -240,23 +246,21 @@ export function OtaSection() {
           busy={run.isPending || consoleUpdater.phase !== 'idle'}
           updater={consoleUpdater}
         />
-        <div className="flex items-center justify-between">
-          <ProductRow
-            icon={<Scale size={14} />}
-            label="Scale"
-            info={scaleOnline ? {
-              fwCurrent: scl?.firmware_current,
-              fwLatest:  scl?.firmware_latest,
-              feCurrent: scl?.frontend_current,
-              feLatest:  scl?.frontend_latest,
-            } : null}
-            pending={scalePending}
-            onUpdate={triggerScaleUpdate}
-            busy={runScale.isPending || scaleUpdater.phase !== 'idle'}
-            updater={scaleUpdater}
-          />
-          <ScaleLinkPill link={scl?.link ?? 'offline'} />
-        </div>
+        <ProductRow
+          icon={<Scale size={14} />}
+          label="Scale"
+          badge={<ScaleLinkPill link={scl?.link ?? 'offline'} />}
+          info={scaleOnline ? {
+            fwCurrent: scl?.firmware_current,
+            fwLatest:  scl?.firmware_latest,
+            feCurrent: scl?.frontend_current,
+            feLatest:  scl?.frontend_latest,
+          } : null}
+          pending={scalePending}
+          onUpdate={triggerScaleUpdate}
+          busy={runScale.isPending || scaleUpdater.phase !== 'idle'}
+          updater={scaleUpdater}
+        />
 
         <div className="flex items-center justify-between text-xs flex-wrap gap-2 border-t border-border pt-2">
           <div className="text-text-secondary">

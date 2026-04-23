@@ -250,6 +250,11 @@ private:
     void _parseReport(const JsonDocument& doc);
     void _parseAms(const JsonObjectConst& amsObj, PrinterState& out);
     void _persistKValues();
+    // Sync the AMS-reported tray_info_idx onto every mapped spool whose
+    // current `slicer_filament` doesn't match. Bambu re-keys this when
+    // the user picks a filament from the printer's panel after a tag
+    // load — without this we'd never learn the printer's chosen idx.
+    void _persistTrayInfoIdx();
     void _autoRestoreKValues();
     void _pushKRestore(int ams_id, int slot_id, const AmsTray& tr, float nozzle, float k);
     // If PendingAms has an armed spool, claim it and push ams_filament_setting

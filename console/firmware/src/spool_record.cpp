@@ -12,12 +12,14 @@ void SpoolRecord::toJson(JsonDocument& doc) const {
     doc["weight_core"]       = weight_core;
     doc["weight_new"]        = weight_new;
     doc["weight_current"]    = weight_current;
+    doc["is_empty"]          = is_empty;
     doc["consumed_since_add"]    = consumed_since_add;
     doc["consumed_since_weight"] = consumed_since_weight;
     doc["nozzle_temp_min"]   = nozzle_temp_min;
     doc["nozzle_temp_max"]   = nozzle_temp_max;
     doc["density"]           = density;
     doc["slicer_filament"]   = slicer_filament;
+    doc["setting_id"]        = setting_id;
     doc["note"]              = note;
     doc["data_origin"]       = data_origin;
     doc["tag_type"]          = tag_type;
@@ -49,6 +51,9 @@ bool SpoolRecord::fromJson(const JsonDocument& doc) {
     auto f32  = [&](const char* k, float& dst) {
         if (doc[k].is<float>() || doc[k].is<int>()) dst = doc[k].as<float>();
     };
+    auto b    = [&](const char* k, bool& dst)    {
+        if (doc[k].is<bool>()) dst = doc[k].as<bool>();
+    };
     str("id",                id);
     str("tag_id",            tag_id);
     str("material_type",     material_type);
@@ -60,12 +65,14 @@ bool SpoolRecord::fromJson(const JsonDocument& doc) {
     i32("weight_core",       weight_core);
     i32("weight_new",        weight_new);
     i32("weight_current",    weight_current);
+    b  ("is_empty",          is_empty);
     f32("consumed_since_add",    consumed_since_add);
     f32("consumed_since_weight", consumed_since_weight);
     i32("nozzle_temp_min",   nozzle_temp_min);
     i32("nozzle_temp_max",   nozzle_temp_max);
     f32("density",           density);
     str("slicer_filament",   slicer_filament);
+    str("setting_id",        setting_id);
     str("note",              note);
     str("data_origin",       data_origin);
     str("tag_type",          tag_type);

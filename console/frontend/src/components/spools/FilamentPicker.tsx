@@ -1,11 +1,21 @@
 import { useMemo, useState } from 'react';
-import { X, Thermometer, Search, BookOpen } from 'lucide-react';
+import { X, Thermometer, Search, BookOpen, User as UserIcon } from 'lucide-react';
 import { Button } from '@spoolhard/ui/components/Button';
 import { useFilamentsDb, type FilamentEntry } from '../../hooks/useFilamentsDb';
+import { useUserFilaments } from '../../hooks/useUserFilaments';
 
 interface Props {
   onPick: (entry: FilamentEntry) => void;
   onClose: () => void;
+  // When true, hide user filaments and show stock only. Used by the
+  // "Base on a stock filament" picker in the custom-filament form so the
+  // user doesn't end up basing one custom on another by accident.
+  stockOnly?: boolean;
+  // Optional copy override — the default is geared at spool editing
+  // ("Pre-fill material, subtype, temps…"), but reuse contexts may want
+  // to phrase it differently.
+  title?: string;
+  description?: string;
 }
 
 // Pill filter for material families. "Other" is a catch-all that also
@@ -14,13 +24,38 @@ interface Props {
 const FAMILIES = ['All', 'PLA', 'PETG', 'ABS', 'ASA', 'TPU', 'PA', 'PC', 'Other'] as const;
 type Family = typeof FAMILIES[number];
 
-export function FilamentPicker({ onPick, onClose }: Props) {
+export function FilamentPicker({ onPick, onClose, stockOnly, title, description }: Props) {
   const { data, isLoading, error } = useFilamentsDb();
+  const userQ = useUserFilaments();
   const [q, setQ]         = useState('');
   const [fam, setFam]     = useState<Family>('All');
 
-  const entries = data?.entries ?? [];
-  const present = data?.present ?? false;
+  // Tag stock entries with source=stock so the renderer + applyFilament
+  // can tell them apart from user entries (which carry a setting_id).
+  const stockEntries = (data?.entries ?? []).map<FilamentEntry>((e) => ({
+    ...e, source: 'stock',
+  }));
+  // Map user filaments into the same FilamentEntry shape — slots into
+  // the existing search / filter / row UI without forking it.
+  const userEntries: FilamentEntry[] = stockOnly
+    ? []
+    : (userQ.data?.rows ?? []).map((u) => ({
+        name:        u.name || '(unnamed)',
+        filament_id: u.filament_id || '',
+        brand:       u.filament_vendor || '',
+        material:    u.filament_type   || '',
+        subtype:     u.filament_subtype || '',
+        nozzle_temp_min: u.nozzle_temp_min > 0 ? u.nozzle_temp_min : undefined,
+        nozzle_temp_max: u.nozzle_temp_max > 0 ? u.nozzle_temp_max : undefined,
+        density:     u.density > 0 ? u.density : undefined,
+        pressure_advance: u.pressure_advance > 0 ? u.pressure_advance : undefined,
+        setting_id:  u.setting_id,
+        source:      'user',
+      }));
+  // User filaments first — they're typically more relevant to the user
+  // who took the time to create them.
+  const entries = [...userEntries, ...stockEntries];
+  const present = entries.length > 0;
 
   const rows = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -57,9 +92,9 @@ export function FilamentPicker({ onPick, onClose }: Props) {
           <div className="flex items-center gap-2">
             <BookOpen size={16} className="text-brand-400" />
             <div>
-              <div className="text-sm font-medium text-text-primary">Load from filaments library</div>
+              <div className="text-sm font-medium text-text-primary">{title ?? 'Load from filaments library'}</div>
               <div className="text-[11px] text-text-muted mt-0.5">
-                Pre-fill material, subtype, temps and Bambu filament ID from an uploaded bambu-filaments database.
+                {description ?? 'Pre-fill material, subtype, temps and Bambu filament ID from an uploaded bambu-filaments database.'}
               </div>
             </div>
           </div>
@@ -73,7 +108,7 @@ export function FilamentPicker({ onPick, onClose }: Props) {
         {!present && !isLoading && !error && (
           <div className="text-sm text-text-muted text-center py-10 border border-dashed border-surface-border rounded-md">
             No library uploaded yet. <br/>
-            Upload a <span className="font-mono">filaments.db</span> in
+            Upload a <span className="font-mono">filaments.jsonl</span> in
             <span className="text-text-primary"> Config → Device → Filaments library</span>.
           </div>
         )}
@@ -162,7 +197,10 @@ function FilamentRow({ e, onPick }: { e: FilamentEntry; onPick: () => void }) {
           aria-hidden
         />
         <span className="flex-1 min-w-0">
-          <div className="text-sm text-text-primary truncate">
+          <div className="text-sm text-text-primary truncate flex items-center gap-2">
+            {e.source === 'user' && (
+              <UserIcon size={11} className="text-brand-400 flex-shrink-0" aria-label="Custom filament" />
+            )}
             {e.brand || 'Unknown'} · {e.material || '—'}
             {e.subtype && <span className="text-text-muted"> · {e.subtype}</span>}
           </div>

@@ -2,6 +2,8 @@
 #include "ui.h"
 #include "../../include/config.h"
 #include "../../include/store.h"
+#include "../../include/user_filaments_store.h"
+#include "../../include/stock_filaments_store.h"
 #include "../../include/scale_link.h"
 #include "../../include/core_weights.h"
 #include "../../include/quick_weights.h"
@@ -12,8 +14,10 @@
 #include <cstring>
 
 // Globals the wizard needs to talk to — defined elsewhere, declared here.
-extern SpoolStore g_store;
-extern ScaleLink  g_scale;
+extern SpoolStore          g_store;
+extern UserFilamentsStore  g_user_filaments;
+extern StockFilamentsStore g_stock_filaments;
+extern ScaleLink           g_scale;
 
 // ── Theme tokens (match ui.cpp) ────────────────────────────
 #define COL_BODY        lv_color_hex(0x0f1117)
@@ -63,6 +67,7 @@ struct WizardCtx {
     String     final_brand;
     String     final_color_name;
     String     final_color_hex;
+    String     final_setting_id;          // Filament preset ref (PFUL/PFUS), "" = none
     int        final_advertised = -1;
     int        final_core       = -1;
     int        final_current    = -1;
@@ -152,16 +157,35 @@ static void set_btn_enabled(lv_obj_t* b, bool enabled) {
     lv_obj_set_style_opa(b, enabled ? LV_OPA_COVER : LV_OPA_70, 0);
 }
 
+// Optional save-completion hook. Set by main.cpp via
+// ui_wizard_set_save_callback so the LCD can move from "wizard owns
+// the screen" to "spool detail screen + AMS-load latch armed" without
+// the wizard module having to import the entire spool-detail rendering
+// pipeline. nullptr = no hook → fall back to the legacy "back to home"
+// behaviour.
+static ui_wizard_save_cb_t s_save_cb = nullptr;
+
+void ui_wizard_set_save_callback(ui_wizard_save_cb_t cb) { s_save_cb = cb; }
+
 // Wizard navigation helpers — put the wizard out of the way when done.
-static void close_wizard() {
-    s_wiz = WizardCtx{};   // reset all fields
-    ui_show_home();
+// `saved_id` is the new spool's id when called from the Save path
+// (drives the post-save callback); empty for cancel paths so they fall
+// through to the legacy "back to home" behaviour.
+static void close_wizard(const String& saved_id = String()) {
+    String pending = saved_id;   // copy before reset wipes s_wiz
+    s_wiz = WizardCtx{};
+    if (pending.length() && s_save_cb) {
+        s_save_cb(pending);      // main.cpp arms PendingAms + opens detail
+    } else {
+        ui_show_home();
+    }
 }
 
 // ── Step navigation forward decls ──────────────────────────
 static void show_prompt();
 static void show_template();
 static void show_pick();
+static void show_filament_pick();
 static void show_state();
 static void show_full();
 static void show_used();
@@ -171,10 +195,16 @@ static void show_done();
 
 // Op codes shared across screens — a tiny int lets us use one event
 // callback per screen without needing separate functions per button.
+//
+// OP_NEW_FILAMENT is the new "Create new spool from a filament preset"
+// branch (was OP_SCRATCH; the value stays 10 so on_template's switch
+// doesn't shift). OP_DUPLICATE renames OP_COPY for the same reason.
+// FILA_ROW is the click-event op for a row in the filament picker.
 enum Op {
     OP_CREATE=1, OP_CLOSE=2,
-    OP_SCRATCH=10, OP_COPY=11,
+    OP_NEW_FILAMENT=10, OP_DUPLICATE=11,
     OP_PICK_ROW=20, OP_BACK=21,
+    OP_FILA_ROW=22,
     OP_CHIP_ALL=30, OP_CHIP_PLA=31, OP_CHIP_PETG=32, OP_CHIP_ABS=33, OP_CHIP_TPU=34,
     OP_STATE_FULL=40, OP_STATE_USED=41, OP_STATE_EMPTY=42,
     OP_FULL_QUICK0=50, OP_FULL_QUICK1=51, OP_FULL_QUICK2=52,
@@ -238,20 +268,33 @@ static void show_prompt() {
     lv_unlock();
 }
 
-// ── Step 2: from-scratch vs copy-template ──────────────────
+// ── Step 2: Duplicate spool vs New Filament ────────────────
+//
+// Two-button binary: pick a previous spool to copy from, OR pick a
+// filament preset (custom for now; stock comes later when the build
+// pipeline emits the JSONL sidecar). Either path seeds the
+// material/brand/color fields and proceeds to the same weight-capture
+// + save flow that already existed.
 
 static void on_template(lv_event_t* e) {
     switch (event_op(e)) {
-        case OP_SCRATCH:
-            s_wiz.use_template = false;
-            s_wiz.template_id  = "";
-            // Seed the "final" fields from tag hints.
-            s_wiz.final_material = s_wiz.hint_material;
-            s_wiz.final_brand    = s_wiz.hint_brand;
-            s_wiz.final_color_hex = s_wiz.hint_color_hex;
-            show_state();
+        case OP_NEW_FILAMENT:
+            s_wiz.use_template     = false;
+            s_wiz.template_id      = "";
+            s_wiz.final_setting_id = "";
+            // Seed material/brand from the tag's NDEF hints in case the
+            // user picked a filament that doesn't carry them. Picker
+            // will overwrite these on selection.
+            s_wiz.final_material  = s_wiz.hint_material;
+            s_wiz.final_brand     = s_wiz.hint_brand;
+            // Default new-spool color: light grey per spec; the user
+            // tweaks the real colour later in the web UI.
+            s_wiz.final_color_hex = s_wiz.hint_color_hex.length()
+                                    ? s_wiz.hint_color_hex
+                                    : String("cccccc");
+            show_filament_pick();
             return;
-        case OP_COPY:
+        case OP_DUPLICATE:
             s_wiz.use_template = true;
             show_pick();
             return;
@@ -265,17 +308,19 @@ static void build_template() {
     s_scr_template = lv_obj_create(nullptr);
     style_screen(s_scr_template);
 
-    lv_obj_t* title = make_label(s_scr_template, "Where to start?", COL_TEXT, &spoolhard_mont_22);
+    lv_obj_t* title = make_label(s_scr_template, "Create new spool", COL_TEXT, &spoolhard_mont_22);
     lv_obj_set_pos(title, 16, 14);
 
     lv_obj_t* hint = make_label(s_scr_template,
-        "Copy an existing spool as a template, or start from scratch and\n"
-        "fill everything in later.", COL_TEXT_MUTED, &spoolhard_mont_16);
+        "Duplicate an existing spool's settings, or pick a filament\n"
+        "preset to start fresh.", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_pos(hint, 16, 56);
 
-    make_btn(s_scr_template, "From scratch",      false, OP_SCRATCH, on_template, 16,  140, 220, 56);
-    make_btn(s_scr_template, "Copy existing",     true,  OP_COPY,    on_template, 248, 140, 220, 56);
-    make_btn(s_scr_template, "Back",              false, OP_BACK,    on_template, 16,  236, 100);
+    // Order matches the user's flow description: Duplicate first,
+    // New Filament second.
+    make_btn(s_scr_template, "Duplicate",    false, OP_DUPLICATE,    on_template, 16,  140, 220, 56);
+    make_btn(s_scr_template, "New filament", true,  OP_NEW_FILAMENT, on_template, 248, 140, 220, 56);
+    make_btn(s_scr_template, "Back",         false, OP_BACK,         on_template, 16,  236, 100);
 }
 
 static void show_template() {
@@ -381,6 +426,136 @@ static void show_pick() {
         }
     }
     lv_screen_load(s_scr_pick);
+    lv_unlock();
+}
+
+// ── Step 3b: filament picker (New Filament branch) ─────────
+//
+// Lists user-managed filament presets (g_user_filaments). Same
+// material-chip filter + scrollable list shape as the spool template
+// picker so the UX stays consistent. Stock filaments are deferred
+// until the build pipeline emits a JSONL sidecar the firmware can
+// read (filaments.db is SQLite which we don't have a client for).
+// On selection the wizard seeds material/brand/subtype + setting_id
+// from the chosen filament and falls through to the existing weight-
+// capture flow — no new state-machine nodes downstream.
+
+static lv_obj_t*               s_scr_filapick     = nullptr;
+static lv_obj_t*               s_filapick_list    = nullptr;
+static String                  s_filapick_filter  = "";
+// Owned heap-Strings for setting_ids attached as user_data on the row
+// buttons. Cleared on every show_filament_pick() to avoid leaks across
+// successive opens.
+static std::vector<String*>    s_filapick_row_ids;
+
+static void clear_filapick_rows() {
+    for (auto* s : s_filapick_row_ids) delete s;
+    s_filapick_row_ids.clear();
+    if (s_filapick_list) lv_obj_clean(s_filapick_list);
+}
+
+static void on_filament_pick(lv_event_t* e) {
+    int op = event_op(e);
+    if (op == OP_BACK)       { show_template(); return; }
+    if (op == OP_CHIP_ALL)   { s_filapick_filter = "";     show_filament_pick(); return; }
+    if (op == OP_CHIP_PLA)   { s_filapick_filter = "PLA";  show_filament_pick(); return; }
+    if (op == OP_CHIP_PETG)  { s_filapick_filter = "PETG"; show_filament_pick(); return; }
+    if (op == OP_CHIP_ABS)   { s_filapick_filter = "ABS";  show_filament_pick(); return; }
+    if (op == OP_CHIP_TPU)   { s_filapick_filter = "TPU";  show_filament_pick(); return; }
+    if (op == OP_FILA_ROW) {
+        lv_obj_t* t = lv_event_get_target_obj(e);
+        const char* sid = (const char*)lv_obj_get_user_data(t);
+        if (!sid) return;
+        FilamentRecord rec;
+        // User store first — locally-edited presets win over their
+        // stock parents if the same id ever appears in both.
+        bool found = g_user_filaments.findById(String(sid), rec) ||
+                     g_stock_filaments.findById(String(sid), rec);
+        if (found) {
+            s_wiz.final_setting_id  = rec.setting_id;
+            if (rec.filament_type.length())   s_wiz.final_material = rec.filament_type;
+            if (rec.filament_subtype.length())s_wiz.final_subtype  = rec.filament_subtype;
+            if (rec.filament_vendor.length()) s_wiz.final_brand    = rec.filament_vendor;
+            // Color stays the wizard's default (light grey from the
+            // OP_NEW_FILAMENT branch above) — filaments don't carry a
+            // single canonical colour, the user picks per-spool later.
+        }
+        show_state();
+        return;
+    }
+}
+
+static void build_filament_pick() {
+    s_scr_filapick = lv_obj_create(nullptr);
+    style_screen(s_scr_filapick);
+
+    lv_obj_t* title = make_label(s_scr_filapick, "Pick a filament", COL_TEXT, &spoolhard_mont_22);
+    lv_obj_set_pos(title, 16, 10);
+
+    // Same chip set as the spool picker for muscle-memory consistency.
+    const char* chip_labels[] = { "All", "PLA", "PETG", "ABS", "TPU" };
+    int chip_ops[]            = { OP_CHIP_ALL, OP_CHIP_PLA, OP_CHIP_PETG, OP_CHIP_ABS, OP_CHIP_TPU };
+    int cx = 16;
+    for (int i = 0; i < 5; ++i) {
+        make_btn(s_scr_filapick, chip_labels[i], false,
+                 chip_ops[i], on_filament_pick, cx, 46, 72, 30);
+        cx += 80;
+    }
+
+    s_filapick_list = lv_list_create(s_scr_filapick);
+    lv_obj_set_pos(s_filapick_list, 16, 84);
+    lv_obj_set_size(s_filapick_list, 448, 142);
+    lv_obj_set_style_bg_color(s_filapick_list, COL_CARD, 0);
+    lv_obj_set_style_border_color(s_filapick_list, COL_BORDER, 0);
+    lv_obj_set_style_border_width(s_filapick_list, 1, 0);
+    lv_obj_set_style_radius(s_filapick_list, 10, 0);
+
+    make_btn(s_scr_filapick, "Back", false, OP_BACK, on_filament_pick, 16, 236, 100);
+}
+
+static void show_filament_pick() {
+    lv_lock();
+    if (!s_scr_filapick) build_filament_pick();
+    clear_filapick_rows();
+
+    // Merge user filaments + stock filaments. User entries are typically
+    // more relevant (the user took the time to create them), so they
+    // come first; stock follows.
+    auto user_rows  = g_user_filaments.list(0, 200, s_filapick_filter);
+    auto stock_rows = g_stock_filaments.list(0, 200, s_filapick_filter);
+
+    auto append_row = [&](const FilamentRecord& rec, const char* badge) {
+        String line = rec.name.length() ? rec.name : String("(unnamed)");
+        if (badge && *badge) {
+            line = String(badge) + "  " + line;
+        }
+        if (rec.filament_type.length())   line += "  " LV_SYMBOL_BULLET "  " + rec.filament_type;
+        if (rec.filament_vendor.length()) line += "  " LV_SYMBOL_BULLET "  " + rec.filament_vendor;
+        lv_obj_t* btn = lv_list_add_btn(s_filapick_list, LV_SYMBOL_RIGHT, line.c_str());
+        String* idCopy = new String(rec.setting_id);
+        s_filapick_row_ids.push_back(idCopy);
+        lv_obj_set_user_data(btn, (void*)idCopy->c_str());
+        lv_obj_add_event_cb(btn, on_filament_pick, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)OP_FILA_ROW);
+    };
+
+    if (user_rows.empty() && stock_rows.empty()) {
+        // True empty state — no stock library uploaded AND no user
+        // filaments created. The "upload via web UI" hint covers both
+        // failure modes since users typically hit either when first
+        // setting up the device.
+        lv_obj_t* empty = make_label(s_filapick_list,
+            "No filaments available.\n\n"
+            "Upload the stock filament library or create a custom one\n"
+            "in the web UI's Filaments tab, then re-scan.",
+            COL_TEXT_MUTED, &spoolhard_mont_16);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(empty);
+    } else {
+        for (const auto& rec : user_rows)  append_row(rec, LV_SYMBOL_EDIT);    // pencil
+        for (const auto& rec : stock_rows) append_row(rec, "");
+    }
+    lv_screen_load(s_scr_filapick);
     lv_unlock();
 }
 
@@ -758,12 +933,16 @@ static void on_done(lv_event_t* e) {
             rec.weight_core       = s_wiz.final_core;
             rec.weight_current    = s_wiz.final_current;
             rec.weight_new        = s_wiz.final_new;
+            rec.setting_id        = s_wiz.final_setting_id;
             rec.data_origin       = s_wiz.tag_format;
             rec.tag_type          = s_wiz.tag_type;
             g_store.upsert(rec);
             Serial.printf("[Wiz] saved spool id=%s core=%d current=%d\n",
                           rec.id.c_str(), rec.weight_core, rec.weight_current);
-            close_wizard();
+            // Save path: hand the new spool id to main.cpp's callback so it
+            // can arm PendingAms + show the spool-detail screen, matching
+            // the existing-tag-rescan flow.
+            close_wizard(rec.id);
             return;
         }
     }

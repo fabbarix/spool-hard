@@ -1,4 +1,4 @@
-import { LayoutDashboard, Settings, Package } from 'lucide-react';
+import { LayoutDashboard, Settings, Package, FlaskConical, Scale } from 'lucide-react';
 import type { Tab } from '../../App';
 
 interface NavTabsProps {
@@ -7,9 +7,11 @@ interface NavTabsProps {
 }
 
 const tabs = [
-  { key: 'dashboard' as const, label: 'Dashboard', icon: LayoutDashboard },
-  { key: 'spools'    as const, label: 'Spools',    icon: Package },
-  { key: 'config'    as const, label: 'Config',    icon: Settings },
+  { key: 'dashboard'     as const, label: 'Dashboard',     icon: LayoutDashboard },
+  { key: 'spools'        as const, label: 'Spools',        icon: Package },
+  { key: 'empty-weights' as const, label: 'Empty weights', icon: Scale },
+  { key: 'filaments'     as const, label: 'Filaments',     icon: FlaskConical },
+  { key: 'config'        as const, label: 'Config',        icon: Settings },
 ];
 
 export function NavTabs({ activeTab, onTabChange }: NavTabsProps) {

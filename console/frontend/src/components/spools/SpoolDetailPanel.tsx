@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react';
-import { Scale, Save, Gauge, Thermometer, StickyNote, Printer, BookOpen } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Scale, Save, Gauge, Thermometer, StickyNote, Printer, BookOpen, Link2, Link2Off, BatteryLow, BatteryFull } from 'lucide-react';
 import { Button } from '@spoolhard/ui/components/Button';
 import { InputField } from '@spoolhard/ui/components/InputField';
 import { useSpoolUpsert, type SpoolRecord } from '../../hooks/useSpools';
 import { useScaleLink } from '../../hooks/useScaleLink';
+import { useFilamentsDb, type FilamentEntry } from '../../hooks/useFilamentsDb';
+import { useUserFilaments } from '../../hooks/useUserFilaments';
 import { FilamentPicker } from './FilamentPicker';
-import type { FilamentEntry } from '../../hooks/useFilamentsDb';
 
 interface Props {
   spool: SpoolRecord;
@@ -28,6 +29,21 @@ export function SpoolDetailPanel({ spool }: Props) {
   useEffect(() => { setDraft(spool); }, [spool]);
   const [pickerOpen, setPickerOpen] = useState(false);
 
+  // Resolve the linked-preset name for display next to the picker
+  // button. We already pull both libraries elsewhere on the page so
+  // the React Query cache hits are free here.
+  const stockLib = useFilamentsDb();
+  const userLib  = useUserFilaments();
+  const linkedFilament = useMemo(() => {
+    const id = draft.setting_id;
+    if (!id) return null;
+    const u = userLib.data?.rows.find((r) => r.setting_id === id);
+    if (u) return { name: u.name, source: 'user' as const };
+    const s = stockLib.data?.entries.find((e) => e.setting_id === id);
+    if (s) return { name: s.name, source: 'stock' as const };
+    return { name: id, source: 'unknown' as const };  // id we can't resolve
+  }, [draft.setting_id, userLib.data, stockLib.data]);
+
   // Overlay semantics: the library only exposes what the preset actually
   // knew (name-derived material/subtype/brand, plus resolved temps +
   // filament_id). Fields the library left undefined don't overwrite what
@@ -43,6 +59,11 @@ export function SpoolDetailPanel({ spool }: Props) {
       nozzle_temp_max:  typeof e.nozzle_temp_max === 'number' ? e.nozzle_temp_max : d.nozzle_temp_max,
       density:          typeof e.density === 'number' && e.density > 0 ? e.density : d.density,
       slicer_filament:  e.filament_id || d.slicer_filament,
+      // Persist the filament preset reference. User filaments carry a
+      // setting_id (PFUL/PFUS) the firmware can resolve back; stock
+      // entries don't have one yet (no JSONL sidecar in the firmware
+      // build pipeline) so we leave d.setting_id alone in that case.
+      setting_id:       e.setting_id  || d.setting_id,
       weight_advertised: typeof e.advertised === 'number' && e.advertised > 0
         ? e.advertised
         : d.weight_advertised,
@@ -64,9 +85,22 @@ export function SpoolDetailPanel({ spool }: Props) {
     draft.nozzle_temp_min !== spool.nozzle_temp_min ||
     draft.nozzle_temp_max !== spool.nozzle_temp_max ||
     draft.slicer_filament !== spool.slicer_filament ||
+    draft.setting_id !== spool.setting_id ||
+    !!draft.is_empty !== !!spool.is_empty ||
     draft.note !== spool.note;
 
   const save = () => upsert.mutate(draft);
+
+  // Toggling empty is a one-click action — saved immediately rather than
+  // staged with the other edits, because users hitting "Mark as empty"
+  // expect the spool to vanish from the default list right away. The
+  // mutation only sends {id, is_empty} so it doesn't race the rest of the
+  // draft (overlay semantics on the firmware side).
+  const toggleEmpty = () => {
+    const next = !draft.is_empty;
+    setDraft({ ...draft, is_empty: next });
+    upsert.mutate({ id: spool.id, is_empty: next });
+  };
 
   const captureWeight = () => {
     if (!scale?.weight || scale.weight.state !== 'stable') return;
@@ -163,11 +197,47 @@ export function SpoolDetailPanel({ spool }: Props) {
 
       {/* Print settings — pushed to Bambu via ams_filament_setting when this
           spool gets auto-assigned after a tag scan. Empty/unset temps fall
-          back to a material-default lookup in the firmware. */}
+          back to a material-default lookup in the firmware. The "Pick from
+          library" button here mirrors the one at the top under Identification
+          — it opens the same picker (combined stock + cloud-synced presets)
+          but lives in this section so users editing print settings find it
+          without scrolling. */}
       <div className="border-t border-surface-border pt-3 space-y-2">
-        <div className="flex items-center gap-1.5 text-xs text-text-muted">
-          <Thermometer size={12} /> Print settings <Printer size={11} className="ml-1 opacity-60" />
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5 text-xs text-text-muted">
+            <Thermometer size={12} /> Print settings <Printer size={11} className="ml-1 opacity-60" />
+          </div>
+          <Button variant="secondary" onClick={() => setPickerOpen(true)} className="!py-1.5 !px-2.5">
+            <BookOpen size={13} className="mr-1.5 inline" />
+            <span className="text-xs">Pick from library</span>
+          </Button>
         </div>
+        {linkedFilament ? (
+          <div className="flex items-center gap-2 text-[11px] text-text-muted">
+            <Link2 size={11} className="text-brand-400 flex-shrink-0" />
+            <span className="truncate">
+              Linked: <span className="text-text-primary">{linkedFilament.name}</span>
+              {linkedFilament.source === 'user' && (
+                <span className="ml-1 text-brand-400">(custom)</span>
+              )}
+              {linkedFilament.source === 'unknown' && (
+                <span className="ml-1 text-status-warning">(preset not in library)</span>
+              )}
+            </span>
+            <button
+              onClick={() => setDraft({ ...draft, setting_id: '' })}
+              className="ml-auto flex items-center gap-1 text-text-muted hover:text-status-error transition-colors flex-shrink-0"
+              title="Unlink filament preset"
+            >
+              <Link2Off size={11} />
+              <span>Unlink</span>
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5 text-[11px] text-text-muted">
+            <Link2Off size={11} /> No filament preset linked — temps + filament ID are loose values.
+          </div>
+        )}
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
           <InputField
             label="Nozzle min (°C)"
@@ -186,8 +256,8 @@ export function SpoolDetailPanel({ spool }: Props) {
             }
           />
           <InputField
-            label="Bambu filament ID"
-            placeholder="e.g. GFL99"
+            label="AMS tray_info_idx"
+            placeholder="e.g. GFL99 — auto-syncs from printer"
             value={draft.slicer_filament ?? ''}
             onChange={(e) => setDraft({ ...draft, slicer_filament: e.target.value })}
           />
@@ -209,10 +279,24 @@ export function SpoolDetailPanel({ spool }: Props) {
       </div>
 
       <div className="flex items-center justify-between pt-1">
-        <Button onClick={save} disabled={!dirty || upsert.isPending}>
-          <Save size={14} className="mr-1.5 inline" />
-          {upsert.isPending ? 'Saving…' : 'Save'}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button onClick={save} disabled={!dirty || upsert.isPending}>
+            <Save size={14} className="mr-1.5 inline" />
+            {upsert.isPending ? 'Saving…' : 'Save'}
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={toggleEmpty}
+            disabled={upsert.isPending}
+            title={draft.is_empty
+              ? 'Mark this spool as not empty so it shows in the default list again.'
+              : 'Mark this spool as empty. It will be hidden from the default list (toggle "Show empty" to see it).'}
+          >
+            {draft.is_empty
+              ? <><BatteryFull size={14} className="mr-1.5 inline" /> Mark as not empty</>
+              : <><BatteryLow  size={14} className="mr-1.5 inline" /> Mark as empty</>}
+          </Button>
+        </div>
         {upsert.error instanceof Error && (
           <span className="text-xs text-status-error">{upsert.error.message}</span>
         )}

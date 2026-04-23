@@ -370,6 +370,67 @@ BambuCloudAuth::StepResult BambuCloudAuth::loginTfa(
     return out;
 }
 
+// ── Generic auth'd API helpers ───────────────────────────────
+//
+// Wrap the underlying _post / _get + a new DELETE so cloud-filament
+// sync (and any future module that talks to api.bambulab.com with a
+// Bearer token) doesn't re-implement the headers + WAF detection. The
+// classification rule is the same in all three: 2xx body → ok, body
+// matches CF reject template → cfBlocked, transport failure →
+// httpStatus 0.
+
+BambuCloudAuth::ApiResult BambuCloudAuth::apiGet(Region r, const char* path,
+                                                  const String& bearer) {
+    ApiResult out;
+    out.body       = _get(r, path, bearer);
+    out.httpStatus = _lastHttpStatus;
+    out.cfBlocked  = looksLikeCloudflareBlock(out.body);
+    return out;
+}
+
+BambuCloudAuth::ApiResult BambuCloudAuth::apiPost(Region r, const char* path,
+                                                   const String& bearer,
+                                                   const String& jsonBody) {
+    // Reuse _post but inject the Bearer header. _post doesn't take a
+    // bearer today (it's used for the unauthenticated login POST), so
+    // we open the HTTPClient ourselves here. Mirrors _post's structure
+    // precisely — same TLS plumbing, same headers, same diagnostics.
+    ApiResult out;
+    String url = String(regionBaseUrl(r)) + path;
+    WiFiClientSecure client; client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(15000);
+    http.setReuse(false);
+    if (!http.begin(client, url)) return out;  // httpStatus stays 0
+    _applyDefaultHeaders(http);
+    http.addHeader("Authorization", String("Bearer ") + bearer);
+    int code = http.POST(jsonBody);
+    out.httpStatus = code;
+    if (code > 0) out.body = http.getString();
+    out.cfBlocked = looksLikeCloudflareBlock(out.body);
+    http.end();
+    return out;
+}
+
+BambuCloudAuth::ApiResult BambuCloudAuth::apiDelete(Region r, const char* path,
+                                                     const String& bearer) {
+    ApiResult out;
+    String url = String(regionBaseUrl(r)) + path;
+    WiFiClientSecure client; client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(15000);
+    http.setReuse(false);
+    if (!http.begin(client, url)) return out;
+    _applyDefaultHeaders(http);
+    http.addHeader("Authorization", String("Bearer ") + bearer);
+    int code = http.sendRequest("DELETE");
+    out.httpStatus = code;
+    if (code > 0) out.body = http.getString();
+    out.cfBlocked = looksLikeCloudflareBlock(out.body);
+    http.end();
+    return out;
+}
+
 BambuCloudAuth::VerifyResult BambuCloudAuth::verifyToken(const String& token, Region r) {
     String body = _get(r, "/v1/user-service/my/profile", token);
     if (_lastHttpStatus == 200) return VerifyResult::Verified;
