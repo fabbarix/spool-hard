@@ -35,6 +35,13 @@ struct FilamentRecord {
     // `base_id` is Bambu's GFXX00 namespace, which doesn't map to any
     // local stock entry one-to-one) and for stock rows themselves.
     String  parent_setting_id;
+    // Cloud-side parent reference. The detail response carries
+    // `setting.inherits` like "Bambu PETG Basic @BBL X1C 0.8 nozzle"
+    // — the human name of the next preset up the BambuStudio
+    // inheritance chain. Captured during cloud sync so the edit form
+    // can fetch the parent's full settings via the public-catalog
+    // cache and pre-fill numeric fields the user hasn't customised.
+    String  cloud_inherits;
     String  filament_type;         // PLA, PETG, TPU, …
     String  filament_subtype;      // basic, matte, translucent, … (optional)
     String  filament_vendor;

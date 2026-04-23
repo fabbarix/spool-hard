@@ -113,6 +113,14 @@ static void parseCloudPreset(const JsonDocument& doc,
         if (s["filament_density"].is<const char*>()) {
             out.density = atof(s["filament_density"].as<const char*>());
         }
+        // Cloud's `inherits` is the human name of the preset this one
+        // delta-overrides — e.g. "Bambu PETG Basic @BBL X1C 0.8 nozzle".
+        // Capture it so the edit form can resolve the parent through
+        // the public-catalog cache and pre-fill empty numeric fields
+        // with the parent's values.
+        if (s["inherits"].is<const char*>()) {
+            out.cloud_inherits = s["inherits"].as<const char*>();
+        }
     }
 }
 

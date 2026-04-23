@@ -20,6 +20,12 @@ export interface UserFilament {
   // time. Empty for cloud-synced customs (their `base_id` is in
   // Bambu's GFXX00 namespace, which doesn't map to a local entry).
   parent_setting_id?: string;
+  // Cloud-side parent — the human name of the preset this one
+  // delta-overrides (Bambu's `setting.inherits`). Captured during
+  // cloud sync. Lets the edit form fetch the parent's full settings
+  // via the public-catalog cache and surface them as placeholders for
+  // any field the user hasn't customised.
+  cloud_inherits?: string;
   filament_type: string;     // PLA / PETG / TPU / ...
   filament_subtype?: string; // basic / matte / translucent / ...
   filament_vendor: string;
@@ -70,6 +76,58 @@ export interface ResolvedUserFilament {
     density:          boolean;
     pressure_advance: boolean;
     pa_by_nozzle:     boolean;
+  };
+}
+
+// Convert a cloud-detail `body` (the response from
+// useCloudFilamentByName) into a FilamentEntry-shaped parent record.
+// Cloud values come wrapped in arrays for multi-extruder support
+// (`filament_density: ["1.25"]`, `nozzle_temperature: ["255","255"]`)
+// — we always take the first element, then for any string with a
+// comma split on the comma and take the first sub-value too. That
+// matches the build-pipeline jsonl_writer's _first_int / _first_float
+// behaviour so the resolver sees the same shape for stock and cloud
+// parents.
+export function cloudBodyToFilamentEntry(
+  cloudBody: CloudDetailResponse['body'] | undefined,
+): FilamentEntry | null {
+  if (!cloudBody) return null;
+  const s = (cloudBody.setting ?? {}) as Record<string, unknown>;
+  const first = (k: string): string => {
+    const v = s[k];
+    if (Array.isArray(v) && v.length > 0) return String(v[0]).split(',')[0].trim();
+    if (typeof v === 'string') return v.split(',')[0].trim();
+    if (typeof v === 'number') return String(v);
+    return '';
+  };
+  const firstInt = (k: string): number | undefined => {
+    const t = first(k);
+    if (!t) return undefined;
+    const n = parseInt(t, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  const firstFloat = (k: string): number | undefined => {
+    const t = first(k);
+    if (!t) return undefined;
+    const n = parseFloat(t);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  // Strip the surrounding quotes that BambuStudio profiles sometimes
+  // emit (`"\"Bambu Lab\""` → `Bambu Lab`).
+  const unq = (v: string): string => v.replace(/^"+|"+$/g, '');
+  return {
+    name:        unq(first('filament_settings_id')) || cloudBody.name || '',
+    filament_id: typeof s['filament_id'] === 'string' ? String(s['filament_id']) : first('filament_id'),
+    brand:       unq(first('filament_vendor')),
+    material:    unq(first('filament_type')),
+    subtype:     unq(first('filament_subtype')),
+    nozzle_temp_min:  firstInt('nozzle_temperature_initial_layer'),
+    nozzle_temp_max:  firstInt('nozzle_temperature'),
+    density:          firstFloat('filament_density'),
+    pressure_advance: firstFloat('pressure_advance'),
+    base_id:          cloudBody.base_id || undefined,
+    setting_id:       cloudBody.name || '',
+    source:           'stock',
   };
 }
 
