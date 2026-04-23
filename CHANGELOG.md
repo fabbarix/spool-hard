@@ -8,6 +8,17 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.3.1] - 2026-04-23
+
+- fix(filaments): expanded row + edit form fall back to base_id when no inherits
+- feat(filaments): edit form auto-fills from the cloud parent's settings
+- feat(filaments): SD-cached public-catalog index + Config UI to manage it
+- feat(filaments): "Try fetching parent from cloud" — public-catalog walker
+- feat(filaments): per-preset cloud-detail viewer for cloud-synced customs
+- feat(filaments): custom filaments inherit unset fields from a stock parent
+- feat(backup): download/upload full-device backup for console + scale
+- fix: OTA page no longer flashes "scale waiting / unavailable" on every WS reconnect
+
 ## [0.3.0] - 2026-04-22
 
 - feat: bambu-filaments build pipeline emits filaments.jsonl (replaces SQLite); cloud-helper tools
