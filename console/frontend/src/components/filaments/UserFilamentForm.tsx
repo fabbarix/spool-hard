@@ -1,97 +1,160 @@
-import { useState } from 'react';
-import { Plus, Trash2, BookOpen, X } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Plus, Trash2, BookOpen, X, RotateCcw } from 'lucide-react';
 import { Button } from '@spoolhard/ui/components/Button';
 import { InputField } from '@spoolhard/ui/components/InputField';
 import {
   useUpsertUserFilament,
+  resolveUserFilament,
   type UserFilament,
   type PaByNozzleEntry,
 } from '../../hooks/useUserFilaments';
+import { useFilamentsDb, type FilamentEntry } from '../../hooks/useFilamentsDb';
 import { FilamentPicker } from '../spools/FilamentPicker';
-import type { FilamentEntry } from '../../hooks/useFilamentsDb';
 
-// Minimal create/edit form for a user filament preset. Fields mirror the
-// shape stored in user_filaments.jsonl on the device (see
-// console/firmware/include/filament_record.h). Anything left blank
-// becomes the firmware's "unset" sentinel (-1 for ints, 0 for floats).
+// Create/edit form for a user filament preset. Fields mirror the
+// storage shape (see console/firmware/include/filament_record.h).
 //
-// The setting_id field isn't editable — it's server-generated on create
-// (PFUL<hash>) and immutable on update.
-//
-// Two ergonomic affordances on top of a plain form:
-//   * "Base on a stock filament" — opens the FilamentPicker (stockOnly)
-//     and prefills name / vendor / temps / density / base_id / etc from
-//     the chosen preset. Saves the user from typing GFSA00 + remembering
-//     the right tray_info_idx for, say, a Bambu PLA Basic clone.
-//   * Per-nozzle pressure-advance table — PA depends on (filament,
-//     nozzle), so we let the user record one K per nozzle they own. The
-//     scalar `pressure_advance` field stays as a fallback for nozzles
-//     not in the table (and for cloud round-trip — Bambu only stores the
-//     scalar).
+// Inheritance model:
+//   - Picking "Base on a stock filament" sets `parent_setting_id` to
+//     the picked stock entry's setting_id. It also fills profile-
+//     IDENTITY fields (name if blank, base_id, vendor-if-blank,
+//     filament_type, subtype, filament_id) from the stock entry.
+//   - The INHERITABLE numeric/PA fields (nozzle temps, density, K)
+//     are deliberately NOT copied on pick — they stay empty in the
+//     form, with the parent's values shown as placeholders. Saved
+//     empty fields persist as sentinel values (-1 / 0 / []) and the
+//     display layer falls back to the parent. That way editing the
+//     base_id later (or the stock library updating) flows new values
+//     through without wiping the user's explicit overrides.
+//   - A value the user types IS an override and is persisted on save.
+//     A per-field "↺ Reset" button next to the label clears the
+//     override back to "inherit from parent".
 export function UserFilamentForm({
   initial, onClose,
 }: {
   initial?: UserFilament;
   onClose: () => void;
 }) {
-  const upsert = useUpsertUserFilament();
+  const upsert  = useUpsertUserFilament();
+  const stockDb = useFilamentsDb();
+
+  // A Partial is enough — empty/unset means "inherit from parent".
   const [form, setForm] = useState<Partial<UserFilament>>({
-    name:             initial?.name             ?? '',
-    base_id:          initial?.base_id          ?? 'GFSA00',  // generic PLA base
-    filament_type:    initial?.filament_type    ?? 'PLA',
-    filament_subtype: initial?.filament_subtype ?? 'basic',
-    filament_vendor:  initial?.filament_vendor  ?? '',
-    filament_id:      initial?.filament_id      ?? '',
-    nozzle_temp_min:  initial?.nozzle_temp_min  ?? 200,
-    nozzle_temp_max:  initial?.nozzle_temp_max  ?? 220,
-    density:          initial?.density          ?? 1.24,
-    pressure_advance: initial?.pressure_advance ?? 0.04,
-    pa_by_nozzle:     initial?.pa_by_nozzle     ?? [],
+    setting_id:        initial?.setting_id,
+    name:              initial?.name ?? '',
+    base_id:           initial?.base_id ?? '',
+    parent_setting_id: initial?.parent_setting_id ?? '',
+    filament_type:     initial?.filament_type ?? '',
+    filament_subtype:  initial?.filament_subtype ?? '',
+    filament_vendor:   initial?.filament_vendor ?? '',
+    filament_id:       initial?.filament_id ?? '',
+    nozzle_temp_min:   initial?.nozzle_temp_min,
+    nozzle_temp_max:   initial?.nozzle_temp_max,
+    density:           initial?.density,
+    pressure_advance:  initial?.pressure_advance,
+    pa_by_nozzle:      initial?.pa_by_nozzle ?? [],
   });
   const [pickerOpen, setPickerOpen] = useState(false);
 
-  const set = <K extends keyof UserFilament>(k: K, v: UserFilament[K]) =>
+  const set = <K extends keyof UserFilament>(k: K, v: UserFilament[K] | undefined) =>
     setForm((f) => ({ ...f, [k]: v }));
 
-  // Take a stock-library entry and overlay every field it actually
-  // populates. Leaves the user's name alone if they've started typing
-  // (rather than blowing it away mid-edit), but otherwise prefills.
+  // Look up the picked parent in the local stock library so we can
+  // show inherited values as placeholders throughout the form.
+  const parent: FilamentEntry | null = useMemo(() => {
+    const id = form.parent_setting_id;
+    if (!id || !stockDb.data?.entries) return null;
+    return stockDb.data.entries.find((e) => e.setting_id === id) ?? null;
+  }, [form.parent_setting_id, stockDb.data]);
+
+  // Resolved view drives the placeholder text — when the user clears a
+  // field we show "1.24 (from Bambu PLA Basic @base)" so the user knows
+  // what value will apply at print time.
+  const resolved = useMemo(
+    () => resolveUserFilament(form as UserFilament, parent),
+    [form, parent],
+  );
+
   const applyStockBase = (e: FilamentEntry) => {
     setForm((f) => ({
       ...f,
-      name:             f.name && f.name.trim() ? f.name : e.name,
-      base_id:          e.base_id          || f.base_id,
-      filament_type:    e.material         || f.filament_type,
-      filament_subtype: e.subtype          || f.filament_subtype,
-      filament_vendor:  e.brand            || f.filament_vendor,
-      filament_id:      e.filament_id      || f.filament_id,
-      nozzle_temp_min:  typeof e.nozzle_temp_min === 'number' ? e.nozzle_temp_min : f.nozzle_temp_min,
-      nozzle_temp_max:  typeof e.nozzle_temp_max === 'number' ? e.nozzle_temp_max : f.nozzle_temp_max,
-      density:          typeof e.density === 'number' && e.density > 0 ? e.density : f.density,
-      pressure_advance: typeof e.pressure_advance === 'number' && e.pressure_advance > 0
-        ? e.pressure_advance
-        : f.pressure_advance,
+      // Link, don't copy, for inheritable fields. The resolved view +
+      // placeholders convey what the values will be without persisting
+      // them to the custom record.
+      parent_setting_id: e.setting_id ?? '',
+      // Profile-identity fields: safe to fill. Name gets filled only
+      // when blank so the user can start typing "My PLA" first and
+      // then pick a base without losing their in-progress name.
+      name:              f.name && f.name.trim() ? f.name : `${e.name} (custom)`,
+      base_id:           e.base_id        || f.base_id,
+      filament_type:     e.material       || f.filament_type,
+      filament_subtype:  e.subtype        || f.filament_subtype,
+      filament_vendor:   e.brand          || f.filament_vendor,
+      filament_id:       e.filament_id    || f.filament_id,
+      // Explicitly DO NOT copy nozzle temps / density / PA. They stay
+      // unset in the form so the resolver sources them from the parent.
     }));
   };
 
-  // Per-nozzle PA mutation helpers. The list is small (at most a few
-  // rows per user) so we keep it as state and overwrite-replace on save.
+  // Inheritable numeric fields — helpers centralise the "what does the
+  // input show / does it render as inherited" logic so every row stays
+  // in sync.
+  const numericInput = (key: 'nozzle_temp_min' | 'nozzle_temp_max' | 'density' | 'pressure_advance') => {
+    const current = form[key] as number | undefined;
+    const isUnset = current === undefined || current < 0 || (key === 'density' || key === 'pressure_advance' ? current === 0 : false);
+    const inherited = resolved.inherited[key];
+    const placeholderValue = inherited ? resolved[key] : null;
+    return {
+      value: isUnset ? '' : String(current),
+      placeholder: placeholderValue !== null && placeholderValue > 0
+        ? (parent ? `${placeholderValue} (from ${parent.name})` : String(placeholderValue))
+        : undefined,
+      onChange: (ev: React.ChangeEvent<HTMLInputElement>) => {
+        // Empty string = reset to inherit; typed value = override.
+        if (ev.target.value === '') set(key, undefined);
+        else set(key, Number(ev.target.value));
+      },
+      onReset: () => set(key, undefined),
+      canReset: !isUnset && !!parent,
+      inherited,
+    };
+  };
+
+  // Per-nozzle PA mutation helpers. The list itself is one override —
+  // if the user clears the table the custom inherits (currently parent
+  // never has a PA-per-nozzle table, but the path is future-proof).
   const pa = form.pa_by_nozzle ?? [];
   const updatePa = (idx: number, patch: Partial<PaByNozzleEntry>) => {
     const next = pa.map((e, i) => (i === idx ? { ...e, ...patch } : e));
     set('pa_by_nozzle', next);
   };
-  const addPa = () => set('pa_by_nozzle', [...pa, { nozzle: 0.4, k: form.pressure_advance ?? 0 }]);
+  const addPa = () => set('pa_by_nozzle', [...pa, {
+    nozzle: 0.4,
+    k: resolved.pressure_advance > 0 ? resolved.pressure_advance : 0,
+  }]);
   const delPa = (idx: number) => set('pa_by_nozzle', pa.filter((_, i) => i !== idx));
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.name) return;
-    upsert.mutate(
-      { ...form, setting_id: initial?.setting_id },
-      { onSuccess: onClose },
-    );
+    // Translate undefined → sentinel so the firmware stores "unset" and
+    // the display layer falls back to the parent. Matches FilamentRecord
+    // defaults on the firmware side.
+    const body: Partial<UserFilament> = {
+      ...form,
+      nozzle_temp_min:  form.nozzle_temp_min  ?? -1,
+      nozzle_temp_max:  form.nozzle_temp_max  ?? -1,
+      density:          form.density          ?? 0,
+      pressure_advance: form.pressure_advance ?? 0,
+      setting_id:       initial?.setting_id,
+    };
+    upsert.mutate(body, { onSuccess: onClose });
   };
+
+  const nMin = numericInput('nozzle_temp_min');
+  const nMax = numericInput('nozzle_temp_max');
+  const dens = numericInput('density');
+  const paK  = numericInput('pressure_advance');
 
   return (
     <form
@@ -117,17 +180,45 @@ export function UserFilamentForm({
           </Button>
         </div>
       </div>
+
+      {parent && (
+        <div className="rounded-md border border-brand-500/30 bg-brand-500/5 px-2 py-1.5 text-[11px] text-text-muted">
+          Inheriting from <span className="text-brand-400 font-mono">{parent.name}</span>
+          {' '}— empty fields below will use the parent's values at print time.
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-3">
         <InputField label="Name"   value={form.name ?? ''}   onChange={(e) => set('name',   e.target.value)} />
-        <InputField label="Vendor" value={form.filament_vendor ?? ''} onChange={(e) => set('filament_vendor', e.target.value)} />
-        <InputField label="Material (PLA / PETG / TPU / …)" value={form.filament_type ?? ''} onChange={(e) => set('filament_type', e.target.value.toUpperCase())} />
-        <InputField label="Subtype (basic / matte / …)" value={form.filament_subtype ?? ''} onChange={(e) => set('filament_subtype', e.target.value)} />
+        <InputField
+          label={fieldLabel('Vendor', !form.filament_vendor && !!parent?.brand)}
+          value={form.filament_vendor ?? ''}
+          placeholder={!form.filament_vendor && parent?.brand ? `${parent.brand} (from parent)` : undefined}
+          onChange={(e) => set('filament_vendor', e.target.value)}
+        />
+        <InputField
+          label={fieldLabel('Material (PLA / PETG / TPU / …)', !form.filament_type && !!parent?.material)}
+          value={form.filament_type ?? ''}
+          placeholder={!form.filament_type && parent?.material ? `${parent.material} (from parent)` : undefined}
+          onChange={(e) => set('filament_type', e.target.value.toUpperCase())}
+        />
+        <InputField
+          label={fieldLabel('Subtype (basic / matte / …)', !form.filament_subtype && !!parent?.subtype)}
+          value={form.filament_subtype ?? ''}
+          placeholder={!form.filament_subtype && parent?.subtype ? `${parent.subtype} (from parent)` : undefined}
+          onChange={(e) => set('filament_subtype', e.target.value)}
+        />
         <InputField label="Bambu base ID" value={form.base_id ?? ''} onChange={(e) => set('base_id', e.target.value)} />
-        <InputField label="Bambu filament ID (tray_info_idx)" value={form.filament_id ?? ''} onChange={(e) => set('filament_id', e.target.value)} />
-        <InputField label="Nozzle temp min (°C)" type="number" value={String(form.nozzle_temp_min ?? '')} onChange={(e) => set('nozzle_temp_min', Number(e.target.value))} />
-        <InputField label="Nozzle temp max (°C)" type="number" value={String(form.nozzle_temp_max ?? '')} onChange={(e) => set('nozzle_temp_max', Number(e.target.value))} />
-        <InputField label="Density (g/cm³)" type="number" step={0.01} value={String(form.density ?? '')} onChange={(e) => set('density', Number(e.target.value))} />
-        <InputField label="Pressure advance — default (K)" type="number" step={0.001} value={String(form.pressure_advance ?? '')} onChange={(e) => set('pressure_advance', Number(e.target.value))} />
+        <InputField
+          label={fieldLabel('Bambu filament ID (tray_info_idx)', !form.filament_id && !!parent?.filament_id)}
+          value={form.filament_id ?? ''}
+          placeholder={!form.filament_id && parent?.filament_id ? `${parent.filament_id} (from parent)` : undefined}
+          onChange={(e) => set('filament_id', e.target.value)}
+        />
+        <NumericField label="Nozzle temp min (°C)" helper={nMin} />
+        <NumericField label="Nozzle temp max (°C)" helper={nMax} />
+        <NumericField label="Density (g/cm³)"      helper={dens} step={0.01} />
+        <NumericField label="Pressure advance — default (K)" helper={paK} step={0.001} />
       </div>
 
       <div className="border-t border-surface-border pt-3 space-y-2">
@@ -210,11 +301,55 @@ export function UserFilamentForm({
         <FilamentPicker
           stockOnly
           title="Base on a stock filament"
-          description="Pick a stock library preset to prefill base_id, vendor, temps, density and PA. You can edit anything afterwards."
+          description="Pick a stock preset as the parent. Values the custom doesn't set will be inherited — you only need to override what you want to change."
           onPick={(e) => applyStockBase(e)}
           onClose={() => setPickerOpen(false)}
         />
       )}
     </form>
+  );
+}
+
+// Adds a subtle "• inherited" decoration to a field label so the user
+// can see at a glance which fields are currently coming from the parent.
+function fieldLabel(text: string, inherited: boolean): string {
+  return inherited ? `${text} · inherited` : text;
+}
+
+// Inheritable numeric input with a one-click "↺" button that resets
+// the field back to "inherit from parent" (i.e. clears the override so
+// the placeholder value applies). Keeps the form grid aligned with the
+// non-inheritable fields by reusing InputField for the input itself.
+interface NumericHelper {
+  value: string;
+  placeholder?: string;
+  onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  onReset: () => void;
+  canReset: boolean;
+  inherited: boolean;
+}
+function NumericField({ label, helper, step }: { label: string; helper: NumericHelper; step?: number }) {
+  return (
+    <div className="relative">
+      <InputField
+        label={fieldLabel(label, helper.inherited)}
+        type="number"
+        step={step}
+        value={helper.value}
+        placeholder={helper.placeholder}
+        onChange={helper.onChange}
+      />
+      {helper.canReset && (
+        <button
+          type="button"
+          onClick={helper.onReset}
+          title="Reset to parent (inherit)"
+          className="absolute right-2 top-7 text-text-muted hover:text-brand-400 transition-colors"
+          aria-label="Reset to parent"
+        >
+          <RotateCcw size={11} />
+        </button>
+      )}
+    </div>
   );
 }

@@ -9,6 +9,7 @@ import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
 import {
   useUserFilaments, useDeleteUserFilament,
   useCloudSyncFilaments, useCloudPushFilament,
+  resolveUserFilament,
   type UserFilament,
 } from '../hooks/useUserFilaments';
 import { useFilamentsDb, type FilamentEntry } from '../hooks/useFilamentsDb';
@@ -289,6 +290,17 @@ function UserFilamentRow({
   const [open, setOpen] = useState(false);
   const push = useCloudPushFilament();
 
+  // Resolve unset fields against the parent stock entry, if any.
+  // We only fetch the stock library when the row is open — the
+  // closed-row summary uses raw fields (it shows material + vendor +
+  // max temp, all of which are usually set on the custom or parent-
+  // inheritance is moot because the parent's metadata also lacks them).
+  const stockDb = useFilamentsDb();
+  const parent  = open && r.parent_setting_id
+    ? stockDb.data?.entries.find((e) => e.setting_id === r.parent_setting_id) ?? null
+    : null;
+  const resolved = open ? resolveUserFilament(r, parent) : null;
+
   // Sync state pill: matches updated_at vs cloud_synced_at to detect
   // local edits that haven't been pushed.
   let cloudPill: { text: string; cls: string } | null = null;
@@ -333,8 +345,22 @@ function UserFilamentRow({
           <Trash2 size={16} />
         </button>
       </div>
-      {open && (
+      {open && resolved && (
         <div className="border-t border-surface-border p-3 space-y-3 text-sm">
+          {r.parent_setting_id && (
+            <div className="text-[11px] text-text-muted">
+              Inherits from{' '}
+              <span className="text-brand-400 font-mono">
+                {parent?.name ?? r.parent_setting_id}
+              </span>
+              {!parent && (
+                <span className="text-amber-400"> (parent not in local stock library)</span>
+              )}
+              {' '}— values marked
+              <span className="text-text-muted/70 italic"> inherited </span>
+              come from the parent; everything else is set on this custom.
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-3 font-mono text-xs">
             <div>
               <div className="text-text-muted">Setting ID</div>
@@ -345,22 +371,22 @@ function UserFilamentRow({
               <div className="text-text-primary truncate">{r.cloud_setting_id || '—'}</div>
             </div>
             <div>
-              <div className="text-text-muted">Base ID</div>
+              <div className="text-text-muted">Bambu base ID</div>
               <div className="text-text-primary">{r.base_id || '—'}</div>
             </div>
-            <div>
-              <div className="text-text-muted">Density</div>
-              <div className="text-text-primary">{r.density > 0 ? `${r.density} g/cm³` : '—'}</div>
-            </div>
-            <div>
-              <div className="text-text-muted">PA default (K)</div>
-              <div className="text-text-primary">{r.pressure_advance > 0 ? r.pressure_advance.toFixed(3) : '—'}</div>
-            </div>
+            <ResolvedField label="Density" inherited={resolved.inherited.density}
+              value={resolved.density > 0 ? `${resolved.density} g/cm³` : '—'} />
+            <ResolvedField label="Nozzle min (°C)" inherited={resolved.inherited.nozzle_temp_min}
+              value={resolved.nozzle_temp_min > 0 ? `${resolved.nozzle_temp_min}` : '—'} />
+            <ResolvedField label="Nozzle max (°C)" inherited={resolved.inherited.nozzle_temp_max}
+              value={resolved.nozzle_temp_max > 0 ? `${resolved.nozzle_temp_max}` : '—'} />
+            <ResolvedField label="PA default (K)" inherited={resolved.inherited.pressure_advance}
+              value={resolved.pressure_advance > 0 ? resolved.pressure_advance.toFixed(3) : '—'} />
             <div>
               <div className="text-text-muted">PA per nozzle</div>
               <div className="text-text-primary">
-                {r.pa_by_nozzle && r.pa_by_nozzle.length > 0
-                  ? r.pa_by_nozzle.map((e) => `${e.nozzle}mm:${e.k.toFixed(3)}`).join(', ')
+                {resolved.pa_by_nozzle.length > 0
+                  ? resolved.pa_by_nozzle.map((e) => `${e.nozzle}mm:${e.k.toFixed(3)}`).join(', ')
                   : '—'}
               </div>
             </div>
@@ -417,6 +443,27 @@ function UserFilamentRow({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// Compact display cell for a custom-filament field that may be inherited
+// from the parent stock entry. The pill makes it obvious at a glance —
+// the user is asked to think about overrides, not raw storage.
+function ResolvedField({ label, value, inherited }: {
+  label: string; value: string; inherited: boolean;
+}) {
+  return (
+    <div>
+      <div className="text-text-muted flex items-center gap-1">
+        {label}
+        {inherited && (
+          <span className="text-[9px] uppercase tracking-wider text-text-muted/70 italic">
+            inherited
+          </span>
+        )}
+      </div>
+      <div className={inherited ? 'text-text-secondary italic' : 'text-text-primary'}>{value}</div>
     </div>
   );
 }

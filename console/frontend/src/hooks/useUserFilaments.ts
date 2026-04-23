@@ -1,4 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import type { FilamentEntry } from './useFilamentsDb';
 
 // Mirrors the firmware's FilamentRecord (console/firmware/include/filament_record.h).
 // Keep field names in sync — server dumps these verbatim from the JSONL on disk.
@@ -12,6 +13,13 @@ export interface UserFilament {
   stock?: boolean;           // false for user records; not surfaced for stock
   name: string;
   base_id: string;           // Bambu's parent preset id, e.g. "GFSA00"
+  // Local-stock linkage: when the user picks a stock filament as the
+  // base via the form's "Base on a stock filament" picker, this holds
+  // that stock entry's setting_id (e.g. "Bambu PETG Basic @base").
+  // Empty fields on the custom inherit from this parent at display
+  // time. Empty for cloud-synced customs (their `base_id` is in
+  // Bambu's GFXX00 namespace, which doesn't map to a local entry).
+  parent_setting_id?: string;
   filament_type: string;     // PLA / PETG / TPU / ...
   filament_subtype?: string; // basic / matte / translucent / ...
   filament_vendor: string;
@@ -35,6 +43,77 @@ export interface UserFilamentsList {
   offset: number;
   limit: number;
   rows: UserFilament[];
+}
+
+// What each field on a custom filament resolves to after merging the
+// parent's values for any field the custom hasn't explicitly set. The
+// `*Inherited` flags tell the UI which fields came from the parent vs.
+// were typed by the user — so the form can label overrides clearly.
+export interface ResolvedUserFilament {
+  filament_type:    string;
+  filament_subtype: string;
+  filament_vendor:  string;
+  filament_id:      string;
+  nozzle_temp_min:  number;          // -1 = parent had no value either
+  nozzle_temp_max:  number;
+  density:          number;          // 0 = unset everywhere
+  pressure_advance: number;
+  pa_by_nozzle:     PaByNozzleEntry[];
+  parent_name:      string | null;   // for "(inherits from <name>)" copy
+  inherited: {
+    filament_type:    boolean;
+    filament_subtype: boolean;
+    filament_vendor:  boolean;
+    filament_id:      boolean;
+    nozzle_temp_min:  boolean;
+    nozzle_temp_max:  boolean;
+    density:          boolean;
+    pressure_advance: boolean;
+    pa_by_nozzle:     boolean;
+  };
+}
+
+// Sentinel detection — the firmware encodes "unset" as -1 for ints,
+// 0 for floats, "" for strings, [] for the PA-per-nozzle list. Centralised
+// here so the form and the display rows agree on what counts as "not set".
+const isUnsetInt   = (v: number | undefined) => v === undefined || v < 0;
+const isUnsetFloat = (v: number | undefined) => v === undefined || v <= 0;
+const isUnsetStr   = (v: string | undefined) => !v || v.length === 0;
+const isUnsetPaList = (v: PaByNozzleEntry[] | undefined) => !v || v.length === 0;
+
+// Walk the parent chain (one level today — local stock is flat) and
+// return a fully-merged view. `parent` is looked up by the caller from
+// useFilamentsDb (the stock library); we keep this function pure so it
+// can be called from anywhere without grabbing the React Query cache
+// directly.
+export function resolveUserFilament(
+  custom: UserFilament,
+  parent: FilamentEntry | null,
+): ResolvedUserFilament {
+  const inh = {
+    filament_type:    isUnsetStr(custom.filament_type)    && !!parent?.material,
+    filament_subtype: isUnsetStr(custom.filament_subtype) && !!parent?.subtype,
+    filament_vendor:  isUnsetStr(custom.filament_vendor)  && !!parent?.brand,
+    filament_id:      isUnsetStr(custom.filament_id)      && !!parent?.filament_id,
+    nozzle_temp_min:  isUnsetInt(custom.nozzle_temp_min)  && typeof parent?.nozzle_temp_min === 'number',
+    nozzle_temp_max:  isUnsetInt(custom.nozzle_temp_max)  && typeof parent?.nozzle_temp_max === 'number',
+    density:          isUnsetFloat(custom.density)        && typeof parent?.density === 'number',
+    pressure_advance: isUnsetFloat(custom.pressure_advance) && typeof parent?.pressure_advance === 'number',
+    pa_by_nozzle:     isUnsetPaList(custom.pa_by_nozzle), // parents don't carry pa_by_nozzle today
+  };
+  return {
+    filament_type:    inh.filament_type    ? (parent!.material ?? '')   : custom.filament_type,
+    filament_subtype: inh.filament_subtype ? (parent!.subtype  ?? '')   : (custom.filament_subtype ?? ''),
+    filament_vendor:  inh.filament_vendor  ? (parent!.brand    ?? '')   : custom.filament_vendor,
+    filament_id:      inh.filament_id      ? (parent!.filament_id ?? '') : (custom.filament_id ?? ''),
+    nozzle_temp_min:  inh.nozzle_temp_min  ? (parent!.nozzle_temp_min ?? -1) : custom.nozzle_temp_min,
+    nozzle_temp_max:  inh.nozzle_temp_max  ? (parent!.nozzle_temp_max ?? -1) : custom.nozzle_temp_max,
+    density:          inh.density          ? (parent!.density ?? 0)     : custom.density,
+    pressure_advance: inh.pressure_advance ? (parent!.pressure_advance ?? 0) : custom.pressure_advance,
+    pa_by_nozzle:     custom.pa_by_nozzle ?? [],
+    parent_name:      parent?.name ?? null,
+    inherited:        inh,
+  };
 }
 
 const LIST_KEY = ['user-filaments'];

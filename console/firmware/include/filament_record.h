@@ -26,6 +26,15 @@ struct FilamentRecord {
     bool    stock          = false;
     String  name;                  // human-readable, e.g. "Bambu PLA Basic"
     String  base_id;               // Bambu's parent preset, e.g. "GFSA00"
+    // Local-stock linkage: when a user creates a custom by picking a
+    // stock entry as the base, this holds that stock entry's setting_id
+    // (e.g. "Bambu PETG Basic @base"). The frontend uses it to resolve
+    // unset numeric/PA fields from the parent at display time, and the
+    // form shows the parent's values as placeholders for any field the
+    // user hasn't overridden. Empty for cloud-synced customs (their
+    // `base_id` is Bambu's GFXX00 namespace, which doesn't map to any
+    // local stock entry one-to-one) and for stock rows themselves.
+    String  parent_setting_id;
     String  filament_type;         // PLA, PETG, TPU, …
     String  filament_subtype;      // basic, matte, translucent, … (optional)
     String  filament_vendor;

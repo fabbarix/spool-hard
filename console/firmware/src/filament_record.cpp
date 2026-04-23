@@ -5,6 +5,7 @@ void FilamentRecord::toJson(JsonDocument& doc) const {
     doc["stock"]            = stock;
     doc["name"]             = name;
     doc["base_id"]          = base_id;
+    doc["parent_setting_id"] = parent_setting_id;
     doc["filament_type"]    = filament_type;
     doc["filament_subtype"] = filament_subtype;
     doc["filament_vendor"]  = filament_vendor;
@@ -50,6 +51,7 @@ bool FilamentRecord::fromJson(const JsonDocument& doc) {
     b  ("stock",            stock);
     str("name",             name);
     str("base_id",          base_id);
+    str("parent_setting_id", parent_setting_id);
     str("filament_type",    filament_type);
     str("filament_subtype", filament_subtype);
     str("filament_vendor",  filament_vendor);
