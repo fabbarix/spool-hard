@@ -358,6 +358,10 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleUserFilamentCloudPush(req);
     });
+    _server.on("^\\/api\\/user-filaments\\/(.+)\\/cloud-detail$", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleUserFilamentCloudDetail(req);
+    });
 
     _server.on("/api/user-filaments", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentsList(req);
@@ -1655,6 +1659,83 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
     }
     String out; serializeJson(resp, out);
     req->send(200, "application/json", out);
+}
+
+void ConsoleWebServer::_handleUserFilamentCloudDetail(AsyncWebServerRequest* req) {
+    if (!g_bambu_cloud.haveToken()) {
+        req->send(400, "application/json",
+                  "{\"error\":\"no Bambu Cloud token configured\"}");
+        return;
+    }
+    String id = req->pathArg(0);
+    FilamentRecord rec;
+    if (!g_user_filaments.findById(id, rec)) {
+        req->send(404, "application/json", "{\"error\":\"not found\"}");
+        return;
+    }
+    // The cloud's "setting" blob is keyed by the cloud's own preset id,
+    // not our local one. For PFUS-prefixed records that's the same id;
+    // for PFUL-prefixed (local-only) records there's no cloud copy yet.
+    String cloudId = rec.cloud_setting_id.length() ? rec.cloud_setting_id : rec.setting_id;
+    if (!cloudId.startsWith("PFUS")) {
+        req->send(404, "application/json",
+                  "{\"error\":\"this filament has no cloud copy (push it first)\"}");
+        return;
+    }
+
+    String path = "/v1/iot-service/api/slicer/setting/" + cloudId;
+    String url  = String(BambuCloudAuth::regionBaseUrl(g_bambu_cloud.region())) + path;
+    auto r = g_bambu_cloud.apiGet(g_bambu_cloud.region(), path.c_str(), g_bambu_cloud.token());
+    dlog("CloudFil", "cloud-detail %s -> HTTP %d (%u bytes)",
+         cloudId.c_str(), r.httpStatus, (unsigned)r.body.length());
+
+    // Tri-state envelope mirrors the rest of the cloud surface — frontend
+    // already knows how to render `unreachable` / `rejected` with
+    // diagnostics, so the detail panel reuses the same shape.
+    if (r.cfBlocked || r.httpStatus <= 0) {
+        JsonDocument resp;
+        resp["status"] = "unreachable";
+        JsonObject d = resp["diagnostics"].to<JsonObject>();
+        d["stage"]         = "cloud-detail " + cloudId;
+        d["request_url"]   = url;
+        d["http_status"]   = r.httpStatus;
+        d["cf_blocked"]    = r.cfBlocked;
+        d["response_body"] = r.body.length() > 512 ? r.body.substring(0, 512) + "...[truncated]" : r.body;
+        String body; serializeJson(resp, body);
+        req->send(200, "application/json", body);
+        return;
+    }
+    if (r.httpStatus >= 400) {
+        JsonDocument resp;
+        resp["status"] = "rejected";
+        JsonObject d = resp["diagnostics"].to<JsonObject>();
+        d["stage"]         = "cloud-detail " + cloudId;
+        d["request_url"]   = url;
+        d["http_status"]   = r.httpStatus;
+        d["cf_blocked"]    = false;
+        d["response_body"] = r.body.length() > 512 ? r.body.substring(0, 512) + "...[truncated]" : r.body;
+        String body; serializeJson(resp, body);
+        req->send(200, "application/json", body);
+        return;
+    }
+    // Wrap the cloud body so the frontend always sees a status field —
+    // makes the success/failure branching uniform.
+    JsonDocument resp;
+    resp["status"] = "ok";
+    JsonDocument inner;
+    if (deserializeJson(inner, r.body)) {
+        // Cloud said 200 but body wasn't JSON — surface the raw text.
+        resp["status"]      = "rejected";
+        JsonObject d = resp["diagnostics"].to<JsonObject>();
+        d["stage"]         = "cloud-detail " + cloudId + " (JSON parse failed)";
+        d["request_url"]   = url;
+        d["http_status"]   = r.httpStatus;
+        d["response_body"] = r.body.length() > 512 ? r.body.substring(0, 512) + "...[truncated]" : r.body;
+    } else {
+        resp["body"] = inner;
+    }
+    String body; serializeJson(resp, body);
+    req->send(200, "application/json", body);
 }
 
 // ── Printer CRUD + state ────────────────────────────────────

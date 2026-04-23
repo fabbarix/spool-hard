@@ -235,6 +235,47 @@ export interface CloudPushResult {
   cloud_setting_id?: string;
   diagnostics?: CloudDiagnostics;
 }
+// Per-preset detail fetch via /api/user-filaments/{id}/cloud-detail.
+// The firmware proxies a single `GET /v1/iot-service/api/slicer/setting/{cloud_id}`
+// to Bambu Cloud and returns the parsed body. The "delta" `setting`
+// blob contains every override the user has ever applied to this
+// preset (flow ratio, max volumetric speed, cooling, etc.) — most of
+// which we don't store on FilamentRecord, so the panel renders it as
+// a key-value table for inspection.
+export interface CloudDetailResponse {
+  status: 'ok' | 'rejected' | 'unreachable';
+  body?: {
+    name?:        string;
+    base_id?:     string;
+    update_time?: string;
+    nickname?:    string | null;
+    type?:        string;
+    setting?:     Record<string, unknown>;
+    [k: string]:  unknown;
+  };
+  diagnostics?: CloudDiagnostics;
+}
+export function useCloudFilamentDetail(setting_id: string, enabled: boolean) {
+  return useQuery<CloudDetailResponse>({
+    queryKey: ['user-filament-cloud-detail', setting_id],
+    enabled,
+    // The cloud round-trip is ~1s typical and the panel is opt-in (only
+    // fetched when the user clicks the "Show cloud details" button) so
+    // we don't refetch on focus/mount — once is enough until the user
+    // explicitly reloads.
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    queryFn: async () => {
+      const r = await fetch(`/api/user-filaments/${encodeURIComponent(setting_id)}/cloud-detail`);
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j?.error || `HTTP ${r.status}`);
+      }
+      return (await r.json()) as CloudDetailResponse;
+    },
+  });
+}
+
 export function useCloudPushFilament() {
   const qc = useQueryClient();
   return useMutation<CloudPushResult, Error, string>({

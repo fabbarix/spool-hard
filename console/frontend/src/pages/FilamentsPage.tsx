@@ -1,14 +1,14 @@
 import { useEffect, useState } from 'react';
 import {
   FlaskConical, Library, User as UserIcon,
-  Plus, Trash2, ChevronDown, ChevronRight, Cloud, CloudUpload, RefreshCw, Thermometer, Gauge,
+  Plus, Trash2, ChevronDown, ChevronRight, Cloud, CloudUpload, RefreshCw, Thermometer, Gauge, Eye,
 } from 'lucide-react';
 import { Card } from '@spoolhard/ui/components/Card';
 import { Button } from '@spoolhard/ui/components/Button';
 import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
 import {
   useUserFilaments, useDeleteUserFilament,
-  useCloudSyncFilaments, useCloudPushFilament,
+  useCloudSyncFilaments, useCloudPushFilament, useCloudFilamentDetail,
   resolveUserFilament,
   type UserFilament,
 } from '../hooks/useUserFilaments';
@@ -288,7 +288,12 @@ function UserFilamentRow({
   onDelete: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [showCloudDetail, setShowCloudDetail] = useState(false);
   const push = useCloudPushFilament();
+  // Cloud detail is opt-in (~1s round-trip per fetch + blocks the
+  // device's HTTP loop briefly). Only enabled once the user clicks the
+  // "Show cloud details" toggle, and only for cloud-synced rows.
+  const detail = useCloudFilamentDetail(r.setting_id, showCloudDetail && !!r.cloud_setting_id);
 
   // Resolve unset fields against the parent stock entry, if any.
   // We only fetch the stock library when the row is open — the
@@ -404,7 +409,27 @@ function UserFilamentRow({
                 {push.isPending ? 'Pushing…' : (r.cloud_setting_id ? 'Push update' : 'Push to cloud')}
               </Button>
             )}
+            {hasToken && r.cloud_setting_id && (
+              <Button
+                variant="secondary"
+                onClick={() => setShowCloudDetail((v) => !v)}
+                disabled={detail.isFetching}
+              >
+                <Eye size={14} className="inline mr-1" />
+                {showCloudDetail ? 'Hide cloud details' : (detail.isFetching ? 'Fetching…' : 'Show cloud details')}
+              </Button>
+            )}
           </div>
+
+          {showCloudDetail && (
+            <CloudDetailPanel
+              isFetching={detail.isFetching}
+              isError={detail.isError}
+              error={detail.error as Error | undefined}
+              data={detail.data}
+              onRefetch={() => detail.refetch()}
+            />
+          )}
           {push.isError && (
             <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-300 break-all font-mono">
               {(push.error as Error)?.message || 'Push request failed'}
@@ -466,4 +491,155 @@ function ResolvedField({ label, value, inherited }: {
       <div className={inherited ? 'text-text-secondary italic' : 'text-text-primary'}>{value}</div>
     </div>
   );
+}
+
+// Detail-fetch panel for a single cloud-synced custom filament. Issues
+// `GET /api/user-filaments/{id}/cloud-detail` (a firmware proxy for
+// Bambu's `/v1/iot-service/api/slicer/setting/{cloud_id}`). The
+// response is a tri-state envelope mirroring the rest of our cloud
+// surface — `ok` shows the parsed body, `unreachable` / `rejected`
+// show the diagnostics block.
+//
+// What's actually in the body:
+//   - top-level metadata: name, base_id, update_time, nickname, type
+//   - `setting`: the user's override delta vs. the parent preset
+//     (flow ratio, max volumetric speed, retraction lengths, gcode
+//     fragments, etc.). For "flat" customs there can be 100+ fields;
+//     for thin overlays only a handful.
+//   - `inherits` (inside setting): the parent preset's name — useful
+//     for understanding the inheritance chain Bambu's slicer uses.
+function CloudDetailPanel({
+  isFetching, isError, error, data, onRefetch,
+}: {
+  isFetching: boolean;
+  isError:    boolean;
+  error?:     Error;
+  data?:      import('../hooks/useUserFilaments').CloudDetailResponse;
+  onRefetch:  () => void;
+}) {
+  if (isFetching && !data) {
+    return (
+      <div className="rounded-md border border-surface-border bg-surface-body/40 p-3 text-xs text-text-muted">
+        Fetching from Bambu Cloud…
+      </div>
+    );
+  }
+  if (isError) {
+    return (
+      <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">
+        {error?.message || 'Cloud detail request failed.'}
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  if (data.status !== 'ok') {
+    return (
+      <div className={`rounded-md border p-3 text-xs space-y-2 ${
+        data.status === 'unreachable'
+          ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+          : 'border-red-500/30 bg-red-500/10 text-red-300'
+      }`}>
+        <div>
+          {data.status === 'unreachable'
+            ? 'Couldn\'t reach Bambu Cloud — try again later.'
+            : 'Cloud detail rejected — see the diagnostics below.'}
+        </div>
+        {data.diagnostics && (
+          <details className="font-mono">
+            <summary className="cursor-pointer">Show details</summary>
+            <div className="mt-1 space-y-1 break-all">
+              <div>stage: {data.diagnostics.stage}</div>
+              <div>{data.diagnostics.http_status} {data.diagnostics.cf_blocked ? '[CF block]' : ''}</div>
+              <div className="opacity-80">{data.diagnostics.request_url}</div>
+              {data.diagnostics.response_body && (
+                <pre className="mt-1 max-h-40 overflow-auto bg-surface-body/40 p-2 rounded whitespace-pre-wrap">
+                  {data.diagnostics.response_body}
+                </pre>
+              )}
+            </div>
+          </details>
+        )}
+      </div>
+    );
+  }
+
+  const body    = data.body ?? {};
+  const setting = (body.setting ?? {}) as Record<string, unknown>;
+  const settingKeys = Object.keys(setting).sort();
+
+  return (
+    <div className="rounded-md border border-surface-border bg-surface-body/40 p-3 space-y-2 text-xs">
+      <div className="flex items-center justify-between">
+        <div className="text-text-muted">
+          From Bambu Cloud — {settingKeys.length} override field{settingKeys.length === 1 ? '' : 's'}
+          {body.update_time && <> · updated {body.update_time}</>}
+        </div>
+        <button
+          onClick={onRefetch}
+          disabled={isFetching}
+          className="text-text-muted hover:text-brand-400 transition-colors disabled:opacity-50"
+          aria-label="Refetch"
+          title="Refetch from cloud"
+        >
+          <RefreshCw size={12} className={isFetching ? 'animate-spin' : ''} />
+        </button>
+      </div>
+      {/* Top-level metadata first — name / base_id / inherits-via-setting
+          are typically the most useful at-a-glance facts. */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1 font-mono">
+        {body.name        && <Kv k="name"        v={String(body.name)} />}
+        {body.base_id     && <Kv k="base_id"     v={String(body.base_id)} />}
+        {(setting['inherits'] as string | undefined) && (
+          <Kv k="inherits"    v={String(setting['inherits'])} highlight />
+        )}
+        {body.nickname    && <Kv k="nickname"    v={String(body.nickname)} />}
+        {body.type        && <Kv k="type"        v={String(body.type)} />}
+      </div>
+      {settingKeys.length > 0 && (
+        <details className="font-mono">
+          <summary className="cursor-pointer text-text-muted">
+            setting · {settingKeys.length} field{settingKeys.length === 1 ? '' : 's'}
+          </summary>
+          <div className="mt-2 max-h-72 overflow-auto rounded-md bg-surface-body/60 border border-surface-border">
+            <table className="w-full text-[11px] tabular-nums">
+              <tbody>
+                {settingKeys.map((k) => (
+                  <tr key={k} className="border-b border-surface-border/40 last:border-0">
+                    <td className="py-1 px-2 text-text-muted align-top whitespace-nowrap w-1/3 max-w-[220px] truncate">
+                      {k}
+                    </td>
+                    <td className="py-1 px-2 text-text-primary break-all">
+                      {formatSettingValue(setting[k])}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function Kv({ k, v, highlight }: { k: string; v: string; highlight?: boolean }) {
+  return (
+    <div className="flex gap-2">
+      <span className="text-text-muted">{k}:</span>
+      <span className={`truncate ${highlight ? 'text-brand-400' : 'text-text-primary'}`}>{v}</span>
+    </div>
+  );
+}
+
+// Cloud's setting blob mixes ints, floats, and strings — some of those
+// strings are themselves multi-value fields like "230,220" or even
+// embedded gcode. Render scalars verbatim and stringify objects/arrays
+// so the table stays predictable.
+function formatSettingValue(v: unknown): string {
+  if (v === null || v === undefined) return '—';
+  if (typeof v === 'string')  return v;
+  if (typeof v === 'number')  return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  return JSON.stringify(v);
 }

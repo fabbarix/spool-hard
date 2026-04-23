@@ -98,6 +98,15 @@ private:
     void _handleUserFilamentsCloudSync(AsyncWebServerRequest* req);
     void _handleUserFilamentsCloudSyncStatus(AsyncWebServerRequest* req);
     void _handleUserFilamentCloudPush(AsyncWebServerRequest* req);
+    // Per-preset "show me everything Bambu Cloud knows about this one"
+    // proxy. Issues `GET /v1/iot-service/api/slicer/setting/{cloud_id}`
+    // with the user's stored token and returns the raw response body
+    // verbatim (plus our usual diagnostics envelope on failure).
+    // Inline call — single GET, ~1s typical, blocks AsyncTCP for that
+    // window. Usage is user-initiated ("Show cloud details" button) so
+    // the brief stall is acceptable; if it becomes a hot path move it
+    // to the cloud-sync FreeRTOS task pattern.
+    void _handleUserFilamentCloudDetail(AsyncWebServerRequest* req);
     void _handleScaleLinkStatus(AsyncWebServerRequest* req);
     void _handleScaleSecretGet(AsyncWebServerRequest* req);
     void _handleScaleSecretPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
