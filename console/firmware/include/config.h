@@ -109,6 +109,12 @@
 #define NVS_NS_CONSOLE         "console_cfg"
 #define NVS_KEY_QUICK_WEIGHTS  "quick_weights"
 #define QUICK_WEIGHTS_MAX      6
+// Calibration-weight presets shown on the LCD's scale-calibration
+// wizard. JSON array of gram values, sorted ascending. Configurable
+// from the console's web UI; defaults to a sensible set for the
+// 3D-printing-spool use case.
+#define NVS_KEY_CAL_PRESETS    "cal_presets"
+#define CAL_PRESETS_MAX        12
 
 // Generic misc settings.
 #define NVS_NS_STORE         "store_cfg"

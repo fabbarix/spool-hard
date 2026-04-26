@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>   // size_t — used by the calibration-wizard preset API
 
 // Public API for the on-device LVGL UI. All functions are safe to call from
 // any FreeRTOS task — they grab lv_lock() internally.
@@ -223,3 +224,60 @@ void ui_set_slot_tap_callback(ui_slot_tap_cb_t cb);
 
 // Show the detail screen with the packed info. Internally switches screen.
 void ui_show_slot_detail(const UiSlotDetail* detail);
+
+// ── Scale settings + calibration wizard ────────────────────────
+// Reachable by tapping the Scale card on the home screen. Hosts a
+// "Tare", "Add point" (opens the wizard), "Clear" and "Close" set of
+// buttons; live weight readout up top; a status line that reflects the
+// scale's current calibration state ("Calibration: N points" or
+// "Uncalibrated"). The screen + the wizard share the same tap callback
+// for buttons to keep main.cpp's wiring trivial.
+
+// Tap target on the home-screen Scale card. Fires when the user taps
+// the scale card; main.cpp typically responds with `ui_show_scale_settings()`.
+typedef void (*ui_scale_tap_cb_t)(void);
+void ui_set_scale_settings_tap_callback(ui_scale_tap_cb_t cb);
+
+// Open the scale-settings screen. Idempotent.
+void ui_show_scale_settings();
+// True while the scale-settings screen OR its calibration wizard is
+// the currently-loaded LVGL screen — main.cpp uses this to gate the
+// live-weight forwarding so we don't churn the readout when the user
+// isn't looking at it.
+bool ui_scale_settings_visible();
+
+// Push a fresh weight reading into the screen + wizard. `state` is
+// "new" / "stable" / "unstable" / "removed" / "uncalibrated" — same
+// vocabulary main.cpp already gets from g_scale.onWeight. precision
+// is 0..4 decimals.
+void ui_set_scale_settings_live_weight(float grams, const char* state, int precision);
+// Push a CalibrationStatus snapshot. `tared` is true when the scale
+// has been zeroed at least once (CalibrationStatus.tare_raw != 0).
+void ui_set_scale_settings_status(int num_points, bool tared);
+
+// Buttons on the scale-settings screen. CLOSE returns to home;
+// the rest forward the action to main.cpp which talks to ScaleLink.
+typedef enum {
+    SCALE_BTN_TARE      = 1,
+    SCALE_BTN_ADD_POINT = 2,
+    SCALE_BTN_CLEAR     = 3,
+    SCALE_BTN_CLOSE     = 4,
+} scale_btn_t;
+typedef void (*scale_settings_cb_t)(scale_btn_t action);
+void ui_set_scale_settings_callback(scale_settings_cb_t cb);
+
+// Calibration wizard — a 3-step flow opened by SCALE_BTN_ADD_POINT.
+// `presets` is the list of weight chips the wizard renders on step 1.
+// Wizard owns its own state until the user finishes / cancels, at
+// which point it returns to the scale-settings screen.
+void ui_start_calibration_wizard(const int* presets, size_t n);
+// True while the wizard is the currently-loaded screen. main.cpp uses
+// this to forward weight events into the wizard's stable-detect logic.
+bool ui_calibration_wizard_visible();
+// Push a weight reading into the wizard's stable-detect ladder.
+// Capture-button enable state is recomputed inside.
+void ui_calibration_wizard_on_weight(float grams, const char* state, int precision);
+// Fired when the user taps Capture on step 2; `weight` is the preset
+// they picked on step 1. main.cpp issues g_scale.addCalPoint(weight).
+typedef void (*ui_calibration_capture_cb_t)(int weight);
+void ui_set_calibration_capture_callback(ui_calibration_capture_cb_t cb);

@@ -1,5 +1,13 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+// Force PlatformIO's library-dependency-finder to pull in HTTPClient.
+// The shared spoolhard_core/src/ota.cpp uses it; LDF only walks
+// #includes from the project's own src/ tree (chain+ default), not
+// from libraries. Without this line the scale firmware fails to link
+// with `HTTPClient.h: No such file or directory`. The console firmware
+// resolves the same dep transitively because bambu_cloud.cpp includes
+// HTTPClient — the scale has no equivalent caller.
+#include <HTTPClient.h>
 
 #include "config.h"
 #include "load_cell.h"
@@ -100,6 +108,17 @@ static void pushOtaPendingIfChanged(bool force) {
     ScaleToConsole::send(ScaleToConsole::Type::OtaPending, doc);
 }
 
+// Push the current calibration state to the console so its LCD scale-
+// settings screen renders "Calibration: N points" without polling.
+// Called after every action that mutates calibration (tare, addCalPoint,
+// clear, legacy single-point calibrate). Cheap — just two ints over WS.
+static void pushCalibrationStatus() {
+    JsonDocument doc;
+    doc["num_points"] = (int)g_scale.cal().numPoints;
+    doc["tare_raw"]   = (int32_t)g_scale.cal().tare_raw;
+    ScaleToConsole::send(ScaleToConsole::Type::CalibrationStatus, doc);
+}
+
 // ── Console protocol ─────────────────────────────────────────
 static void handleConsoleMessage(ConsoleToScale::Message& msg) {
     using T = ConsoleToScale::Type;
@@ -115,6 +134,29 @@ static void handleConsoleMessage(ConsoleToScale::Message& msg) {
                 Serial.printf("[App] Calibrate with known weight=%ldg\n", (long)weight);
                 g_scale.calibrate((float)weight);
             }
+            pushCalibrationStatus();
+            break;
+        }
+        case T::AddCalPoint: {
+            // {"AddCalPoint": i32} — capture raw + add to multi-point curve.
+            // Mirrors the web /api/scale-cal-point flow used by the scale's
+            // own calibration wizard, only triggered from the console LCD.
+            int32_t weight = msg.doc.as<int32_t>();
+            if (weight <= 0) {
+                Serial.printf("[App] AddCalPoint ignored — bad weight %ld\n", (long)weight);
+                break;
+            }
+            long raw = g_scale.captureRaw();
+            g_scale.addCalPoint((float)weight, raw);
+            Serial.printf("[App] AddCalPoint %ldg @ raw=%ld → %u points\n",
+                          (long)weight, raw, (unsigned)g_scale.cal().numPoints);
+            pushCalibrationStatus();
+            break;
+        }
+        case T::ClearCalPoints: {
+            Serial.println("[App] ClearCalPoints");
+            g_scale.clearCalPoints();
+            pushCalibrationStatus();
             break;
         }
         case T::ButtonResponse: {
@@ -443,6 +485,16 @@ void setup() {
         // doesn't persist the cached state across its own reboots, so a
         // reconnect (e.g. after a console OTA) needs to re-seed it.
         g_pendingPushPending = true;
+
+        // Seed the console with the current calibration state so the
+        // LCD's scale-settings screen shows the right "N points" /
+        // "Uncalibrated" the first time the user taps it. Subsequent
+        // mutations push their own CalibrationStatus from
+        // pushCalibrationStatus().
+        JsonDocument calDoc;
+        calDoc["num_points"] = (int)g_scale.cal().numPoints;
+        calDoc["tare_raw"]   = (int32_t)g_scale.cal().tare_raw;
+        ScaleToConsole::send(ScaleToConsole::Type::CalibrationStatus, calDoc);
     });
     g_console.onDisconnected([]() {
         Serial.println("[Console] SpoolHard Console disconnected");

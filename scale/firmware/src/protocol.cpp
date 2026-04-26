@@ -20,6 +20,7 @@ static const char* s2cName(ScaleToConsole::Type t) {
         case T::OtaPending:          return "OtaPending";
         case T::Term:                return "Term";
         case T::CurrentWeight:       return "CurrentWeight";
+        case T::CalibrationStatus:   return "CalibrationStatus";
     }
     return "?";
 }
@@ -197,6 +198,17 @@ void send(Type type, JsonDocument& doc) {
             emitStruct("CurrentWeight", inner);
             break;
         }
+        case Type::CalibrationStatus: {
+            // Pushed after every tare / addCalPoint / clear. The console
+            // LCD's scale-settings screen renders "Calibration: N points"
+            // straight from this — it never has to poll the calibration
+            // state otherwise.
+            JsonDocument inner;
+            inner["num_points"] = doc["num_points"].as<int>();
+            inner["tare_raw"]   = doc["tare_raw"].as<int32_t>();
+            emitStruct("CalibrationStatus", inner);
+            break;
+        }
     }
 }
 
@@ -225,6 +237,8 @@ static Type nameToType(const char* name) {
     if (strcmp(name, "GetCurrentWeight")     == 0) return Type::GetCurrentWeight;
     if (strcmp(name, "RunOtaUpdate")         == 0) return Type::RunOtaUpdate;
     if (strcmp(name, "CheckOtaUpdates")      == 0) return Type::CheckOtaUpdates;
+    if (strcmp(name, "AddCalPoint")          == 0) return Type::AddCalPoint;
+    if (strcmp(name, "ClearCalPoints")       == 0) return Type::ClearCalPoints;
     return Type::Unknown;
 }
 

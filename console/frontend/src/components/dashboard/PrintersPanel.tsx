@@ -158,13 +158,17 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, label, external }: {
   const bg  = hex ? `#${hex}` : 'transparent';
   const textOnSwatch = useMemo(() => pickReadableTextColor(hex), [hex]);
 
-  // Prefer the SpoolRecord's weight_current (true weighed value). If the
-  // spool record hasn't been scanned or isn't mapped, fall back to nothing
-  // — the remain_pct bar already conveys rough inventory.
-  const weightG =
-    spool && typeof spool.weight_current === 'number' && spool.weight_current >= 0
-      ? spool.weight_current
-      : null;
+  // Show the *current estimated* weight: last weighed value minus
+  // whatever live print-consumption has forecast since. The detail
+  // panel keeps the breakdown ("weighed N g, − M g since last weigh")
+  // for transparency, but the tile itself always reflects the running
+  // estimate so users see it tick down through a print. Clamped at 0
+  // so a slightly-over-budget run doesn't render as a negative number.
+  const weightG = (() => {
+    if (!spool || typeof spool.weight_current !== 'number' || spool.weight_current < 0) return null;
+    const consumed = typeof spool.consumed_since_weight === 'number' ? spool.consumed_since_weight : 0;
+    return Math.max(0, Math.round(spool.weight_current - consumed));
+  })();
 
   // K value: prefer what the printer is actively reporting for this slot;
   // otherwise look up the stored value for this (printer, nozzle) in the

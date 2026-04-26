@@ -354,6 +354,25 @@ void ScaleLink::_dispatch(const ScaleToConsole::Message& msg) {
             }
             break;
         }
+        case T::CalibrationStatus: {
+            // {"CalibrationStatus": {"num_points": N, "tare_raw": R}}
+            // Pushed once on console-connect and after every tare /
+            // addCalPoint / clearCalPoints on the scale. The LCD's
+            // scale-settings screen renders "Calibration: N points"
+            // straight from the cached values; main.cpp also forwards
+            // the event into the scale-settings screen via
+            // onCalibrationStatus().
+            int     n = msg.doc["num_points"] | 0;
+            int32_t r = msg.doc["tare_raw"]   | 0;
+            _calNumPoints = n;
+            _calTareRaw   = r;
+            if (_onCalStatus) _onCalStatus(n, r);
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%d point%s, tare_raw=%ld",
+                     n, n == 1 ? "" : "s", (long)r);
+            _recordEvent("calibration", buf);
+            break;
+        }
         case T::OtaProgressUpdate: {
             // Wire shape: {"OtaProgressUpdate": {"Status": {text, percent, kind}}}
             // We read the structured fields when present; the human-
@@ -391,6 +410,14 @@ void ScaleLink::tare() {
 
 void ScaleLink::calibrate(int32_t known_weight) {
     _send(ConsoleToScale::buildTuple(ConsoleToScale::Type::Calibrate, known_weight));
+}
+
+void ScaleLink::addCalPoint(int32_t known_weight) {
+    _send(ConsoleToScale::buildTuple(ConsoleToScale::Type::AddCalPoint, known_weight));
+}
+
+void ScaleLink::clearCalPoints() {
+    _send(ConsoleToScale::build(ConsoleToScale::Type::ClearCalPoints));
 }
 
 void ScaleLink::readTag() {

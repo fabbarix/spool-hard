@@ -86,10 +86,30 @@ public:
     // show "<name>: online" without re-reading NVS.
     using HandshakeCb = std::function<void(Handshake, const String& scaleName)>;
     void onHandshakeChanged(HandshakeCb cb) { _onHandshake = std::move(cb); }
+    // Fires on every CalibrationStatus frame the scale pushes —
+    // emitted right after every tare / addCalPoint / clearCalPoints
+    // and once on console-connect as a baseline. `num_points` is the
+    // size of the multi-point curve; `tare_raw` is the persisted zero
+    // reading (nonzero ⇒ scale has been tared at least once).
+    using CalibrationStatusCb = std::function<void(int num_points, int32_t tare_raw)>;
+    void onCalibrationStatus(CalibrationStatusCb cb) { _onCalStatus = std::move(cb); }
+    // Most recent CalibrationStatus snapshot — useful for callers that
+    // want the current state without waiting for the next push (e.g.
+    // the scale-settings screen reading the value when it opens).
+    int     calNumPoints() const { return _calNumPoints; }
+    int32_t calTareRaw()   const { return _calTareRaw; }
 
     // Commands.
     void tare();                                 // Calibrate(0)
-    void calibrate(int32_t known_weight);        // Calibrate(w)
+    void calibrate(int32_t known_weight);        // Calibrate(w)  legacy single-point
+    // Multi-point calibration controls used by the LCD wizard.
+    // addCalPoint asks the scale to sample its current raw reading and
+    // append a (weight, raw-tare_raw) entry to its piecewise-linear
+    // curve (max 8 points). clearCalPoints wipes the curve back to
+    // empty. Both fire-and-forget; the scale pushes a CalibrationStatus
+    // frame back which the UI hooks via onCalibrationStatus() below.
+    void addCalPoint(int32_t known_weight);      // {"AddCalPoint": w}
+    void clearCalPoints();                       // "ClearCalPoints"
     void readTag();                              // "ReadTag"
     void writeTag(const String& text, const String& uidHex);
     void emulateTag(const String& url);
@@ -189,6 +209,13 @@ private:
     TagCb      _onTag;
     VoidCb     _onButton;
     HandshakeCb _onHandshake;
+    CalibrationStatusCb _onCalStatus;
+    // Most-recent CalibrationStatus payload, cached so callers can
+    // read the latest snapshot synchronously without waiting for the
+    // next push event. Updated on every CalibrationStatus frame and
+    // reset on disconnect.
+    int        _calNumPoints  = 0;
+    int32_t    _calTareRaw    = 0;
 
     // Cached scale-side OTA state — populated by _dispatch on every
     // OtaPending frame.

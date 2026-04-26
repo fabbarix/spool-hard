@@ -11,6 +11,7 @@
 #include "scale_link.h"
 #include "scale_secrets.h"
 #include "core_weights.h"
+#include "calibration_presets.h"
 #include "quick_weights.h"
 #include "sdcard.h"
 #include "printer_config.h"
@@ -495,6 +496,19 @@ void ConsoleWebServer::_setupRoutes() {
     });
 
     // Quick-weights shortcut list for the wizard "Full" step.
+    // Calibration weight presets (config for the LCD's scale-calibration
+    // wizard). PUT replaces the whole list; the firmware normalises
+    // (positive, sorted, deduped, capped) before persisting.
+    _server.on("/api/calibration-presets", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        _handleCalibrationPresetsGet(req);
+    });
+    _server.on("/api/calibration-presets", HTTP_PUT,
+        [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!_requireAuth(req)) return;
+            _handleCalibrationPresetsPut(req, data, len);
+        });
+
     _server.on("/api/quick-weights", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleQuickWeightsGet(req);
     });
@@ -2960,6 +2974,40 @@ void ConsoleWebServer::_handleQuickWeightsGet(AsyncWebServerRequest* req) {
     JsonArray arr = doc["grams"].to<JsonArray>();
     for (int g : QuickWeights::get()) arr.add(g);
     String out; serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+void ConsoleWebServer::_handleCalibrationPresetsGet(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    JsonDocument doc;
+    JsonArray arr = doc["presets"].to<JsonArray>();
+    for (int g : CalibrationPresets::list()) arr.add(g);
+    String out; serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+void ConsoleWebServer::_handleCalibrationPresetsPut(AsyncWebServerRequest* req, uint8_t* data, size_t len) {
+    JsonDocument doc;
+    if (deserializeJson(doc, data, len)) {
+        req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+        return;
+    }
+    if (!doc["presets"].is<JsonArrayConst>()) {
+        req->send(400, "application/json", "{\"error\":\"presets (array) required\"}");
+        return;
+    }
+    std::vector<int> v;
+    for (JsonVariantConst x : doc["presets"].as<JsonArrayConst>()) {
+        int g = x | 0;
+        if (g > 0) v.push_back(g);
+    }
+    CalibrationPresets::set(v);   // dedupes, sorts, persists
+    // Echo the canonical (post-normalisation) list so the UI can
+    // refresh its state without a follow-up GET.
+    JsonDocument out_doc;
+    JsonArray arr = out_doc["presets"].to<JsonArray>();
+    for (int g : CalibrationPresets::list()) arr.add(g);
+    String out; serializeJson(out_doc, out);
     req->send(200, "application/json", out);
 }
 

@@ -179,6 +179,11 @@ private:
     void _handleCoreWeightsDelete(AsyncWebServerRequest* req);
     void _handleQuickWeightsGet(AsyncWebServerRequest* req);
     void _handleQuickWeightsPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    // Reference-weight presets shown on the LCD's scale-calibration
+    // wizard. Stored console-side in NVS via CalibrationPresets:: ;
+    // exposed to the React UI so the user can curate their own list.
+    void _handleCalibrationPresetsGet(AsyncWebServerRequest* req);
+    void _handleCalibrationPresetsPut(AsyncWebServerRequest* req, uint8_t* data, size_t len);
 
     // Filaments library (SD-resident SQLite DB sourced from bambu-filaments).
     // Upload writes straight to /sd/filaments.db — GET streams it back to the

@@ -22,6 +22,7 @@
 #include "bambu_cloud.h"
 #include "bambu_discovery.h"
 #include "core_weights.h"
+#include "calibration_presets.h"
 #include "pending_ams.h"
 #include <lvgl.h>   // LV_SYMBOL_* FontAwesome glyphs baked into Montserrat
 #include "scale_discovery.h"
@@ -308,11 +309,28 @@ void setup() {
         ui_set_spool_live_weight(grams, state);
         // Same goes for the registration wizard's Full/Used/Empty screens.
         ui_wizard_on_weight(grams, state);
+        // …and the scale-settings screen / calibration wizard, when
+        // they're the visible screen. Both run the live readout off
+        // the same weight pipe so the user can watch a tare or a
+        // capture settle in real time.
+        if (ui_scale_settings_visible()) {
+            ui_set_scale_settings_live_weight(grams, state, precision);
+        }
+        if (ui_calibration_wizard_visible()) {
+            ui_calibration_wizard_on_weight(grams, state, precision);
+        }
         JsonDocument d;
         d["weight_g"]  = grams;
         d["state"]     = state;
         d["precision"] = precision;
         g_web.broadcastDebug("weight", d);
+    });
+    // CalibrationStatus events from the scale → keep the LCD's
+    // status line up-to-date and seed it on console-connect so the
+    // first time the user opens the screen it shows the real point
+    // count, not "—".
+    g_scale.onCalibrationStatus([](int num_points, int32_t tare_raw) {
+        ui_set_scale_settings_status(num_points, tare_raw != 0);
     });
     // Shared entry point for tags read either from the console's own PN532
     // or forwarded from the scale's NFC reader over the WebSocket. Behaviour
@@ -518,6 +536,62 @@ void setup() {
         g_bambu.reconnectAll();
     });
 
+    // ── Scale settings + calibration wizard wiring ───────────
+    // Tap on the home-screen Scale card opens the settings screen.
+    // Seed it with whatever CalibrationStatus snapshot ScaleLink has
+    // already received (cached across link drops, refreshed on every
+    // reconnect from the scale's onConnected handler).
+    ui_set_scale_settings_tap_callback([]() {
+        Serial.println("[UI] Scale card tapped");
+        ui_set_scale_settings_status(g_scale.calNumPoints(),
+                                     g_scale.calTareRaw() != 0);
+        if (g_scale.lastWeightMs() > 0) {
+            ui_set_scale_settings_live_weight(g_scale.lastWeightG(),
+                                              g_scale.lastWeightState().c_str(),
+                                              g_scale.scalePrecision());
+        }
+        ui_show_scale_settings();
+        // Pull a fresh weight from the scale so the readout settles
+        // quickly without waiting for the next state-change event.
+        g_scale.requestCurrentWeight();
+    });
+    // Buttons on the scale-settings screen → ScaleLink commands.
+    // The CalibrationStatus push from the scale handles UI feedback,
+    // so these are pure fire-and-forget actions here.
+    ui_set_scale_settings_callback([](scale_btn_t action) {
+        switch (action) {
+            case SCALE_BTN_TARE:
+                Serial.println("[UI] Scale tare");
+                g_scale.tare();
+                break;
+            case SCALE_BTN_ADD_POINT: {
+                auto presets = CalibrationPresets::list();
+                Serial.printf("[UI] Calibration wizard: %u presets\n",
+                              (unsigned)presets.size());
+                ui_start_calibration_wizard(presets.data(), presets.size());
+                // Force a refresh so the wizard's step-2 readout has
+                // the latest reading instantly when the user picks.
+                g_scale.requestCurrentWeight();
+                break;
+            }
+            case SCALE_BTN_CLEAR:
+                Serial.println("[UI] Scale clear calibration");
+                g_scale.clearCalPoints();
+                break;
+            case SCALE_BTN_CLOSE:
+                Serial.println("[UI] Scale settings close");
+                ui_show_home();
+                break;
+        }
+    });
+    // Wizard's Capture button → addCalPoint. The scale will push back
+    // CalibrationStatus once the new point is persisted, which tickles
+    // the status line on the next return to scale settings.
+    ui_set_calibration_capture_callback([](int weight) {
+        Serial.printf("[UI] Calibration capture %d g\n", weight);
+        g_scale.addCalPoint((int32_t)weight);
+    });
+
     ui_set_slot_tap_callback([](int slot_idx) {
         UiSlotDetail d = {};
         const BambuPrinter* bp = nullptr;
@@ -705,7 +779,19 @@ static void _refreshHomeAmsPanel() {
             // tag_uid/tray_type to the printer yet).
             dst.occupied = tr.tray_type.length() || tr.tray_color.length() ||
                            tr.tag_uid.length()   || have_rec;
-            dst.weight_g = (have_rec && rec.weight_current >= 0) ? rec.weight_current : -1;
+            // The tile shows the *current estimated* remaining — the
+            // last weighed value minus what live print-consumption has
+            // forecast since. Clamped at 0 so a slightly-over-budget
+            // print doesn't render as a negative number. The richer
+            // breakdown (weighed value + "− N g since last weigh")
+            // stays on the slot-detail screen for transparency.
+            if (have_rec && rec.weight_current >= 0) {
+                int est = rec.weight_current - (int)rec.consumed_since_weight;
+                if (est < 0) est = 0;
+                dst.weight_g = est;
+            } else {
+                dst.weight_g = -1;
+            }
             // When we're sourcing from the spool record, backfill the
             // material name so the tile labels "PLA" rather than "" for a
             // SpoolHard spool the printer doesn't have tray_type for yet.

@@ -40,6 +40,13 @@ namespace ScaleToConsole {
         // state is the WeightState name (Uncalibrated / Idle / NewLoad /
         // StableLoad / LoadChangedStable / LoadChangedUnstable / LoadRemoved).
         CurrentWeight,
+        // Pushed after every tare / addCalPoint / clear so the console
+        // LCD's scale-settings screen can render "Calibration: N
+        // points" without polling. Struct variant:
+        //   {"CalibrationStatus": {"num_points": 3, "tare_raw": 12345}}
+        // tare_raw is the persisted zero reading; nonzero means the
+        // scale has been tared at least once.
+        CalibrationStatus,
     };
 
     // Generic typed send. `doc` carries fields that are mapped into the
@@ -71,6 +78,12 @@ namespace ConsoleToScale {
         // console doesn't have to know per-device settings.
         RunOtaUpdate,          // "RunOtaUpdate"   — flash now using stored config
         CheckOtaUpdates,       // "CheckOtaUpdates" — kick the manifest checker now
+        // Multi-point calibration controls used by the LCD wizard. The
+        // legacy `Calibrate` tuple stays for compatibility.
+        //   {"AddCalPoint": <int32>}   — sample raw + addCalPoint(weight,raw)
+        //   "ClearCalPoints"           — wipe all stored points
+        AddCalPoint,
+        ClearCalPoints,
     };
 
     struct Message {

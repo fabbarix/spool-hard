@@ -11,6 +11,7 @@ import { DirectUploadSection } from '../components/config/DirectUploadSection';
 import { DeviceControlSection } from '../components/config/DeviceControlSection';
 import { DisplaySection } from '../components/config/DisplaySection';
 import { QuickWeightsSection } from '../components/config/QuickWeightsSection';
+import { CalibrationPresetsSection } from '../components/config/CalibrationPresetsSection';
 import { FilamentsDbSection } from '../components/config/FilamentsDbSection';
 import { BambuCloudSection } from '../components/config/BambuCloudSection';
 import { CloudPublicCacheSection } from '../components/config/CloudPublicCacheSection';
@@ -68,6 +69,7 @@ export function ConfigPage() {
         {activeTab === 'scale' && (
           <div className="space-y-4">
             <ScaleSection />
+            <CalibrationPresetsSection />
             <QuickWeightsSection />
           </div>
         )}

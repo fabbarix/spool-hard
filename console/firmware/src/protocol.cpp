@@ -24,6 +24,7 @@ static Type nameToType(const char* name) {
     if (strcmp(name, "OtaPending")          == 0) return Type::OtaPending;
     if (strcmp(name, "Term")                == 0) return Type::Term;
     if (strcmp(name, "CurrentWeight")       == 0) return Type::CurrentWeight;
+    if (strcmp(name, "CalibrationStatus")   == 0) return Type::CalibrationStatus;
     return Type::Unknown;
 }
 
@@ -42,6 +43,7 @@ const char* typeToString(Type t) {
         case Type::OtaPending:          return "OtaPending";
         case Type::Term:                return "Term";
         case Type::CurrentWeight:       return "CurrentWeight";
+        case Type::CalibrationStatus:   return "CalibrationStatus";
         default:                        return "Unknown";
     }
 }
@@ -116,6 +118,8 @@ static const char* typeName(Type t) {
         case Type::GetCurrentWeight:     return "GetCurrentWeight";
         case Type::RunOtaUpdate:         return "RunOtaUpdate";
         case Type::CheckOtaUpdates:      return "CheckOtaUpdates";
+        case Type::AddCalPoint:          return "AddCalPoint";
+        case Type::ClearCalPoints:       return "ClearCalPoints";
     }
     return "?";
 }
