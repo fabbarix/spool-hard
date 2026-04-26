@@ -61,3 +61,31 @@ BambuPrinter* BambuManager::find(const String& serial) {
     }
     return nullptr;
 }
+
+void BambuManager::reconnectAll() {
+    for (auto& p : _printers) p->forceReconnect();
+}
+
+void BambuManager::onAnnounce(const String& serial, const IPAddress& ip) {
+    if (serial.isEmpty() || (uint32_t)ip == 0) return;
+    BambuPrinter* p = find(serial);
+    if (!p) return;
+    String newIp = ip.toString();
+    if (p->config().ip != newIp) {
+        Serial.printf("[Bambu] %s IP changed %s -> %s — updating + reconnecting\n",
+                      serial.c_str(), p->config().ip.c_str(), newIp.c_str());
+        PrinterConfig cfg = p->config();
+        cfg.ip = newIp;
+        g_printers_cfg.upsert(cfg);
+        g_printers_cfg.save();
+        p->updateConfig(cfg);   // already drops MQTT and resets the gate
+        return;
+    }
+    // IP unchanged but we're not currently linked — nudge the retry gate
+    // so we don't sit out the rest of a 30 s TLS timeout cycle when the
+    // printer is clearly back on the air.
+    auto link = p->state().link;
+    if (link == BambuLinkState::Failed || link == BambuLinkState::Disconnected) {
+        p->forceReconnect();
+    }
+}

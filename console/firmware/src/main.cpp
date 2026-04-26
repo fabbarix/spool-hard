@@ -237,6 +237,19 @@ void setup() {
     g_bambu_discovery.begin();
     g_scale_discovery.begin();
 
+    // Bridge SSDP hits to BambuManager so a configured printer that comes
+    // back on a fresh DHCP lease (or simply powers on after the console)
+    // gets its IP refreshed and a reconnect kicked, instead of sitting on
+    // the stale config and the slow 5 s × 30 s TLS retry cycle.
+    g_bambu_discovery.setOnSeen([](const BambuDiscovery::Entry& e) {
+        g_bambu.onAnnounce(e.serial, e.ip);
+    });
+
+    // Kick one active probe so we don't have to wait the full ~30 s for
+    // the printer's next periodic NOTIFY when the console boots after
+    // the printer is already on.
+    g_bambu_discovery.probe();
+
     // Scale link: SSDP-discovered, WebSocket client.
     g_scale.begin();
     g_scale.onConnect([]() {
@@ -496,6 +509,15 @@ void setup() {
     // live state here (rather than caching it in the UI layer) so the
     // user always sees fresh data when opening the screen. Looks at AMS
     // unit 0's trays for slots 0..3 and the external vt_tray for slot 4.
+    // Refresh button on the printer card → re-probe SSDP and force a
+    // reconnect on every configured printer. Same payload as the web
+    // POST /api/printers/refresh — keeps the LCD and the web in sync.
+    ui_set_printer_refresh_callback([]() {
+        Serial.println("[UI] Printer refresh tapped");
+        g_bambu_discovery.probe();
+        g_bambu.reconnectAll();
+    });
+
     ui_set_slot_tap_callback([](int slot_idx) {
         UiSlotDetail d = {};
         const BambuPrinter* bp = nullptr;

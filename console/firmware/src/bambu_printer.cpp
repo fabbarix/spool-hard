@@ -8,6 +8,7 @@
 #include "printer_config.h"
 #include "web_server.h"
 #include "ui/ui.h"
+#include "ring_log.h"
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <IPAddress.h>
@@ -88,6 +89,21 @@ void BambuPrinter::updateConfig(const PrinterConfig& cfg) {
         _mqtt && _mqtt->connected()) {
         _mqtt->disconnect();
     }
+    if (reconnect) {
+        _lastConnectAttemptMs = 0;   // bypass the 5 s gate on next loop()
+    }
+}
+
+void BambuPrinter::forceReconnect() {
+    // Don't fight a pending background connect — it owns _mqtt. Just reset
+    // the gate so the next harvest tick promptly retries on failure.
+    _lastConnectAttemptMs = 0;
+    if (_connectTaskState == ConnectTaskState::Pending) return;
+    if (_mqtt && _mqtt->connected()) {
+        _mqtt->disconnect();
+        _state.link = BambuLinkState::Disconnected;
+    }
+    Serial.printf("[Bambu %s] forceReconnect requested\n", _cfg.serial.c_str());
 }
 
 // Runs on its own pinned-to-core-0 task; nobody else touches _mqtt/_wifi
@@ -205,6 +221,8 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
 
     String prevGcode = _state.gcode_state;
     if (print["gcode_state"].is<const char*>())  _state.gcode_state  = print["gcode_state"].as<String>();
+    if (print["subtask_name"].is<const char*>()) _state.subtask_name = print["subtask_name"].as<String>();
+    if (print["gcode_file"].is<const char*>())   _state.gcode_file   = print["gcode_file"].as<String>();
     if (_state.gcode_state != prevGcode) {
         _handleGcodeStateTransition(prevGcode, _state.gcode_state);
     }
@@ -695,11 +713,18 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
     uint32_t tmin = 0, tmax = 0;
     resolveTemps(rec.material_type, rec.nozzle_temp_min, rec.nozzle_temp_max, tmin, tmax);
 
-    // Bambu expects RGBA. Pad RRGGBB → RRGGBBFF (fully opaque) if the record
-    // only stored six hex chars, which is the SpoolHard convention.
+    // Bambu expects RGBA. Pad RRGGBB → RRGGBBFF (fully opaque) if the
+    // record only stored six hex chars, which is the SpoolHard
+    // convention. Uppercase the whole string — Bambu's MQTT parser
+    // accepts our mixed-case "ffde0aFF" silently but then drops it
+    // back to "000000FF" in the next AMS report (we end up sending
+    // material+tray_info_idx successfully but the colour reverts to
+    // black). Uppercase RGBA matches what Bambu Studio sends and gets
+    // honoured in the printer state.
     String color = rec.color_code;
     if (color.length() == 6) color += "FF";
     if (color.isEmpty())     color  = "FFFFFFFF";
+    color.toUpperCase();
 
     JsonDocument doc;
     JsonObject print = doc["print"].to<JsonObject>();
@@ -748,7 +773,91 @@ static IPAddress _parseIp(const String& s) {
     return ip;
 }
 
-bool BambuPrinter::analyseRemote(const String& path) {
+// Pull the filename out of one BusyBox-style `ls -l` line. Bambu's FTPS
+// emits e.g. `-rw-r--r-- 1 root root 12345 Jan 1 00:00 Some Job.3mf`
+// — the filename is everything after column 8. Bare-name listings
+// (no spaces) just pass through. Returns "" on lines we can't parse.
+static String _ftpListName(const String& raw) {
+    String line = raw; line.trim();
+    if (!line.length()) return "";
+    // Heuristic: if the line has no spaces it's already a bare name.
+    if (line.indexOf(' ') < 0) return line;
+    // Walk past 8 whitespace-separated tokens (perms, links, owner,
+    // group, size, mon, day, time/year), then the rest is the name —
+    // which may itself contain spaces, so we can't just `lastIndexOf`.
+    int idx = 0, tokens = 0;
+    while (idx < (int)line.length() && tokens < 8) {
+        while (idx < (int)line.length() && line[idx] != ' ') idx++;
+        while (idx < (int)line.length() && line[idx] == ' ') idx++;
+        tokens++;
+    }
+    if (idx >= (int)line.length()) {
+        // Fallback for non-`-l` formats (NLST returns bare names too).
+        int sp = line.lastIndexOf(' ');
+        return (sp >= 0) ? line.substring(sp + 1) : line;
+    }
+    String name = line.substring(idx);
+    name.trim();
+    return name;
+}
+
+// List `dir` and return the most plausible *.3mf match for `hint` — the
+// MQTT subtask_name when we have one. Matching is fuzzy: we lowercase
+// both sides and treat spaces/underscores/dashes as the same character,
+// because Bambu sometimes sanitizes one but not the other when writing
+// the file vs. populating subtask_name (ha-bambulab #1520, and the
+// "filename has parens but the on-disk copy doesn't" case the user
+// just hit). When nothing matches the hint, return the last *.3mf in
+// the listing — Bambu's `LIST` sorts oldest first, so the active job
+// tends to sit at the bottom. Returns "" if the listing has no .3mf
+// entries or if the LIST command itself fails.
+static String _normalizeForMatch(const String& s) {
+    String out; out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); ++i) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c == ' ' || c == '_' || c == '-' || c == '(' || c == ')') c = '_';
+        out += c;
+    }
+    return out;
+}
+static String _bestThreeMfIn(PrinterFtp& ftp, const String& dir, const String& hint) {
+    std::vector<String> lines;
+    if (!ftp.listDir(dir, lines)) {
+        dlog("ftp", "listDir(%s) failed: %s", dir.c_str(), ftp.lastError().c_str());
+        return "";
+    }
+    dlog("ftp", "listDir(%s) returned %u entries", dir.c_str(), (unsigned)lines.size());
+    String last3mf;
+    String best;
+    String hintLower = _normalizeForMatch(hint);
+    if (hintLower.endsWith(".3mf")) hintLower = hintLower.substring(0, hintLower.length() - 4);
+    for (const String& raw : lines) {
+        String name = _ftpListName(raw);
+        if (name.length() < 5) continue;
+        String lower = name; lower.toLowerCase();
+        if (!lower.endsWith(".3mf")) continue;
+        last3mf = name;
+        if (hintLower.length()) {
+            String norm = _normalizeForMatch(name);
+            if (norm.endsWith(".3mf")) norm = norm.substring(0, norm.length() - 4);
+            if (norm == hintLower || norm.indexOf(hintLower) >= 0 ||
+                hintLower.indexOf(norm) >= 0) {
+                best = name;
+                dlog("ftp", "matched %s ~ %s", hint.c_str(), name.c_str());
+            }
+        }
+    }
+    if (!best.length() && last3mf.length()) {
+        dlog("ftp", "no fuzzy match for '%s' — using last *.3mf '%s'",
+             hint.c_str(), last3mf.c_str());
+        best = last3mf;
+    }
+    if (!best.length()) return "";
+    return dir.endsWith("/") ? (dir + best) : (dir + "/" + best);
+}
+
+bool BambuPrinter::analyseRemote(const String& requestedPath) {
     if (_analysisInProgress) {
         _lastAnalysis.error = "analysis already in progress";
         return false;
@@ -765,7 +874,9 @@ bool BambuPrinter::analyseRemote(const String& path) {
     GcodeAnalysis& result = _lastAnalysis;
     result = GcodeAnalysis{};
     result.started_ms = millis();
-    result.path       = path;
+    // Surface the resolved path below; if requestedPath was empty we
+    // overwrite this once we know what we're actually fetching.
+    result.path       = requestedPath;
 
     auto fail = [&](const String& why) -> bool {
         result.finished_ms  = millis();
@@ -802,62 +913,205 @@ bool BambuPrinter::analyseRemote(const String& path) {
         return fail("ftp connect: " + ftp.lastError());
     }
 
-    int32_t total = ftp.size(path);
-    if (total <= 0) { ftp.quit(); return fail("SIZE failed"); }
+    // Resolve the actual 3MF path. Two modes:
+    //   - Caller supplied a path (web FTP-debug flow): use it verbatim.
+    //   - Auto-resolve: walk a candidate ladder built from MQTT
+    //     subtask_name + gcode_file with .3mf and .gcode.3mf suffixes,
+    //     under both /cache/ (cloud/MakerWorld convention) and / (LAN
+    //     convention). SIZE-test each — control-channel only, so this
+    //     works even when Bambu's PASV data port refuses connections
+    //     (which it sometimes does on H2D — see ha-bambulab #1520 and
+    //     the data-channel notes in printer_ftp.cpp). The mapping
+    //     here mirrors ha-bambulab's `_attempt_ftp_download` ladder.
+    String path = requestedPath;
+    int32_t total = -1;
+    if (path.length()) {
+        total = ftp.size(path);
+    } else {
+        std::vector<String> candidates;
+        auto addCandidates = [&candidates](const String& nameRaw) {
+            if (!nameRaw.length()) return;
+            String name = nameRaw;
+            // gcode_file is a ramdisk path on X1 LAN prints — not FTP-
+            // reachable, so skip anything containing /data/ or Metadata.
+            if (name.indexOf("/data/") >= 0 || name.indexOf("Metadata") >= 0) return;
+            // If it already has a path prefix, try it as-is too.
+            if (name.startsWith("/")) {
+                candidates.push_back(name);
+                int slash = name.lastIndexOf('/');
+                name = name.substring(slash + 1);
+            }
+            // Two suffix conventions and two search dirs (/cache then /).
+            // ha-bambulab finds the LAN-print variant lives under /cache
+            // with the ".gcode.3mf" suffix, while cloud/MakerWorld uses
+            // ".3mf" only. Try the no-suffix variant when the field
+            // already ends in ".3mf" so we don't accidentally double it.
+            const char* dirs[] = {"/cache/", "/"};
+            for (const char* dir : dirs) {
+                if (name.endsWith(".3mf")) {
+                    candidates.push_back(String(dir) + name);
+                } else if (name.endsWith(".gcode")) {
+                    // Already a raw-gcode filename — try as-is.
+                    candidates.push_back(String(dir) + name);
+                } else {
+                    // Some H2D firmwares store the active job as a raw
+                    // .gcode (no 3MF wrapper) — `<name>_plate_<N>.gcode`
+                    // under /cache. Try those first since they're far
+                    // more common in practice on this firmware than
+                    // the .3mf variants. Also keep the .3mf candidates
+                    // for cloud/MakerWorld jobs.
+                    candidates.push_back(String(dir) + name + "_plate_1.gcode");
+                    candidates.push_back(String(dir) + name + "_plate_2.gcode");
+                    candidates.push_back(String(dir) + name + ".gcode");
+                    candidates.push_back(String(dir) + name + ".3mf");
+                    candidates.push_back(String(dir) + name + ".gcode.3mf");
+                }
+            }
+        };
+        addCandidates(_state.subtask_name);
+        if (_state.gcode_file.length() && _state.gcode_file != _state.subtask_name) {
+            addCandidates(_state.gcode_file);
+        }
+        // Two-pass scan: first accept only sz > 0 (the happy case where
+        // SIZE reports the real length); then accept sz == 0 (Bambu
+        // sometimes under-reports SIZE for in-progress or just-finished
+        // prints — the file is there and RETR returns bytes anyway, so
+        // we'd rather try than give up early).
+        String zeroFallback;
+        for (const String& c : candidates) {
+            int32_t sz = ftp.size(c);
+            dlog("ftp", "SIZE %s -> %ld", c.c_str(), (long)sz);
+            if (sz > 0) { path = c; total = sz; break; }
+            if (sz == 0 && !zeroFallback.length()) zeroFallback = c;
+        }
+        if (total <= 0 && zeroFallback.length()) {
+            path = zeroFallback;
+            total = 0;
+            dlog("ftp", "all SIZE>0 attempts missed; trying %s with size=0",
+                 path.c_str());
+        }
+        // Last-ditch: try listing /cache (works on the rare days the
+        // PASV data port plays nice). We don't gate the candidate scan
+        // behind this because LIST is exactly the operation that's been
+        // failing — but if it IS up, picking the best match here beats
+        // a confusing "could not find any of N candidates" error.
+        if (total < 0) {
+            String listed = _bestThreeMfIn(ftp, "/cache", _state.subtask_name);
+            if (listed.length()) {
+                int32_t sz = ftp.size(listed);
+                dlog("ftp", "listing pick SIZE %s -> %ld", listed.c_str(), (long)sz);
+                if (sz >= 0) { path = listed; total = sz; }
+            }
+        }
+    }
+    result.path = path;
+    if (total < 0) {
+        ftp.quit();
+        if (!path.length()) {
+            return fail("no current job: subtask_name+gcode_file both empty, listing failed");
+        }
+        return fail("SIZE failed for " + path);
+    }
+    // Pre-compute the byte range we'll feed into the analyzer below.
+    // Two cases — Bambu prints can land on disk as either a ZIP-wrapped
+    // 3MF (which we have to parse to find the gcode entry) or a raw
+    // `.gcode` file (just stream + feed). Detection is purely by the
+    // resolved path's extension.
+    bool is_raw_gcode = path.endsWith(".gcode");
 
-    // Grab the trailing EOCD window. ZIP's EOCD record is 22 fixed bytes
-    // plus up to 65535 bytes of comment; Bambu's 3mf never sets a ZIP
-    // comment, so 4 KiB is ample and keeps the backing std::vector small
-    // enough that the internal heap stays healthy for the simultaneous
-    // mbedTLS handshake context (~30 KiB) on the same task.
-    const uint32_t eocd_window = total > 4096 ? 4096 : (uint32_t)total;
-    uint32_t eocd_start = total - eocd_window;
-    std::vector<uint8_t> eocdBuf(eocd_window);
-    if (!ftp.retrieveInto(path, eocd_start, eocd_window, eocdBuf.data())) {
-        ftp.quit();
-        return fail("eocd fetch: " + ftp.lastError());
-    }
+    uint32_t data_offset      = 0;
+    uint32_t data_length      = 0;   // 0 means "stream until EOF" (raw)
 
-    uint32_t cd_offset = 0, cd_size = 0;
-    uint16_t entry_count = 0;
-    if (!ZipReader::parseEOCD(eocdBuf.data(), eocd_window, cd_offset, cd_size, entry_count)) {
-        ftp.quit();
-        return fail("EOCD not found");
-    }
+    if (!is_raw_gcode) {
+        // ── ZIP-wrapped 3MF path ─────────────────────────────────
+        // Grab the trailing EOCD window. ZIP's EOCD record is 22 fixed
+        // bytes plus up to 65535 bytes of comment; Bambu's 3mf never
+        // sets a ZIP comment, so 4 KiB is ample and keeps the backing
+        // std::vector small enough that the internal heap stays
+        // healthy for the simultaneous mbedTLS handshake context
+        // (~30 KiB) on the same task.
+        uint32_t eocd_window = (total > 0 && (uint32_t)total < 4096) ? (uint32_t)total : 4096;
+        uint32_t eocd_start = 0;
+        std::vector<uint8_t> eocdBuf(eocd_window);
+        if (total > 0) {
+            eocd_start = total - eocd_window;
+            if (!ftp.retrieveInto(path, eocd_start, eocd_window, eocdBuf.data())) {
+                ftp.quit();
+                return fail("eocd fetch: " + ftp.lastError());
+            }
+        } else {
+            // SIZE returned 0 but the file exists (Bambu's H2D firmware
+            // does this for the active print's 3MF). RETR still streams
+            // the real bytes — pull them all and keep the trailing
+            // eocd_window for the EOCD parse below.
+            uint32_t streamed = 0, tailGot = 0;
+            if (!ftp.retrieveTrailing(path, eocd_window, eocdBuf.data(),
+                                      &streamed, &tailGot)) {
+                ftp.quit();
+                return fail("trailing fetch: " + ftp.lastError());
+            }
+            if (streamed == 0) {
+                ftp.quit();
+                return fail("file empty for " + path +
+                            " (SIZE 0 + RETR returned no bytes); "
+                            "cache may have been rotated post-finish — "
+                            "retry while gcode_state is RUNNING");
+            }
+            total       = (int32_t)streamed;
+            eocd_window = tailGot;
+            eocd_start  = streamed - tailGot;
+            dlog("ftp", "trailing-stream got %u bytes; tail %u from offset %u",
+                 (unsigned)streamed, (unsigned)tailGot, (unsigned)eocd_start);
+        }
 
-    std::vector<uint8_t> cdBuf(cd_size);
-    if (!ftp.retrieveInto(path, cd_offset, cd_size, cdBuf.data())) {
-        ftp.quit();
-        return fail("cd fetch: " + ftp.lastError());
-    }
+        uint32_t cd_offset = 0, cd_size = 0;
+        uint16_t entry_count = 0;
+        if (!ZipReader::parseEOCD(eocdBuf.data(), eocd_window, cd_offset, cd_size, entry_count)) {
+            ftp.quit();
+            return fail("EOCD not found");
+        }
 
-    auto entries = ZipReader::parseCentralDirectory(cdBuf.data(), cd_size, entry_count);
-    // Pick the first .gcode entry. Bambu's layout puts plate_<n>.gcode under
-    // Metadata/ or directly at the root depending on slicer version.
-    ZipReader::Entry gcode;
-    bool found = false;
-    for (auto& e : entries) {
-        if (e.name.endsWith(".gcode")) { gcode = e; found = true; break; }
-    }
-    if (!found) { ftp.quit(); return fail("no .gcode entry"); }
-    if (gcode.method != 0) {
-        ftp.quit();
-        return fail("gcode entry is deflated (method=" + String(gcode.method) + "), not yet supported");
-    }
+        std::vector<uint8_t> cdBuf(cd_size);
+        if (!ftp.retrieveInto(path, cd_offset, cd_size, cdBuf.data())) {
+            ftp.quit();
+            return fail("cd fetch: " + ftp.lastError());
+        }
 
-    // Resolve local-header → data offset. Bambu often inserts an extra field
-    // so compressed data doesn't start at local_header_offset + 30 + name_len.
-    uint8_t lhdr[64];
-    if (!ftp.retrieveInto(path, gcode.local_header_offset, sizeof(lhdr), lhdr)) {
-        ftp.quit();
-        return fail("local header fetch: " + ftp.lastError());
+        auto entries = ZipReader::parseCentralDirectory(cdBuf.data(), cd_size, entry_count);
+        // Pick the first .gcode entry. Bambu's layout puts plate_<n>.gcode under
+        // Metadata/ or directly at the root depending on slicer version.
+        ZipReader::Entry gcode;
+        bool found = false;
+        for (auto& e : entries) {
+            if (e.name.endsWith(".gcode")) { gcode = e; found = true; break; }
+        }
+        if (!found) { ftp.quit(); return fail("no .gcode entry"); }
+        if (gcode.method != 0) {
+            ftp.quit();
+            return fail("gcode entry is deflated (method=" + String(gcode.method) + "), not yet supported");
+        }
+
+        // Resolve local-header → data offset. Bambu often inserts an extra field
+        // so compressed data doesn't start at local_header_offset + 30 + name_len.
+        uint8_t lhdr[64];
+        if (!ftp.retrieveInto(path, gcode.local_header_offset, sizeof(lhdr), lhdr)) {
+            ftp.quit();
+            return fail("local header fetch: " + ftp.lastError());
+        }
+        uint16_t name_len = 0, extra_len = 0;
+        if (!ZipReader::parseLocalHeader(lhdr, sizeof(lhdr), name_len, extra_len)) {
+            ftp.quit();
+            return fail("local header parse");
+        }
+        data_offset = gcode.local_header_offset + 30 + name_len + extra_len;
+        data_length = gcode.compressed_size;
+    } else {
+        // ── Raw .gcode path ─────────────────────────────────────
+        // No wrapper — the entire file IS the gcode. data_offset stays
+        // at 0; data_length stays at 0 to mean "stream to EOF" since
+        // SIZE may be unreliable mid-print on some Bambu firmwares.
+        dlog("ftp", "raw gcode path — skipping ZIP walk for %s", path.c_str());
     }
-    uint16_t name_len = 0, extra_len = 0;
-    if (!ZipReader::parseLocalHeader(lhdr, sizeof(lhdr), name_len, extra_len)) {
-        ftp.quit();
-        return fail("local header parse");
-    }
-    uint32_t data_offset = gcode.local_header_offset + 30 + name_len + extra_len;
 
     // Seed per-tool densities so mm → grams conversion uses the right value
     // per slot. Priority:
@@ -880,6 +1134,11 @@ bool BambuPrinter::analyseRemote(const String& path) {
         ~AnalyzerGuard() { if (p) { p->~GCodeAnalyzer(); heap_caps_free(p); } }
     } analyzer_guard{analyzer_obj};
     GCodeAnalyzer& analyzer = *analyzer_obj;
+    // GCodeAnalyzer has no user-declared constructor — its `_diameters[]`
+    // and `_densities[]` C arrays are left uninitialised by the default
+    // ctor on placement-new into PSRAM. reset() seeds them with the
+    // 1.75 mm / 1.24 g/cm³ defaults before we override per-tool below.
+    analyzer.reset();
     for (int u = 0; u < _state.ams_count; ++u) {
         for (int t = 0; t < 4; ++t) {
             const AmsTray& tr = _state.ams[u].trays[t];
@@ -909,14 +1168,25 @@ bool BambuPrinter::analyseRemote(const String& path) {
         }
     }
 
-    // Stream the compressed bytes (method=0 means raw) through the analyzer.
-    bool ok = ftp.retrieveRange(path, data_offset, gcode.compressed_size,
-                                [&](const uint8_t* d, size_t n) {
-        analyzer.feed(d, n);
-        return true;
-    });
+    // Stream the gcode bytes through the analyzer. For ZIP-wrapped 3MFs
+    // we range-read just the embedded gcode entry (method=0 means
+    // stored, not deflated). For raw .gcode files there's no wrapper —
+    // stream the whole thing from byte 0 to EOF.
+    bool ok;
+    if (data_length > 0) {
+        ok = ftp.retrieveRange(path, data_offset, data_length,
+                               [&](const uint8_t* d, size_t n) {
+            analyzer.feed(d, n);
+            return true;
+        });
+    } else {
+        ok = ftp.retrieveStream(path, [&](const uint8_t* d, size_t n, size_t) {
+            analyzer.feed(d, n);
+            return true;
+        });
+    }
     ftp.quit();
-    if (!ok) return fail("gcode range: " + ftp.lastError());
+    if (!ok) return fail("gcode fetch: " + ftp.lastError());
 
     analyzer.finalise();
 
@@ -1035,7 +1305,11 @@ void BambuPrinter::_maybeRetryAnalysis() {
     ++_analysisAttempts;
     Serial.printf("[Bambu %s] retrying analyseRemote (attempt %u)\n",
                   _cfg.serial.c_str(), (unsigned)_analysisAttempts);
-    auto* ctx = new AnalyseTaskCtx{this, "/cache/.3mf"};
+    // Empty path → analyseRemote auto-resolves from MQTT subtask_name
+    // with an FTP-listing fallback. The old "/cache/.3mf" hardcode was
+    // a leftover guess that 550'd as soon as Bambu started naming the
+    // job something other than empty.
+    auto* ctx = new AnalyseTaskCtx{this, ""};
     BaseType_t rc = xTaskCreatePinnedToCore(_analyseTaskTrampoline, "ana",
                                             16384, ctx, 1, nullptr, 0);
     if (rc != pdPASS) {
@@ -1069,9 +1343,15 @@ void BambuPrinter::_maybeRetryAnalysis() {
 #include "config.h"       // SD_MOUNT
 
 BambuPrinter::FtpStreamCtx::FtpStreamCtx() {
-    // 8 KiB is comfortably bigger than any single line we emit; bursty
-    // events (e.g. 208-entry list payload) are still one ftp_done line.
-    sb = xStreamBufferCreate(8192, 1);
+    // 64 KiB so the biggest line we'll ever emit (the `list` done event
+    // with the full /cache directory inline — ~25 KiB on a saturated
+    // printer) fits in one xStreamBufferSend call. The previous 8 KiB
+    // size was short-writing the done line and the frontend's NDJSON
+    // parser silently skipped the malformed JSON, leaving the spinner
+    // spinning forever. FreeRTOS streams use the system heap (internal
+    // DRAM); 64 KiB sits comfortably in the ~100 KiB free pool we hold
+    // during a transfer and avoids the retry-loop complexity entirely.
+    sb = xStreamBufferCreate(65536, 1);
 }
 BambuPrinter::FtpStreamCtx::~FtpStreamCtx() {
     if (sb) vStreamBufferDelete(sb);
@@ -1081,9 +1361,11 @@ void BambuPrinter::FtpStreamCtx::emit(const JsonDocument& doc) {
     String out;
     serializeJson(doc, out);
     out += '\n';
-    // 5 s timeout guards against a disappeared client leaving us blocked
-    // forever if the stream buffer fills — after that we silently give
-    // up on this line and the task can exit cleanly.
+    // 5 s timeout — guards against a disappeared client (consumer
+    // stops draining) leaving the FTP task blocked. Single-shot is
+    // safe with the 64 KiB buffer above: every line we emit fits
+    // whole-or-not, never half-written, so the NDJSON stream can't
+    // be left in a parseable-prefix-with-malformed-tail state.
     xStreamBufferSend(sb, out.c_str(), out.length(), pdMS_TO_TICKS(5000));
 }
 
@@ -1212,7 +1494,11 @@ void BambuPrinter::_runFtpDebug(const String& op, const String& path,
             _ftpDebugBusy = false;
             return;
         }
-        const char* dest_path = SD_MOUNT "/ftp_dl.bin";
+        // SD.open paths are bare `/foo`, NOT `/sd/foo` — the SD library's
+        // own VFS mount strips the prefix and a wrong path silently fails
+        // on writes (and on exists()/remove(), giving the false "doesn't
+        // exist" answer that lets us fall through to open() and 0).
+        const char* dest_path = "/ftp_dl.bin";
         if (SD.exists(dest_path)) SD.remove(dest_path);
         File out = SD.open(dest_path, FILE_WRITE);
         if (!out) {
@@ -1270,7 +1556,11 @@ void BambuPrinter::_handleGcodeStateTransition(const String& prev, const String&
         if (_cfg.track_print_consume && !_analysisInProgress) {
             Serial.printf("[Bambu %s] print started — queuing background analysis\n",
                           _cfg.serial.c_str());
-            auto* ctx = new AnalyseTaskCtx{this, "/cache/.3mf"};
+            // Empty path → analyseRemote auto-resolves from MQTT subtask_name
+    // with an FTP-listing fallback. The old "/cache/.3mf" hardcode was
+    // a leftover guess that 550'd as soon as Bambu started naming the
+    // job something other than empty.
+    auto* ctx = new AnalyseTaskCtx{this, ""};
             // 16 KiB stack — analyseRemote heap-allocates the analyzer into
             // PSRAM and writes the result directly into _lastAnalysis, so
             // the stack holds the PrinterFtp (with its WiFiClientSecure) plus

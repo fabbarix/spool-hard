@@ -149,6 +149,10 @@ private:
     void _handlePrinterDelete(AsyncWebServerRequest* req);
     void _handleDiscoveryPrinters(AsyncWebServerRequest* req);
     void _handleDiscoveryScales(AsyncWebServerRequest* req);
+    // POST /api/printers/refresh — fires an SSDP M-SEARCH probe and
+    // forces a fresh MQTT reconnect on every configured printer. Used
+    // by the LCD refresh button and the web Printers section.
+    void _handlePrinterRefresh(AsyncWebServerRequest* req);
     void _handlePrinterAnalyzeStart(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handlePrinterAnalysisGet(AsyncWebServerRequest* req);
     void _handleDisplayConfigGet(AsyncWebServerRequest* req);

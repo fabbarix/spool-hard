@@ -26,14 +26,29 @@ public:
     static constexpr uint32_t DISCOVERY_TTL_MS = 5 * 60 * 1000;  // 5 min
 
     void begin();
-    void update();   // prunes stale entries; call periodically
+    void update();   // prunes stale entries + slow auto-probe; call periodically
 
     const std::vector<Entry>& entries() const { return _entries; }
+
+    // Force an immediate active SSDP M-SEARCH on both 1990 and 1900. Use
+    // when the user taps a Refresh button or right after WiFi (re)connect.
+    void probe();
+
+    // Fired every time a Bambu announcement is parsed (NOTIFY or M-SEARCH
+    // response). Wired by main.cpp into BambuManager so it can pick up an
+    // IP change for an already-configured printer and trigger a reconnect
+    // — answering the "I powered the printer on, it's now on a fresh DHCP
+    // lease, how do I get the console to notice" use case without forcing
+    // the user to edit the IP by hand.
+    using OnSeenCb = std::function<void(const Entry&)>;
+    void setOnSeen(OnSeenCb cb) { _onSeen = std::move(cb); }
 
 private:
     // Listeners live in ssdp_hub; we just subscribe. See ssdp_hub.h.
     std::vector<Entry> _entries;
     uint32_t _lastPruneMs = 0;
+    uint32_t _lastProbeMs = 0;
+    OnSeenCb _onSeen;
 
     void _onAnnounce(const SsdpListener::Announce& a, const String& extra_model);
     static String _parseModel(const String& raw_packet);

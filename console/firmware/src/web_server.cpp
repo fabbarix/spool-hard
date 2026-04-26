@@ -456,6 +456,12 @@ void ConsoleWebServer::_setupRoutes() {
             _handlePrinterFtpDebug(req, data, len);
         });
 
+    // Registered before the `^\/api\/printers\/(.+)$` GET regex so the
+    // exact path doesn't accidentally get swallowed as a serial.
+    _server.on("/api/printers/refresh", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handlePrinterRefresh(req);
+    });
     _server.on("/api/printers", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handlePrintersList(req);
     });
@@ -877,16 +883,17 @@ void ConsoleWebServer::_setupRoutes() {
         req->send(SD, FILAMENTS_RELPATH, "application/x-ndjson");
     });
 
-    // Downloads the blob the most recent FTP debug "download" op wrote to
-    // /sd/ftp_dl.bin. Auth-gated, served with attachment disposition so the
-    // browser saves it rather than trying to render unknown bytes.
+    // Downloads the blob the most recent FTP debug "download" op wrote
+    // to /ftp_dl.bin on the SD card. SD.open paths are bare `/foo` —
+    // the wrong-prefix `/sd/...` form silently fails. Auth-gated; sent
+    // as attachment so the browser saves rather than rendering bytes.
     _server.on("/api/ftp-download", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
-        if (!g_sd.isMounted() || !SD.exists(SD_MOUNT "/ftp_dl.bin")) {
+        if (!g_sd.isMounted() || !SD.exists("/ftp_dl.bin")) {
             req->send(404, "application/json", "{\"error\":\"no download available\"}");
             return;
         }
-        auto* resp = req->beginResponse(SD, SD_MOUNT "/ftp_dl.bin",
+        auto* resp = req->beginResponse(SD, "/ftp_dl.bin",
                                         "application/octet-stream");
         resp->addHeader("Content-Disposition", "attachment; filename=\"ftp_dl.bin\"");
         req->send(resp);
@@ -2180,6 +2187,8 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
         default:                           st["link"] = "disconnected"; break;
     }
     st["gcode_state"]   = s.gcode_state;
+    st["subtask_name"]  = s.subtask_name;
+    st["gcode_file"]    = s.gcode_file;
     st["progress_pct"]  = s.progress_pct;
     st["layer_num"]     = s.layer_num;
     st["total_layers"]  = s.total_layers;
@@ -2304,7 +2313,10 @@ void ConsoleWebServer::_handlePrinterAnalyzeStart(AsyncWebServerRequest* req,
         req->send(409, "application/json", "{\"error\":\"analysis already running\"}");
         return;
     }
-    String path = "/cache/.3mf";
+    // Empty path → analyseRemote() auto-resolves from MQTT subtask_name
+    // with an FTP-listing fallback. The web FTP-debug flow can still
+    // override with a specific path in the request body.
+    String path = "";
     if (len > 0) {
         JsonDocument doc;
         if (!deserializeJson(doc, data, len)) {
@@ -2469,6 +2481,15 @@ void ConsoleWebServer::_handlePrinterFtpDebug(AsyncWebServerRequest* req,
     resp->addHeader("Cache-Control", "no-cache");
     resp->addHeader("X-Content-Type-Options", "nosniff");
     req->send(resp);
+}
+
+void ConsoleWebServer::_handlePrinterRefresh(AsyncWebServerRequest* req) {
+    g_bambu_discovery.probe();
+    g_bambu.reconnectAll();
+    int n = (int)g_bambu.printers().size();
+    char body[64];
+    snprintf(body, sizeof(body), "{\"ok\":true,\"reconnecting\":%d}", n);
+    req->send(200, "application/json", body);
 }
 
 void ConsoleWebServer::_handleDiscoveryPrinters(AsyncWebServerRequest* req) {

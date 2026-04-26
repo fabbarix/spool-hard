@@ -80,6 +80,14 @@ struct UiPrinterSnapshot {
 };
 void ui_set_printer_panel(const UiPrinterSnapshot* snap);
 
+// Tap callback for the small refresh button on the printer card. main.cpp
+// hooks this to fire `g_bambu_discovery.probe()` + `g_bambu.reconnectAll()`
+// so the user can re-probe the LAN and force-reconnect without going to
+// the web UI. Pass nullptr to disable; the button still renders, just
+// becomes a no-op.
+typedef void (*ui_printer_refresh_cb_t)(void);
+void ui_set_printer_refresh_callback(ui_printer_refresh_cb_t cb);
+
 // Update onboarding screen — called once from setup() with the values the
 // WifiProvisioning module exposes.
 void ui_set_onboarding(const char* ap_ssid, const char* security_key, const char* ip_or_mdns);

@@ -1,40 +1,41 @@
 #pragma once
 #include <Arduino.h>
 #include <IPAddress.h>
-#include <WiFiClientSecure.h>
 #include <functional>
 #include <vector>
 
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/net_sockets.h>
+
 /**
- * Implicit-TLS FTP client targeting Bambu Lab printers.
+ * Implicit-TLS FTPS client targeting Bambu Lab printers.
  *
  *   - Control + data connection both TLS (implicit, :990).
+ *   - **TLS session reuse between control and data is required** —
+ *     Bambu's FTPS daemon enforces RFC 4217 §10.1 (data handshake must
+ *     resume the control session). We use raw mbedtls so we can call
+ *     `mbedtls_ssl_get_session()` on the control after login and
+ *     `mbedtls_ssl_set_session()` on each data context before its
+ *     handshake. WiFiClientSecure can't do this — its mbedtls session
+ *     is internal and not exposed.
  *   - Auth: username "bblp", password = printer access code.
- *   - Binary transfers only.
- *   - Passive mode only (servers initiate nothing).
+ *   - Binary transfers only (`TYPE I`).
+ *   - Passive mode only; PROT P negotiated post-login.
  *
  * Typical use:
  *   PrinterFtp ftp;
- *   if (!ftp.connect(ip, access_code)) { ... }
- *   ftp.retrieveStream("/cache/job.3mf", [](const uint8_t* data, size_t n, size_t total, size_t idx) {
- *       // handle chunk
- *       return true;  // continue
- *   });
+ *   if (!ftp.connect(ip, access_code, serial)) { ... }
+ *   ftp.retrieveStream("/cache/job.gcode", [](...) { ... });
  *   ftp.quit();
- *
- * Limitations: no directory listing helper yet, no resume, no upload.
  */
 class PrinterFtp {
 public:
     using ChunkCb = std::function<bool(const uint8_t* data, size_t len, size_t total_so_far)>;
     using RangeCb = std::function<bool(const uint8_t* data, size_t len)>;
 
-    // Debug tap: fires once per protocol-level event (TCP connect, TLS
-    // handshake, banner, each control-channel command + response, PASV,
-    // LIST / RETR, per-chunk data progress). `code` is the FTP response
-    // code when meaningful, 0 otherwise. `text` is the server's response
-    // text or a human-readable status string for non-FTP steps (e.g.
-    // "tls handshake ok"). `elapsed_ms` is measured from setTraceCb time.
+    // Debug tap: fires once per protocol-level event.
     using TraceCb = std::function<void(const char* step, int code,
                                        const String& text, uint32_t elapsed_ms)>;
     void setTraceCb(TraceCb cb) { _trace = std::move(cb); _traceStart = millis(); }
@@ -42,57 +43,78 @@ public:
     PrinterFtp();
     ~PrinterFtp();
 
-    // Connect to the printer's FTPS on `ip:port`, using `sni_hostname`
-    // (typically the printer's serial, which matches the CN of its self-
-    // signed cert) as the TLS SNI extension. Bambu's FTPS silently drops
-    // post-banner commands when SNI doesn't match — same behaviour the
-    // Rust SpoolHard reference sidesteps by wrapping an already-connected
-    // socket in a TLS session with an explicit servername.
     bool connect(const IPAddress& ip, const String& access_code,
                  const String& sni_hostname, uint16_t port = 990);
     bool quit();
-    bool isOpen() { return _control.connected(); }
+    bool isOpen() const { return _ctrl_open; }
 
-    /// Read `length` bytes starting at `offset` of `path` from the server,
-    /// calling `cb` with each chunk. Implemented with FTP REST + RETR when
-    /// the server supports it.
     bool retrieveRange(const String& path, uint32_t offset, uint32_t length, RangeCb cb);
-
-    /// Full-file retrieval streamed via callback. `cb` returns false to abort.
     bool retrieveStream(const String& path, ChunkCb cb);
-
-    /// Fetch bytes [offset, offset+length) into a buffer. Caller pre-sizes.
     bool retrieveInto(const String& path, uint32_t offset, uint32_t length, uint8_t* dst);
 
-    /// Query file size via FTP SIZE command. Returns -1 on error.
+    // Stream the entire file via RETR and retain only the trailing
+    // `tail_size` bytes in `dst`. Used as a fallback when SIZE is
+    // unreliable (Bambu's H2D firmware reports SIZE 0 for the active
+    // 3MF mid-print, but RETR still returns the real bytes).
+    bool retrieveTrailing(const String& path, uint32_t tail_size,
+                          uint8_t* dst, uint32_t* streamed_total,
+                          uint32_t* tail_actual);
+
     int32_t size(const String& path);
 
-    /// PASV + LIST on `path`. Raw CRLF-separated server lines go into
-    /// `out` (one element per listing entry). Each entry line is
-    /// whatever Bambu's FTP daemon emits — typically BusyBox-style
-    /// "drwxr-xr-x ... name" or bare filenames.
     bool listDir(const String& path, std::vector<String>& out);
 
     const String& lastError() const { return _lastError; }
 
 private:
-    WiFiClientSecure _control;
-    IPAddress        _ip;
-    String           _sni;   // cached for the data connection (PASV)
+    // ── Raw mbedtls state ──────────────────────────────────────────
+    mbedtls_entropy_context  _entropy;
+    mbedtls_ctr_drbg_context _drbg;
+    mbedtls_ssl_config       _conf;
+    bool                     _mbed_inited = false;
 
-    String           _lastError;
+    // Control channel: persistent for the FTP session.
+    mbedtls_ssl_context _ctrl_ssl;
+    mbedtls_net_context _ctrl_net;
+    bool                _ctrl_open = false;
 
-    TraceCb          _trace;
-    uint32_t         _traceStart = 0;
-    void             _emit(const char* step, int code, const String& text);
+    // Saved control session — used to resume on every data channel
+    // handshake. Populated right after the control TLS handshake
+    // completes.
+    mbedtls_ssl_session _ctrl_session;
+    bool                _ctrl_session_saved = false;
 
-    // Low-level control: send one command, drain one response line, return
-    // the 3-digit code (or -1 on timeout).
-    int  _sendCmd(const String& cmd);
+    // For the data channel's TLS handshake — the SNI hostname is the
+    // printer's serial (cert CN), kept around between login and each
+    // data-channel open.
+    IPAddress _ip;
+    String    _sni;
+
+    String    _lastError;
+    TraceCb   _trace;
+    uint32_t  _traceStart = 0;
+    void      _emit(const char* step, int code, const String& text);
+
+    // Read the FTP response off the control TLS — single 3-digit code,
+    // possibly multiline (terminated by "<code> " on its own line).
     int  _readResponse(String* body = nullptr, uint32_t timeout_ms = 5000);
-    // Parse PASV response into (ip, port).
+    int  _sendCmd(const String& cmd);
     bool _parsePasv(const String& line, IPAddress& ip, uint16_t& port);
 
+    // Resource lifecycle helpers.
+    bool _initMbedtlsOnce();
+    void _resetCtrl();          // clear control ssl/net contexts (no resource leak)
+
+    // Open one data-channel TLS connection by reissuing PASV and
+    // resuming `_ctrl_session`. On success, `data_net` and `data_ssl`
+    // are connected and TLS-handshaked; caller is responsible for
+    // tearing them down via `_closeData()` once the data transfer is
+    // done. Returns false on any failure with `_lastError` set.
+    bool _openDataChannel(mbedtls_net_context* data_net,
+                          mbedtls_ssl_context* data_ssl);
+    void _closeData(mbedtls_net_context* data_net,
+                    mbedtls_ssl_context* data_ssl);
+
     bool _openDataAndRetrieve(const String& path, uint32_t offset,
-                              std::function<bool(WiFiClientSecure&)> reader);
+                              std::function<bool(mbedtls_ssl_context&)> reader);
 };

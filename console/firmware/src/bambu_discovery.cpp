@@ -20,6 +20,15 @@ void BambuDiscovery::begin() {
 
 void BambuDiscovery::update() {
     uint32_t now = millis();
+
+    // Slow auto-probe so a printer that powers on between NOTIFY broadcasts
+    // (Bambu sends one every ~30 s) is still picked up within ~1 minute
+    // without the user having to tap Refresh. Cheap — two UDP packets.
+    if (now - _lastProbeMs > 60000) {
+        _lastProbeMs = now;
+        ssdp_hub_probe();
+    }
+
     if (now - _lastPruneMs < 30000) return;
     _lastPruneMs = now;
 
@@ -35,6 +44,11 @@ void BambuDiscovery::update() {
     }
 }
 
+void BambuDiscovery::probe() {
+    _lastProbeMs = millis();   // reset auto-probe clock
+    ssdp_hub_probe();
+}
+
 void BambuDiscovery::_onAnnounce(const SsdpListener::Announce& a, const String& model) {
     if (a.usn.isEmpty() || (uint32_t)a.ip == 0) return;
 
@@ -44,6 +58,7 @@ void BambuDiscovery::_onAnnounce(const SsdpListener::Announce& a, const String& 
             e.ip = a.ip;
             e.last_seen_ms = now;
             if (model.length()) e.model = model;
+            if (_onSeen) _onSeen(e);
             return;
         }
     }
@@ -52,7 +67,8 @@ void BambuDiscovery::_onAnnounce(const SsdpListener::Announce& a, const String& 
     e.ip     = a.ip;
     e.model  = model;
     e.last_seen_ms = now;
-    _entries.push_back(std::move(e));
+    _entries.push_back(e);
     Serial.printf("[BambuDisc] New printer: %s @ %s\n",
                   a.usn.c_str(), a.ip.toString().c_str());
+    if (_onSeen) _onSeen(_entries.back());
 }

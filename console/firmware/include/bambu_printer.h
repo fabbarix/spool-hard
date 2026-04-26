@@ -70,6 +70,19 @@ struct GcodeAnalysis {
 struct PrinterState {
     BambuLinkState link = BambuLinkState::Disconnected;
     String  gcode_state;            // IDLE|PREPARE|RUNNING|PAUSE|FINISH|FAILED
+    // Bambu's pushall reports `print.subtask_name` as the human-readable job
+    // name. The 3MF on the printer's FTPS server lives at /cache/<name>.3mf
+    // (sometimes the field already includes the `.3mf` suffix — strip
+    // before re-appending). Used by analyseRemote() to build the FTP path
+    // instead of guessing. Empty until the first MQTT report.
+    String  subtask_name;
+    // Bambu also publishes `print.gcode_file` — content is firmware-dependent:
+    //   - X1 LAN print: ramdisk path like "/data/Metadata/plate_1.gcode"
+    //     (NOT FTP-reachable; we filter these out).
+    //   - P1 LAN print: bare filename "<name>.gcode.3mf" (this IS the
+    //     on-disk filename and the path resolver tries it as a fallback).
+    //   - Cloud / MakerWorld: usually empty, subtask_name carries the name.
+    String  gcode_file;
     int     progress_pct = -1;
     int     layer_num    = -1;
     int     total_layers = -1;
@@ -119,6 +132,15 @@ public:
     void loop();                          // call regularly (non-blocking)
     void requestFullStatus();             // pushes pushall on device/request
 
+    // Drop the current MQTT session (if any) and reset the 5 s reconnect
+    // gate so the next loop() tick attempts a fresh TLS+MQTT connect
+    // immediately. Used by the Refresh affordances (web button + LCD
+    // button) and by the discovery callback when a configured printer's
+    // IP has just changed under us. Safe while a background connect task
+    // is in flight — the disconnect is skipped in that case and the new
+    // connect will be picked up on the next harvest tick.
+    void forceReconnect();
+
     const PrinterState& state() const     { return _state; }
     const PrinterConfig& config() const   { return _cfg; }
     const GcodeAnalysis& lastAnalysis() const { return _lastAnalysis; }
@@ -130,7 +152,11 @@ public:
     // entry from the 3MF, and run it through GCodeAnalyzer. Blocks the caller.
     // Default path targets the current print job. Returns false on transport
     // or parse error (details in _lastAnalysis.error).
-    bool analyseRemote(const String& path = "/cache/.3mf");
+    // Empty `path` (the default) means "auto-resolve from the current
+    // MQTT subtask_name with an FTP-listing fallback". Pass an explicit
+    // path only from the web FTP-debug flow, where the user is poking a
+    // specific file.
+    bool analyseRemote(const String& path = "");
 
     // Interactive FTP debug — kicks off a background task that runs the
     // requested operation against the printer's FTPS server and pushes

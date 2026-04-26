@@ -33,6 +33,14 @@ public:
     /// Back-compat convenience: begin(port) + subscribe(cb) in one shot.
     void begin(Callback cb, uint16_t port = SSDP_PORT);
 
+    /// Send an SSDP M-SEARCH probe out the bound multicast socket. Devices
+    /// reply unicast back to the source port (which is the same port we're
+    /// listening on), so the existing `_onPacket` path catches the responses.
+    /// `st` is the search target — pass "ssdp:all" for a broad probe or a
+    /// vendor-specific URN for a narrow one. No-op if the listener isn't
+    /// running yet.
+    void sendMSearch(const char* st);
+
     void stop();
 
 private:

@@ -74,6 +74,8 @@ static lv_obj_t* s_led_printer        = nullptr;   // connection dot
 static lv_obj_t* s_lbl_printer_status = nullptr;   // "name · STATE · N 210°C · B 60°C"
 static lv_obj_t* s_bar_printer_prog   = nullptr;   // progress bar
 static lv_obj_t* s_lbl_printer_detail = nullptr;   // "42% · layer 120/250"
+static lv_obj_t* s_btn_printer_refresh = nullptr;  // top-right refresh icon
+static ui_printer_refresh_cb_t s_printer_refresh_cb = nullptr;
 static lv_obj_t* s_bar_ota        = nullptr;
 static lv_obj_t* s_lbl_ota_pct    = nullptr;
 static lv_obj_t* s_lbl_ota_kind   = nullptr;
@@ -238,6 +240,31 @@ static void build_home() {
     lv_obj_set_pos(s_lbl_printer_detail, 288, 26);
     lv_obj_set_width(s_lbl_printer_detail, 152);
     lv_label_set_long_mode(s_lbl_printer_detail, LV_LABEL_LONG_DOT);
+
+    // Reconnect button — only shown when the printer card is rendering
+    // its offline placeholder (see ui_set_printer_panel). Brand-coloured
+    // and large enough to feel like a primary action since it's the
+    // user's only on-device way to nudge a stuck connection. Sits on
+    // the right side of the card, vertically centred — the offline
+    // status text sits on the left and never reaches it. Hidden by
+    // default; toggled visible/invisible from ui_set_printer_panel.
+    s_btn_printer_refresh = lv_btn_create(s_printer_card);
+    lv_obj_set_size(s_btn_printer_refresh, 140, 42);
+    lv_obj_align(s_btn_printer_refresh, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_btn_printer_refresh, COL_BRAND, 0);
+    lv_obj_set_style_bg_opa(s_btn_printer_refresh, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_btn_printer_refresh, 0, 0);
+    lv_obj_set_style_radius(s_btn_printer_refresh, 6, 0);
+    lv_obj_set_style_pad_all(s_btn_printer_refresh, 0, 0);
+    lv_obj_t* refresh_lbl = lv_label_create(s_btn_printer_refresh);
+    lv_label_set_text(refresh_lbl, LV_SYMBOL_REFRESH "  Reconnect");
+    lv_obj_set_style_text_color(refresh_lbl, COL_INPUT, 0);
+    lv_obj_set_style_text_font(refresh_lbl, &spoolhard_mont_16, 0);
+    lv_obj_center(refresh_lbl);
+    lv_obj_add_event_cb(s_btn_printer_refresh, [](lv_event_t*) {
+        if (s_printer_refresh_cb) s_printer_refresh_cb();
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_flag(s_btn_printer_refresh, LV_OBJ_FLAG_HIDDEN);
 
     // ── AMS panel (y=150..282, h=132): bigger tiles, no header —
     //    the printer card above already carries printer/status. ─────
@@ -735,7 +762,10 @@ void ui_set_printer_panel(const UiPrinterSnapshot* snap) {
     lv_lock();
 
     if (!snap || !snap->connected) {
-        // Placeholder: grey LED, muted "no printer" line, hide bar/detail.
+        // Placeholder: red LED, muted "no printer" line, hide bar/detail,
+        // SHOW the Reconnect button — it's the only on-device path to
+        // nudge a stuck MQTT connect, so it gets prime real estate
+        // exactly while the user has reason to want it.
         lv_led_set_color(s_led_printer, COL_DISCONN);
         lv_led_off(s_led_printer);
         lv_obj_set_style_text_color(s_lbl_printer_status, COL_TEXT_MUTED, 0);
@@ -743,12 +773,14 @@ void ui_set_printer_panel(const UiPrinterSnapshot* snap) {
                           snap ? "Printer offline" : "No printer");
         lv_obj_add_flag(s_bar_printer_prog, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(s_lbl_printer_detail, "");
+        if (s_btn_printer_refresh) lv_obj_clear_flag(s_btn_printer_refresh, LV_OBJ_FLAG_HIDDEN);
         lv_unlock();
         return;
     }
 
     lv_led_set_color(s_led_printer, COL_CONNECTED);
     lv_led_on(s_led_printer);
+    if (s_btn_printer_refresh) lv_obj_add_flag(s_btn_printer_refresh, LV_OBJ_FLAG_HIDDEN);
 
     // Status line: name + state + temps (one row, dot-truncated). Temps
     // appear inline so they're visible even when the progress bar is
@@ -950,6 +982,10 @@ void ui_set_hostname(const char* hostname, wifi_lcd_state_t state) {
 
 void ui_set_slot_tap_callback(ui_slot_tap_cb_t cb) {
     s_slot_tap_cb = cb;
+}
+
+void ui_set_printer_refresh_callback(ui_printer_refresh_cb_t cb) {
+    s_printer_refresh_cb = cb;
 }
 
 // Append a "key: value" row to the detail grid. `muted` draws the label

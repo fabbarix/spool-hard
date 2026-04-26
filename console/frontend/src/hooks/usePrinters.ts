@@ -82,6 +82,24 @@ export function useDeletePrinter() {
   });
 }
 
+// Fires an SSDP M-SEARCH probe + force-reconnect on every configured
+// printer. Use after powering on a printer so the console picks up the
+// new lease + reattaches without waiting for the next ~30s NOTIFY tick.
+export function useRefreshPrinters() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      fetch('/api/printers/refresh', { method: 'POST' }).then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? 'refresh failed');
+        return r.json();
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['printers'] });
+      qc.invalidateQueries({ queryKey: ['discovery-printers'] });
+    },
+  });
+}
+
 export interface AnalysisTool {
   tool_idx: number;
   grams: number;           // total predicted for this tool over the whole print

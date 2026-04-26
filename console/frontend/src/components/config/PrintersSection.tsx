@@ -1,12 +1,12 @@
 import { useState } from 'react';
-import { Printer, Plus, Trash2 } from 'lucide-react';
+import { Printer, Plus, Trash2, RefreshCw } from 'lucide-react';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { InputField } from '@spoolhard/ui/components/InputField';
 import { PasswordField } from '@spoolhard/ui/components/PasswordField';
 import { Button } from '@spoolhard/ui/components/Button';
 import { StatusDot } from '@spoolhard/ui/components/StatusDot';
 import { TextScanner } from '@spoolhard/ui/components/TextScanner';
-import { usePrinters, useUpsertPrinter, useDeletePrinter, type Printer as P } from '../../hooks/usePrinters';
+import { usePrinters, useUpsertPrinter, useDeletePrinter, useRefreshPrinters, type Printer as P } from '../../hooks/usePrinters';
 import { useDiscoveredPrinters, type DiscoveredPrinter } from '../../hooks/useDiscoveredPrinters';
 
 const MAX_PRINTERS = 5;
@@ -21,6 +21,7 @@ export function PrintersSection() {
   const { data: printers } = usePrinters();
   const upsert = useUpsertPrinter();
   const del    = useDeletePrinter();
+  const refresh = useRefreshPrinters();
 
   const [form, setForm] = useState({ name: '', serial: '', ip: '', access_code: '' });
   const [adding, setAdding] = useState(false);
@@ -102,11 +103,22 @@ export function PrintersSection() {
           </div>
         </div>
       ) : (
-        <div className="mt-3">
+        <div className="mt-3 flex items-center gap-2">
           <Button onClick={() => setAdding(true)} disabled={atLimit}>
             <span className="inline-flex items-center gap-1.5">
               <Plus size={16} />
               Add printer{atLimit ? ` (max ${MAX_PRINTERS})` : ''}
+            </span>
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => refresh.mutate()}
+            disabled={refresh.isPending}
+            title="Re-probe the LAN over SSDP and force-reconnect every configured printer."
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <RefreshCw size={16} className={refresh.isPending ? 'animate-spin' : ''} />
+              {refresh.isPending ? 'Refreshing…' : 'Refresh'}
             </span>
           </Button>
         </div>

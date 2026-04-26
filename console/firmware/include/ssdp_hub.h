@@ -13,3 +13,8 @@ extern SsdpListener g_ssdp_1900;
 
 // Call once after WiFi comes up. Safe to call repeatedly; idempotent.
 void ssdp_hub_begin();
+
+// Fire an M-SEARCH probe out both ports so devices reply immediately
+// instead of waiting for their next periodic NOTIFY (~30 s on Bambu).
+// Cheap, but don't spam — call on user action or on a slow timer.
+void ssdp_hub_probe();

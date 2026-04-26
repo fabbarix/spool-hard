@@ -91,3 +91,53 @@ schema; do not re-define those keys in the per-product `config.h`.
 
 When adding new shared code, prefer extending the lib over duplicating
 between `console/` and `scale/`.
+
+## Code navigation & editing — use Serena MCP
+
+This repo has the **Serena** MCP server attached. Prefer Serena's
+symbol-aware tools over `grep`/`Read`/`Edit` for any task that involves
+finding or modifying C/C++/JS/TS symbols. Serena uses the language
+server, so it understands scope, overloads, and cross-file references —
+which matters here because the protocol enums and OTA helpers are
+mirrored across `console/`, `scale/`, and `shared/firmware/`.
+
+**Discovery (read-only, cheap):**
+- `mcp__serena__get_symbols_overview` — first call when opening an
+  unfamiliar file; returns the top-level symbol tree without reading the
+  body. Use this instead of `Read` for orientation.
+- `mcp__serena__find_symbol` — locate a class/function/method by
+  `name_path` (e.g. `ConsoleToScale/send`, or `/OtaConfig` for an
+  absolute match). Pass `include_body=true` only when you need the
+  source; pass `depth=1` to list members of a class without their
+  bodies. Use `relative_path` to scope to one file/dir — much faster.
+- `mcp__serena__find_referencing_symbols` — before renaming or deleting
+  a symbol, or when adding a new protocol message and you need to find
+  every `nameToType` / `typeToString` / `send` switch that has to be
+  updated in lockstep.
+
+**Editing:**
+- `mcp__serena__replace_symbol_body` — swap the body of a known
+  function/method without re-reading the surrounding file. Body must
+  start at the signature line and exclude leading comments/imports.
+- `mcp__serena__insert_after_symbol` / `insert_before_symbol` — add a
+  new enum value, method, or include without hand-counting line numbers.
+- `mcp__serena__rename_symbol` — repo-wide rename via the language
+  server (handles call sites). Use this instead of `Edit ... replace_all`
+  for anything that crosses files.
+- `mcp__serena__safe_delete_symbol` — refuses to delete if references
+  exist; returns the reference list so you know what to clean up first.
+
+**When NOT to use Serena tools:**
+- Plain text files (`VERSION`, `*.md`, `*.json`, `platformio.ini`,
+  `CMakeLists.txt`) — use `Read` / `Edit` / `Write`.
+- Whole-file rewrites or new-file creation — use `Write`.
+- Looking for a literal string (URL, log message, config key) — use
+  `grep` via `Bash`. Serena indexes symbols, not arbitrary text.
+- One-off reads where you already know the exact lines you need —
+  `Read` with `offset`/`limit` is fine.
+
+**Serena's project memory** (`mcp__serena__{list,read,write}_memory`)
+is separate from the `~/.claude/projects/.../memory/` auto-memory above.
+Don't duplicate; only write a Serena memory if a fact is specifically
+useful to future Serena symbol-navigation sessions (e.g. "the protocol
+enum lives at `*/firmware/src/protocol.h`").
