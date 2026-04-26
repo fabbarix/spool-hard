@@ -281,3 +281,14 @@ void ui_calibration_wizard_on_weight(float grams, const char* state, int precisi
 // they picked on step 1. main.cpp issues g_scale.addCalPoint(weight).
 typedef void (*ui_calibration_capture_cb_t)(int weight);
 void ui_set_calibration_capture_callback(ui_calibration_capture_cb_t cb);
+
+// Fired when the wizard advances from step 1 (pick) to step 2
+// (capture). main.cpp typically responds by calling
+// `g_scale.requestCurrentWeight()` so the wizard's gating logic
+// re-runs on a fresh weight event. Necessary because the scale
+// doesn't periodically re-emit "Uncalibrated" — without a fresh
+// reply the Capture button can never enable on a freshly-cleared
+// scale unless the original Add-point request's reply happened to
+// arrive while step 2 was already visible.
+typedef void (*ui_calibration_step_enter_cb_t)(void);
+void ui_set_calibration_capture_enter_callback(ui_calibration_step_enter_cb_t cb);

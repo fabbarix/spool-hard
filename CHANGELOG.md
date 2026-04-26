@@ -8,6 +8,45 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.5.4] - 2026-04-26
+
+Tare + multi-point calibrate directly from the console LCD, plus a
+batch of UX polish on top of v0.5.0.
+
+- feat(scale): tap the home-screen Scale card to open a Scale settings
+  view with live weight, calibration status, and Tare / Add point /
+  Clear / Close actions.
+- feat(scale): 3-step calibration wizard — pick known weights from a
+  configurable preset list, place + capture (button gates on the
+  scale's stable / new state, and on uncalibrated for the first
+  bootstrap point after a Clear), confirm and add another or finish.
+- feat(scale): chip taps in the wizard ADD into a running sum so the
+  user can compose any reference weight from what they own
+  (e.g. 100 g + 200 g = 300 g).
+- feat(scale): prominent "Target: N g" label on the capture screen
+  plus a signed delta-vs-target line that turns teal within ±1 % (or
+  ±1 g) of the target, so the user can see at a glance when the load
+  is close.
+- feat(scale): web Config → Scale gains a "Calibration Weights"
+  section to manage the LCD wizard's preset chips (sorted, deduped,
+  capped at 12). Defaults to 100 / 250 / 500 g + 1 / 2 / 5 kg.
+- feat(protocol): three new console↔scale messages —
+  ConsoleToScale::AddCalPoint(weight), ConsoleToScale::ClearCalPoints,
+  and ScaleToConsole::CalibrationStatus(num_points, tare_raw). Pushed
+  on every tare / add / clear and once on console-connect so the LCD
+  status line never has to poll. Console-side ScaleLink exposes the
+  matching addCalPoint / clearCalPoints / onCalibrationStatus +
+  cached calNumPoints / calTareRaw snapshot.
+- fix(ui): AMS tile weight on both LCD and the web Printers panel now
+  shows max(0, weight_current - consumed_since_weight) so the
+  displayed remaining ticks down through a print as the gcode
+  analyzer forecasts consumption — the breakdown is still on the
+  detail screens for transparency.
+- fix(scale fw): added `#include <HTTPClient.h>` to scale main.cpp so
+  PlatformIO's LDF pulls in the bundled lib for spoolhard_core's
+  ota.cpp. The console resolved it transitively via bambu_cloud.cpp;
+  the scale had no equivalent caller and was failing to build locally.
+
 ## [0.3.1] - 2026-04-23
 
 - fix(filaments): expanded row + edit form fall back to base_id when no inherits

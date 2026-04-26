@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <cmath>      // fabsf — used by the calibration wizard's delta-vs-target colour cue
 #include <lvgl.h>
 
 // ── Theme tokens (mirror shared/frontend/src/app.css) ────────
@@ -41,18 +42,28 @@ static scale_settings_cb_t    s_scale_settings_cb  = nullptr;
 // Calibration-wizard widget handles + state.
 static lv_obj_t* s_calwiz_pick_grid     = nullptr;   // chip container
 static lv_obj_t* s_lbl_calwiz_pick_title = nullptr;  // "Pick a known weight"
+static lv_obj_t* s_lbl_calwiz_pick_sum   = nullptr;  // running-sum readout
+static lv_obj_t* s_btn_calwiz_pick_continue = nullptr;
+static lv_obj_t* s_btn_calwiz_pick_reset = nullptr;
 static lv_obj_t* s_lbl_calwiz_capture_title = nullptr;
 static lv_obj_t* s_lbl_calwiz_capture_weight = nullptr;
 static lv_obj_t* s_lbl_calwiz_capture_state  = nullptr;
+static lv_obj_t* s_lbl_calwiz_capture_target = nullptr;  // "Target: 500 g"
+static lv_obj_t* s_lbl_calwiz_capture_delta  = nullptr;  // "Δ: -3 g (close)"
 static lv_obj_t* s_btn_calwiz_capture        = nullptr;
 static lv_obj_t* s_lbl_calwiz_done_msg       = nullptr;
-static int       s_calwiz_picked      = 0;     // grams chosen on step 1
+static int       s_calwiz_picked      = 0;     // running sum of chip taps on step 1
 static int       s_calwiz_last_known_count = 0;
-static uint32_t  s_calwiz_stable_since_ms = 0; // when the current stable run started
 static ui_calibration_capture_cb_t s_calwiz_cb = nullptr;
-// How long the scale must read "stable" before Capture enables — same
-// 1 s gating idiom the spool wizard uses.
-static const uint32_t CALWIZ_STABLE_HOLD_MS = 1000;
+static ui_calibration_step_enter_cb_t s_calwiz_enter_cb = nullptr;
+
+// Forward decls — used by the per-screen lambdas in the builders before
+// the implementations appear later in the file.
+static void _calwiz_refresh_sum();
+static void _calwiz_enter_capture(int weight);
+// Format a known-weight integer as "Xg" or "X.X kg" (matches the chip
+// label rendering so the sum line and the chips look consistent).
+static void _fmt_grams_short(char* buf, size_t n, int g);
 
 // Spool-screen widget handles. Populated from ui_show_spool().
 static lv_obj_t* s_lbl_spool_title     = nullptr;
@@ -735,7 +746,7 @@ static void build_calwiz_pick() {
     style_screen(s_calwiz_pick);
 
     s_lbl_calwiz_pick_title = make_label(s_calwiz_pick,
-        "Pick a known weight", COL_BRAND, &spoolhard_mont_22);
+        "Add known weight", COL_BRAND, &spoolhard_mont_22);
     lv_obj_align(s_lbl_calwiz_pick_title, LV_ALIGN_TOP_LEFT, 12, 10);
 
     lv_obj_t* cancel = make_text_btn(s_calwiz_pick, "Cancel", false,
@@ -745,12 +756,22 @@ static void build_calwiz_pick() {
     lv_obj_add_event_cb(cancel, [](lv_event_t*) { ui_show_scale_settings(); },
                         LV_EVENT_CLICKED, nullptr);
 
+    // Running-sum readout. Tapping a chip adds its grams to the sum so
+    // the user can compose "100 + 200 = 300 g" out of whatever weights
+    // they have on hand. Reset button below clears the accumulator;
+    // Continue advances to the capture step with that total.
+    s_lbl_calwiz_pick_sum = make_label(s_calwiz_pick,
+        "Tap chips to add", COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_align(s_lbl_calwiz_pick_sum, LV_ALIGN_TOP_LEFT, 12, 44);
+    lv_obj_set_width(s_lbl_calwiz_pick_sum, 456);
+    lv_label_set_long_mode(s_lbl_calwiz_pick_sum, LV_LABEL_LONG_DOT);
+
     // Chip grid container. Populated fresh in ui_start_calibration_wizard
     // from the runtime preset list — we clear+rebuild on every entry so
     // a presets edit shows up without rebooting.
     s_calwiz_pick_grid = lv_obj_create(s_calwiz_pick);
-    lv_obj_set_pos(s_calwiz_pick_grid, 12, 56);
-    lv_obj_set_size(s_calwiz_pick_grid, 456, 256);
+    lv_obj_set_pos(s_calwiz_pick_grid, 12, 76);
+    lv_obj_set_size(s_calwiz_pick_grid, 456, 162);
     lv_obj_set_style_bg_opa(s_calwiz_pick_grid, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_calwiz_pick_grid, 0, 0);
     lv_obj_set_style_pad_all(s_calwiz_pick_grid, 0, 0);
@@ -758,17 +779,45 @@ static void build_calwiz_pick() {
     lv_obj_set_style_pad_row(s_calwiz_pick_grid, 8, 0);
     lv_obj_set_style_pad_column(s_calwiz_pick_grid, 8, 0);
     lv_obj_set_scroll_dir(s_calwiz_pick_grid, LV_DIR_VER);
+
+    // Footer: Reset (left) + Continue (right). Continue stays dim while
+    // sum is 0; recomputed on every chip tap + on Reset via
+    // _calwiz_refresh_sum().
+    s_btn_calwiz_pick_reset = make_text_btn(s_calwiz_pick, "Reset", false,
+                                            12, 248, 144, 60);
+    lv_obj_add_event_cb(s_btn_calwiz_pick_reset, [](lv_event_t*) {
+        s_calwiz_picked = 0;
+        // Repaint the sum line + Continue gating. The helper is defined
+        // alongside the wizard's other state-pushing utilities below
+        // ui_init() — forward declared at the top of the file.
+        _calwiz_refresh_sum();
+    }, LV_EVENT_CLICKED, nullptr);
+
+    s_btn_calwiz_pick_continue = make_text_btn(s_calwiz_pick, "Continue",
+                                               /*primary*/true, 324, 248, 144, 60);
+    lv_obj_set_style_bg_opa(s_btn_calwiz_pick_continue, LV_OPA_70, 0);
+    lv_obj_clear_flag(s_btn_calwiz_pick_continue, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_btn_calwiz_pick_continue, [](lv_event_t*) {
+        if (s_calwiz_picked <= 0) return;
+        // Defined below — switches screen + retitles capture.
+        _calwiz_enter_capture(s_calwiz_picked);
+    }, LV_EVENT_CLICKED, nullptr);
 }
 
-// Step 2 — instruct user to place the picked weight, then Capture
-// (gated by a 1 s stable hold). Back returns to step 1; Cancel returns
-// to scale settings.
+// Step 2 — show the target weight prominently, render live weight + a
+// signed delta vs target, and unlock Capture as soon as the scale
+// reports `state == "stable"`. We don't run our own stable-hold timer
+// any more: the scale already has its own multi-sample stable filter
+// (`stableCountReq`), and crucially the scale only emits a state
+// event ON TRANSITIONS (one LoadChangedStable then silence) — a
+// console-side N-second hold would never tick because no further
+// weight events arrive to trigger the recompute.
 static void build_calwiz_capture() {
     s_calwiz_capture = lv_obj_create(nullptr);
     style_screen(s_calwiz_capture);
 
     s_lbl_calwiz_capture_title = make_label(s_calwiz_capture,
-        "Place — g on the scale", COL_BRAND, &spoolhard_mont_22);
+        "Capture calibration point", COL_BRAND, &spoolhard_mont_22);
     lv_obj_align(s_lbl_calwiz_capture_title, LV_ALIGN_TOP_LEFT, 12, 10);
 
     lv_obj_t* cancel = make_text_btn(s_calwiz_capture, "Cancel", false,
@@ -778,37 +827,44 @@ static void build_calwiz_capture() {
     lv_obj_add_event_cb(cancel, [](lv_event_t*) { ui_show_scale_settings(); },
                         LV_EVENT_CLICKED, nullptr);
 
-    // Live weight readout.
-    lv_obj_t* card = make_card(s_calwiz_capture, 12, 56, 456, 120);
+    // Big target line right under the title — this is the user's "shoot
+    // for this number" reference, more important than the live readout.
+    s_lbl_calwiz_capture_target = make_label(s_calwiz_capture,
+        "Target: — g", COL_BRAND, &spoolhard_mont_28);
+    lv_obj_align(s_lbl_calwiz_capture_target, LV_ALIGN_TOP_LEFT, 12, 50);
+
+    // Live weight card — bigger number on the left, state pill on the
+    // right, signed delta-vs-target as a sub-line. Delta colour shifts
+    // toward green as the live weight closes on target.
+    lv_obj_t* card = make_card(s_calwiz_capture, 12, 96, 456, 100);
     lv_obj_set_style_pad_all(card, 12, 0);
     s_lbl_calwiz_capture_weight = make_label(card, "— g",
         COL_TEXT, &spoolhard_mont_36);
-    lv_obj_align(s_lbl_calwiz_capture_weight, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_align(s_lbl_calwiz_capture_weight, LV_ALIGN_TOP_LEFT, 0, 0);
     s_lbl_calwiz_capture_state = make_label(card, "waiting",
         COL_TEXT_MUTED, &spoolhard_mont_16);
-    lv_obj_align(s_lbl_calwiz_capture_state, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_align(s_lbl_calwiz_capture_state, LV_ALIGN_TOP_RIGHT, 0, 4);
+    s_lbl_calwiz_capture_delta = make_label(card, "—",
+        COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_align(s_lbl_calwiz_capture_delta, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
-    // Helper line.
+    // Helper line right under the card.
     lv_obj_t* help = make_label(s_calwiz_capture,
         "Wait for stable, then tap Capture",
         COL_TEXT_MUTED, &spoolhard_mont_14);
-    lv_obj_align(help, LV_ALIGN_TOP_LEFT, 12, 192);
+    lv_obj_align(help, LV_ALIGN_TOP_LEFT, 12, 208);
 
     // Back + Capture buttons.
     lv_obj_t* back = make_text_btn(s_calwiz_capture, "Back", false,
-                                   12, 240, 144, 60);
+                                   12, 248, 144, 60);
     lv_obj_add_event_cb(back, [](lv_event_t*) {
-        // Re-enter step 1 with the same preset list as before; the list
-        // is held across the wizard's lifetime via the chip widgets in
-        // s_calwiz_pick_grid.
         lv_lock();
         lv_screen_load(s_calwiz_pick);
-        s_calwiz_stable_since_ms = 0;
         lv_unlock();
     }, LV_EVENT_CLICKED, nullptr);
 
     s_btn_calwiz_capture = make_text_btn(s_calwiz_capture, "Capture",
-                                         /*primary*/true, 324, 240, 144, 60);
+                                         /*primary*/true, 324, 248, 144, 60);
     lv_obj_set_style_bg_opa(s_btn_calwiz_capture, LV_OPA_70, 0);  // dim until stable
     lv_obj_clear_flag(s_btn_calwiz_capture, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_btn_calwiz_capture, [](lv_event_t*) {
@@ -816,15 +872,11 @@ static void build_calwiz_capture() {
         int w = s_calwiz_picked;
         if (w <= 0) return;
         s_calwiz_cb(w);   // main.cpp issues g_scale.addCalPoint(w)
-        // Move to step 3 — confirmation. The CalibrationStatus push
-        // from the scale will land in ui_set_scale_settings_status,
-        // which build_calwiz_done's "N points total" line reads from.
         char msg[48];
         snprintf(msg, sizeof(msg), "Captured %d g", w);
         if (s_lbl_calwiz_done_msg) lv_label_set_text(s_lbl_calwiz_done_msg, msg);
         lv_lock();
         lv_screen_load(s_calwiz_done);
-        s_calwiz_stable_since_ms = 0;
         lv_unlock();
     }, LV_EVENT_CLICKED, nullptr);
 }
@@ -1289,10 +1341,13 @@ void ui_set_calibration_capture_callback(ui_calibration_capture_cb_t cb) {
     s_calwiz_cb = cb;
 }
 
+void ui_set_calibration_capture_enter_callback(ui_calibration_step_enter_cb_t cb) {
+    s_calwiz_enter_cb = cb;
+}
+
 void ui_show_scale_settings() {
     lv_lock();
     lv_screen_load(s_scale_set);
-    s_calwiz_stable_since_ms = 0;
     lv_unlock();
 }
 
@@ -1352,27 +1407,71 @@ void ui_set_scale_settings_status(int num_points, bool tared) {
 // Forward-declared because the chip click handler issues lv_screen_load
 // of step 2 — the static block at the top declares the screen, this
 // helper is what populates step 2's title with the picked weight.
+static void _fmt_grams_short(char* buf, size_t n, int g) {
+    // Render kg when >=1 kg in clean steps so chip labels and the sum
+    // line render compactly: "1 kg" / "1.5 kg" / "100 g".
+    if (g >= 1000 && (g % 100) == 0) {
+        if ((g % 1000) == 0) snprintf(buf, n, "%d kg", g / 1000);
+        else                 snprintf(buf, n, "%.1f kg", g / 1000.0f);
+    } else {
+        snprintf(buf, n, "%d g", g);
+    }
+}
+
+static void _calwiz_refresh_sum() {
+    if (!s_lbl_calwiz_pick_sum) return;
+    char buf[64];
+    if (s_calwiz_picked <= 0) {
+        snprintf(buf, sizeof(buf), "Tap chips to add — total: 0 g");
+    } else {
+        char short_g[16];
+        _fmt_grams_short(short_g, sizeof(short_g), s_calwiz_picked);
+        snprintf(buf, sizeof(buf), "Total: %s  (%d g)", short_g, s_calwiz_picked);
+    }
+    lv_lock();
+    lv_label_set_text(s_lbl_calwiz_pick_sum, buf);
+    lv_obj_set_style_text_color(s_lbl_calwiz_pick_sum,
+        s_calwiz_picked > 0 ? COL_BRAND : COL_TEXT_MUTED, 0);
+    if (s_btn_calwiz_pick_continue) {
+        if (s_calwiz_picked > 0) {
+            lv_obj_set_style_bg_opa(s_btn_calwiz_pick_continue, LV_OPA_COVER, 0);
+            lv_obj_add_flag(s_btn_calwiz_pick_continue, LV_OBJ_FLAG_CLICKABLE);
+        } else {
+            lv_obj_set_style_bg_opa(s_btn_calwiz_pick_continue, LV_OPA_70, 0);
+            lv_obj_clear_flag(s_btn_calwiz_pick_continue, LV_OBJ_FLAG_CLICKABLE);
+        }
+    }
+    lv_unlock();
+}
+
 static void _calwiz_enter_capture(int weight) {
     s_calwiz_picked = weight;
-    s_calwiz_stable_since_ms = 0;
-    if (s_lbl_calwiz_capture_title) {
-        char buf[40];
-        snprintf(buf, sizeof(buf), "Place %d g on the scale", weight);
-        lv_label_set_text(s_lbl_calwiz_capture_title, buf);
+    if (s_lbl_calwiz_capture_target) {
+        char tbuf[32]; char short_g[16];
+        _fmt_grams_short(short_g, sizeof(short_g), weight);
+        snprintf(tbuf, sizeof(tbuf), "Target: %s", short_g);
+        lv_label_set_text(s_lbl_calwiz_capture_target, tbuf);
     }
-    if (s_btn_calwiz_capture) {
-        lv_obj_set_style_bg_opa(s_btn_calwiz_capture, LV_OPA_70, 0);
-        lv_obj_clear_flag(s_btn_calwiz_capture, LV_OBJ_FLAG_CLICKABLE);
-    }
+    // We deliberately do NOT reset the Capture button to disabled
+    // here. The scale's state events are edge-triggered (one
+    // LoadChangedStable / Uncalibrated per transition then silence),
+    // so disabling on entry would leave the button stuck if no event
+    // arrives between now and when the user is ready. Instead we let
+    // whatever the most recent weight event established carry over,
+    // and ask main.cpp to re-poll the scale via the enter callback so
+    // the gating logic re-runs with the current state.
     lv_lock();
     lv_screen_load(s_calwiz_capture);
     lv_unlock();
+    if (s_calwiz_enter_cb) s_calwiz_enter_cb();
 }
 
 void ui_start_calibration_wizard(const int* presets, size_t n) {
     lv_lock();
-    // Rebuild the chip grid from the supplied preset list. Cheap —
-    // CAL_PRESETS_MAX caps it at 12 chips.
+    // Rebuild the chip grid from the supplied preset list. Each tap
+    // ADDS the chip's grams to the running sum (s_calwiz_picked) so
+    // the user can compose "100 + 200 = 300 g" without needing every
+    // possible reference weight as its own preset.
     lv_obj_clean(s_calwiz_pick_grid);
     for (size_t i = 0; i < n; ++i) {
         int weight = presets[i];
@@ -1383,19 +1482,8 @@ void ui_start_calibration_wizard(const int* presets, size_t n) {
         lv_obj_set_style_bg_color(chip, COL_INPUT, 0);
         lv_obj_set_style_border_color(chip, COL_BRAND, 0);
         lv_obj_set_style_border_width(chip, 1, 0);
-        // Render kg for >=1000 g so a "1000" chip shows "1 kg" — easier
-        // to scan in the grid than four-digit gram labels everywhere.
         char lbl[16];
-        if (weight >= 1000 && (weight % 100) == 0) {
-            float kg = weight / 1000.0f;
-            // Trim trailing .0 (1.0 kg → 1 kg) for the common case.
-            if ((weight % 1000) == 0)
-                snprintf(lbl, sizeof(lbl), "%d kg", weight / 1000);
-            else
-                snprintf(lbl, sizeof(lbl), "%.1f kg", kg);
-        } else {
-            snprintf(lbl, sizeof(lbl), "%d g", weight);
-        }
+        _fmt_grams_short(lbl, sizeof(lbl), weight);
         lv_obj_t* l = lv_label_create(chip);
         lv_label_set_text(l, lbl);
         lv_obj_set_style_text_color(l, COL_TEXT, 0);
@@ -1403,44 +1491,87 @@ void ui_start_calibration_wizard(const int* presets, size_t n) {
         lv_obj_center(l);
         lv_obj_add_event_cb(chip, [](lv_event_t* e) {
             int w = (int)(intptr_t)lv_event_get_user_data(e);
-            _calwiz_enter_capture(w);
+            s_calwiz_picked += w;
+            _calwiz_refresh_sum();
         }, LV_EVENT_CLICKED, (void*)(intptr_t)weight);
     }
     s_calwiz_picked = 0;
-    s_calwiz_stable_since_ms = 0;
+    _calwiz_refresh_sum();
     lv_screen_load(s_calwiz_pick);
     lv_unlock();
 }
 
 void ui_calibration_wizard_on_weight(float grams, const char* state, int precision) {
+    bool uncal = state && !strcmp(state, "uncalibrated");
+
     // Update the readout regardless of which step is showing — the
     // labels only exist on step 2 so we guard against null.
     if (s_lbl_calwiz_capture_weight) {
-        char buf[24];
-        _fmt_weight(buf, sizeof(buf), grams, precision);
         lv_lock();
-        lv_label_set_text(s_lbl_calwiz_capture_weight, buf);
+        if (uncal) {
+            // grams is meaningless until the curve is established. Show
+            // a placeholder so users don't see a fake "0.0 g" implying
+            // the scale read zero. Same goes for the delta below.
+            lv_label_set_text(s_lbl_calwiz_capture_weight, "—");
+        } else {
+            char buf[24];
+            _fmt_weight(buf, sizeof(buf), grams, precision);
+            lv_label_set_text(s_lbl_calwiz_capture_weight, buf);
+        }
         if (state && *state) {
             lv_label_set_text(s_lbl_calwiz_capture_state, state);
         }
         lv_unlock();
     }
 
-    // Stable-detect ladder: same idiom as the spool wizard. We only
-    // enable Capture once the scale has reported "stable" or "new" for
-    // at least CALWIZ_STABLE_HOLD_MS continuously. Anything else
-    // resets the run.
-    bool stable_now = state && (!strcmp(state, "stable") || !strcmp(state, "new"));
-    if (stable_now) {
-        if (s_calwiz_stable_since_ms == 0) s_calwiz_stable_since_ms = millis();
-    } else {
-        s_calwiz_stable_since_ms = 0;
+    // Delta vs target — meaningless when uncalibrated (grams is fake).
+    // When calibrated, colour shifts toward green within 1 % (or 1 g,
+    // whichever is larger) of the target.
+    if (s_lbl_calwiz_capture_delta && s_calwiz_picked > 0) {
+        char dbuf[48];
+        lv_color_t col = COL_TEXT_MUTED;
+        if (uncal) {
+            snprintf(dbuf, sizeof(dbuf),
+                "Wait for the load to settle, then Capture");
+        } else {
+            float delta = grams - (float)s_calwiz_picked;
+            snprintf(dbuf, sizeof(dbuf), "%s%.*f g vs target",
+                     delta >= 0 ? "+" : "",
+                     precision < 0 ? 0 : (precision > 4 ? 4 : precision),
+                     delta);
+            float tol = s_calwiz_picked * 0.01f;
+            if (tol < 1.0f) tol = 1.0f;
+            if (fabsf(delta) <= tol) col = COL_CONNECTED;
+        }
+        lv_lock();
+        lv_label_set_text(s_lbl_calwiz_capture_delta, dbuf);
+        lv_obj_set_style_text_color(s_lbl_calwiz_capture_delta, col, 0);
+        lv_unlock();
     }
-    bool enable = s_calwiz_stable_since_ms != 0 &&
-                  (millis() - s_calwiz_stable_since_ms) >= CALWIZ_STABLE_HOLD_MS;
+
+    // Capture-button gating.
+    //   * "stable" / "new"        — the scale's multi-sample stable
+    //     filter (`stableCountReq`) has already passed; safe to
+    //     capture immediately. Same convention as
+    //     ScaleLink::hasStableWeight() (scale_link.h:65) — gating on
+    //     "stable" alone leaves the button dim in the common
+    //     place-and-don't-wiggle case because LoadChangedStable only
+    //     fires on a change-while-loaded.
+    //   * "uncalibrated"           — the scale won't emit any
+    //     stable/new events at all because it has no curve to map
+    //     raw → grams (LoadCell stays in Uncalibrated state until
+    //     numPoints > 0). Without enabling Capture in this state the
+    //     wizard can never bootstrap the very first point after a
+    //     fresh Clear. captureRaw() reads the HX711 directly, so the
+    //     capture itself works regardless of calibration state — it's
+    //     on the user to wait until the load is physically settled
+    //     before tapping. The helper text on the screen says so.
+    bool ok = state && (!strcmp(state, "stable") ||
+                        !strcmp(state, "new") ||
+                        !strcmp(state, "uncalibrated"));
     if (s_btn_calwiz_capture) {
         lv_lock();
-        if (enable) {
+        if (ok) {
             lv_obj_set_style_bg_opa(s_btn_calwiz_capture, LV_OPA_COVER, 0);
             lv_obj_add_flag(s_btn_calwiz_capture, LV_OBJ_FLAG_CLICKABLE);
         } else {

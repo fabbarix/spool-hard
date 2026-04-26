@@ -591,6 +591,14 @@ void setup() {
         Serial.printf("[UI] Calibration capture %d g\n", weight);
         g_scale.addCalPoint((int32_t)weight);
     });
+    // When the wizard transitions from "pick" to "capture", refresh
+    // the scale's last known state so the Capture-button gating runs
+    // against current data — particularly important right after a
+    // Clear, when the scale stays in Uncalibrated and never re-emits
+    // a state event on its own.
+    ui_set_calibration_capture_enter_callback([]() {
+        g_scale.requestCurrentWeight();
+    });
 
     ui_set_slot_tap_callback([](int slot_idx) {
         UiSlotDetail d = {};
