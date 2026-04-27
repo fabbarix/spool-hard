@@ -10,6 +10,14 @@
 #include "ui/ui.h"
 #include "ring_log.h"
 #include <WiFiClientSecure.h>
+// Raw-deflate inflater bundled in ROM. Bambu's slicer started shipping
+// some 3MFs with the gcode entry deflate-compressed (method=8) instead
+// of stored, so analyseRemote needs to inflate on the fly. We use the
+// low-level tinfl_decompress call (rather than tinfl_decompress_mem_to_
+// callback, which requires the entire compressed input to be in memory)
+// so we can pipe the FTP retrieveRange callback's chunks straight into
+// the inflater and keep peak memory bounded by the 32 KiB sliding dict.
+#include <rom/miniz.h>
 #include <PubSubClient.h>
 #include <IPAddress.h>
 #include <esp_heap_caps.h>   // PSRAM-capable allocator for the analyzer
@@ -23,6 +31,88 @@ extern SpoolStore g_store;   // defined in main.cpp
 
 // Static hook invoked once per successful PendingAms claim.
 BambuPrinter::SpoolAssignedCb BambuPrinter::s_onSpoolAssigned;
+
+// ── PSRAM-backed task spawning ──────────────────────────────────────
+//
+// The analyse + FTP-debug tasks each want a 16 KiB FreeRTOS stack from
+// internal DRAM. Mid-print the contiguous-internal-DRAM budget gets
+// tight (Bambu pushall payloads, mbedtls handshake contexts for MQTT
+// / FTPS, LVGL frames…) and `xTaskCreatePinnedToCore` returns
+// errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY. The kicker: the analyse-task
+// itself is mostly TLS + I/O wait, so it doesn't need the speed of
+// internal RAM — putting its stack in PSRAM is fine. PSRAM has ~1.9 MB
+// free, vs ~40 KiB internal DRAM mid-print.
+//
+// Strategy: try internal first (fast path; preserves PSRAM for big
+// allocs that actually need it), fall back to a static-PSRAM stack on
+// failure. One static TCB+stack pair PER task type; concurrency
+// inside a type is already gated (analyse: _analysisInProgress;
+// ftp-debug: _ftpDebugBusy) so reuse is safe.
+//
+// For the static-task path, we lazy-allocate the PSRAM stack on first
+// fallback and keep it allocated for the lifetime of the firmware —
+// next spawn reuses the same buffer. xTaskCreateStatic doesn't auto-
+// free memory; reusing the buffer avoids a leak.
+namespace {
+
+constexpr size_t TASK_STACK_BYTES = 16384;
+constexpr size_t TASK_STACK_WORDS = TASK_STACK_BYTES / sizeof(StackType_t);
+
+// Three reusable PSRAM stacks — one each for the analyse, FTP-debug,
+// and MQTT-connect task slots. They're orthogonal (each can run
+// concurrently with the others). The `busy` flag prevents reuse mid-
+// task (e.g. two BambuPrinter instances both falling back to PSRAM
+// for connect at the same time): the second caller gets a refusal
+// from spawnPSRAMFallbackTask and the standard 5 s retry covers it.
+struct PSRAMStackSlot {
+    StaticTask_t  tcb;
+    StackType_t*  buf = nullptr;
+    volatile bool busy = false;   // true while a task owns the buffer
+};
+PSRAMStackSlot s_analyseSlot;
+PSRAMStackSlot s_ftpDebugSlot;
+PSRAMStackSlot s_connectSlot;
+
+// Spawn a one-shot task with internal-stack-then-PSRAM-stack fallback.
+// Caller's `fn` is responsible for vTaskDelete(NULL) at the end (same
+// contract as our existing trampolines) AND, if it ran on the PSRAM
+// slot, must clear `slot.busy = false` before vTaskDelete so the
+// buffer can be reused. Returns true on success.
+bool spawnPSRAMFallbackTask(TaskFunction_t fn, void* arg, const char* name,
+                            BaseType_t core_id, UBaseType_t priority,
+                            PSRAMStackSlot& slot) {
+    // Try internal heap first — fast path, keeps PSRAM free for big
+    // analysis allocs (gcode-analyzer's mmAtPct table, etc).
+    BaseType_t rc = xTaskCreatePinnedToCore(fn, name, TASK_STACK_BYTES,
+                                            arg, priority, nullptr, core_id);
+    if (rc == pdPASS) return true;
+    Serial.printf("[Task %s] internal-heap stack alloc failed; trying PSRAM\n", name);
+    if (slot.busy) {
+        Serial.printf("[Task %s] PSRAM slot already in use — caller will retry\n", name);
+        return false;
+    }
+    if (!slot.buf) {
+        slot.buf = (StackType_t*)heap_caps_malloc(
+            TASK_STACK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!slot.buf) {
+        Serial.printf("[Task %s] PSRAM stack alloc also failed\n", name);
+        return false;
+    }
+    slot.busy = true;
+    TaskHandle_t h = xTaskCreateStaticPinnedToCore(
+        fn, name, TASK_STACK_WORDS, arg, priority,
+        slot.buf, &slot.tcb, core_id);
+    if (!h) {
+        slot.busy = false;
+        Serial.printf("[Task %s] xTaskCreateStaticPinnedToCore returned null\n", name);
+        return false;
+    }
+    Serial.printf("[Task %s] running on PSRAM stack\n", name);
+    return true;
+}
+
+}  // namespace
 
 namespace {
 // Fallback nozzle temps per material. Used when a SpoolRecord has no
@@ -117,6 +207,11 @@ void BambuPrinter::_connectTrampoline(void* arg) {
     self->_connectTaskResult = ok;
     self->_connectTaskState  = ConnectTaskState::Done;
     self->_connectTask       = nullptr;
+    // Release the PSRAM stack slot if we ran from there. Safe to do
+    // unconditionally — clearing a flag that's already false is a no-
+    // op, and we don't track which task path ran (internal-stack
+    // tasks just leave the flag false the whole time).
+    s_connectSlot.busy = false;
     vTaskDelete(NULL);
 }
 
@@ -157,21 +252,26 @@ void BambuPrinter::_ensureConnected() {
     _state.link = BambuLinkState::Connecting;
     _mqtt->setServer(_cfg.ip.c_str(), BAMBU_MQTT_PORT);
 
-    // Hand the blocking PubSubClient::connect() to a one-shot task. Pinned
-    // to core 0 with low priority so it can't preempt the main loop on
-    // core 1; main loop polls _connectTaskState each tick to harvest.
+    // Hand the blocking PubSubClient::connect() to a one-shot task.
+    // Pinned to core 0 with low priority so it can't preempt the main
+    // loop on core 1; main loop polls _connectTaskState each tick to
+    // harvest. spawnPSRAMFallbackTask tries internal heap first
+    // (faster, keeps PSRAM free for big allocs) and falls back to
+    // a static PSRAM stack when internal DRAM is fragmented — typical
+    // mid-print, when a Reconnect tap from the LCD would otherwise
+    // silently fail to spawn the connect task and look broken.
     _connectTaskResult = false;
     _connectTaskState  = ConnectTaskState::Pending;
-    BaseType_t rc = xTaskCreatePinnedToCore(_connectTrampoline, "bambu_conn",
-                                            16384, this, 1, &_connectTask, 0);
-    if (rc != pdPASS) {
-        // Couldn't spawn (heap pressure, mostly) — drop back to Idle so the
-        // next 5-s retry tries again. Don't fall back to a synchronous
-        // connect here, that's exactly the stall we're trying to escape.
+    if (!spawnPSRAMFallbackTask(_connectTrampoline, this, "bambu_conn",
+                                /*core*/0, /*priority*/1, s_connectSlot)) {
+        // Couldn't spawn even with PSRAM fallback (PSRAM exhausted or
+        // slot already in use by another printer's connect attempt).
+        // Drop back to Idle so the next 5 s retry tries again.
         _connectTaskState = ConnectTaskState::Idle;
         _state.link       = BambuLinkState::Failed;
         _state.error_message = "task spawn failed";
-        Serial.printf("[Bambu %s] connect task spawn failed\n", _cfg.serial.c_str());
+        Serial.printf("[Bambu %s] connect task spawn failed (internal+PSRAM)\n",
+                      _cfg.serial.c_str());
     }
 }
 
@@ -752,19 +852,19 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
 // M3.4/3.5 — FTP + ZIP + gcode analyzer orchestration.
 //
 // Bambu stores the current print job in /cache/<name>.3mf on the printer's
-// FTPS server. We stream just the plate gcode entry (stored, not deflated) into
-// the analyzer without landing the full 3MF on flash — the userfs partition is
-// only 7 MB and Bambu jobs easily exceed that. The workflow:
+// FTPS server. We stream just the plate gcode entry into the analyzer
+// without landing the full 3MF on flash — the userfs partition is only
+// 7 MB and Bambu jobs easily exceed that. The workflow:
 //
 //   1. FTP connect + SIZE.
 //   2. Fetch the last ~64 KB to locate the EOCD → central directory offset.
 //   3. Fetch the central directory, find the first *.gcode entry.
 //   4. Fetch its local-header to resolve the actual data offset (variable
 //      because of extra-field padding).
-//   5. Range-read the compressed_size bytes through the gcode analyzer.
-//
-// Deflate entries are currently rejected — Bambu stores the gcode entry so
-// this covers the common case; adding a streaming inflator is a follow-up.
+//   5. Range-read compressed_size bytes; for stored (method=0) entries
+//      they go straight to the analyzer, for deflate (method=8) they
+//      are piped through ROM-miniz tinfl_decompress with a 32 KiB
+//      sliding dict in PSRAM and the inflated bytes feed the analyzer.
 // ----------------------------------------------------------------------------
 
 static IPAddress _parseIp(const String& s) {
@@ -1021,6 +1121,7 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
 
     uint32_t data_offset      = 0;
     uint32_t data_length      = 0;   // 0 means "stream until EOF" (raw)
+    uint16_t data_method      = 0;   // 0=stored, 8=deflate (only set on .3mf path)
 
     if (!is_raw_gcode) {
         // ── ZIP-wrapped 3MF path ─────────────────────────────────
@@ -1086,10 +1187,15 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             if (e.name.endsWith(".gcode")) { gcode = e; found = true; break; }
         }
         if (!found) { ftp.quit(); return fail("no .gcode entry"); }
-        if (gcode.method != 0) {
+        // Bambu's slicer ships some 3MFs with the gcode entry stored
+        // (method=0) and others deflate-compressed (method=8). Both
+        // are handled below; anything else (bzip2, etc.) we don't.
+        if (gcode.method != 0 && gcode.method != 8) {
             ftp.quit();
-            return fail("gcode entry is deflated (method=" + String(gcode.method) + "), not yet supported");
+            return fail("gcode entry has unsupported compression method=" +
+                        String(gcode.method));
         }
+        data_method = gcode.method;
 
         // Resolve local-header → data offset. Bambu often inserts an extra field
         // so compressed data doesn't start at local_header_offset + 30 + name_len.
@@ -1168,27 +1274,212 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
         }
     }
 
-    // Stream the gcode bytes through the analyzer. For ZIP-wrapped 3MFs
-    // we range-read just the embedded gcode entry (method=0 means
-    // stored, not deflated). For raw .gcode files there's no wrapper —
-    // stream the whole thing from byte 0 to EOF.
+    // Stream the gcode bytes through the analyzer.
+    //   * Raw .gcode files (data_length == 0): no ZIP wrap, full stream
+    //     from byte 0 to EOF.
+    //   * Stored .3mf entries (method=0): range-read the slice, feed
+    //     verbatim to the analyzer.
+    //   * Deflated .3mf entries (method=8): range-read the compressed
+    //     slice, pipe each chunk through tinfl_decompress (32 KiB
+    //     PSRAM sliding dict + ~11 KiB tinfl_decompressor state) and
+    //     feed the decompressed bytes to the analyzer. tinfl handles
+    //     output wrap-around for us by returning the per-call written
+    //     length; we just have to split the feed across the ring's
+    //     wrap point when it occurs.
     bool ok;
-    if (data_length > 0) {
+    if (data_length == 0) {
+        ok = ftp.retrieveStream(path, [&](const uint8_t* d, size_t n, size_t) {
+            analyzer.feed(d, n);
+            return true;
+        });
+    } else if (data_method == 0) {
         ok = ftp.retrieveRange(path, data_offset, data_length,
                                [&](const uint8_t* d, size_t n) {
             analyzer.feed(d, n);
             return true;
         });
     } else {
-        ok = ftp.retrieveStream(path, [&](const uint8_t* d, size_t n, size_t) {
-            analyzer.feed(d, n);
+        // Deflate path. Allocate state in PSRAM to keep internal DRAM
+        // free for the concurrent FTPS data context.
+        auto* inflator = (tinfl_decompressor*)heap_caps_malloc(
+            sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM);
+        auto* dict = (uint8_t*)heap_caps_malloc(
+            TINFL_LZ_DICT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!inflator || !dict) {
+            if (inflator) heap_caps_free(inflator);
+            if (dict)     heap_caps_free(dict);
+            ftp.quit();
+            return fail("inflate buffer alloc failed");
+        }
+        tinfl_init(inflator);
+        struct InflateState {
+            tinfl_decompressor* inflator;
+            uint8_t*            dict;
+            size_t              dict_pos;     // next-write cursor in the ring (0..32K-1)
+            uint32_t            consumed_in;  // bytes fed in so far (vs data_length)
+            uint32_t            total_in;     // == data_length, snapshot for HAS_MORE_INPUT flag
+            GCodeAnalyzer*      analyzer;
+            bool                ok;
+            String              err;
+        } st = { inflator, dict, 0, 0, data_length, &analyzer, true, "" };
+
+        ok = ftp.retrieveRange(path, data_offset, data_length,
+                               [&st](const uint8_t* d, size_t n) {
+            const uint8_t* in_ptr = d;
+            size_t         in_remain = n;
+            st.consumed_in += n;
+            // Inner loop: a single FTP chunk may contain bytes that
+            // produce multiple output windows (e.g. when the
+            // decompressed stream is much larger than the compressed
+            // chunk), so call tinfl_decompress until either the input
+            // is fully consumed or the inflater says it needs more.
+            while (in_remain > 0) {
+                size_t in_size  = in_remain;
+                size_t out_size = TINFL_LZ_DICT_SIZE - st.dict_pos;
+                uint32_t flags = (st.consumed_in < st.total_in)
+                                ? TINFL_FLAG_HAS_MORE_INPUT : 0;
+                tinfl_status status = tinfl_decompress(
+                    st.inflator,
+                    in_ptr, &in_size,
+                    st.dict, st.dict + st.dict_pos, &out_size,
+                    flags);
+
+                // Feed the freshly-written window to the analyzer.
+                // The dict is treated as a ring; if a single tinfl
+                // call's output crossed the end of the buffer the
+                // bytes are split into two contiguous slices.
+                size_t end = st.dict_pos + out_size;
+                if (end <= TINFL_LZ_DICT_SIZE) {
+                    if (out_size) st.analyzer->feed(st.dict + st.dict_pos, out_size);
+                } else {
+                    size_t first = TINFL_LZ_DICT_SIZE - st.dict_pos;
+                    st.analyzer->feed(st.dict + st.dict_pos, first);
+                    st.analyzer->feed(st.dict, out_size - first);
+                }
+                st.dict_pos = (st.dict_pos + out_size) & (TINFL_LZ_DICT_SIZE - 1);
+
+                in_ptr    += in_size;
+                in_remain -= in_size;
+
+                if (status == TINFL_STATUS_DONE) return true;        // stop reading
+                if (status == TINFL_STATUS_NEEDS_MORE_INPUT) break;  // wait for next chunk
+                if (status == TINFL_STATUS_HAS_MORE_OUTPUT) continue; // re-call to flush
+                if (status < 0) {
+                    st.ok = false;
+                    st.err = "tinfl status " + String((int)status);
+                    return false;
+                }
+            }
             return true;
         });
+        heap_caps_free(inflator);
+        heap_caps_free(dict);
+        if (!st.ok) {
+            ftp.quit();
+            return fail("inflate: " + st.err);
+        }
+    }
+    // Before tearing the FTP session down, try to fetch the print's
+    // `.bbl` companion. Bambu stores it next to each gcode in /cache
+    // (~400-byte JSON manifest) and it carries the canonical
+    // slicer-idx → AMS-tray-id mapping under the "ams mapping" key —
+    // saves us guessing via filament_ids/colour for the common case.
+    // Path transform:
+    //   /cache/<name>_plate_<N>.gcode  →  /cache/<N>_<name>.gcode.bbl
+    std::vector<int> bblAmsMapping;
+    {
+        String bblPath;
+        if (path.endsWith(".gcode")) {
+            int slash = path.lastIndexOf('/');
+            String dir   = (slash >= 0) ? path.substring(0, slash + 1) : "";
+            String fname = (slash >= 0) ? path.substring(slash + 1)    : path;
+            int plateAt = fname.lastIndexOf("_plate_");
+            if (plateAt > 0) {
+                String name   = fname.substring(0, plateAt);
+                String suffix = fname.substring(plateAt + 7);   // "<N>.gcode"
+                int dot = suffix.indexOf('.');
+                if (dot > 0) {
+                    String plateNum = suffix.substring(0, dot);
+                    bblPath = dir + plateNum + "_" + name + ".gcode.bbl";
+                }
+            }
+        }
+        if (bblPath.length()) {
+            int32_t bblSize = ftp.size(bblPath);
+            // .bbl is always tiny (<2 KB in practice). Cap at 8 KB to
+            // protect against unexpected blobs.
+            if (bblSize > 0 && bblSize <= 8192) {
+                std::vector<uint8_t> bblBuf(bblSize + 1);
+                if (ftp.retrieveInto(bblPath, 0, (uint32_t)bblSize, bblBuf.data())) {
+                    bblBuf[bblSize] = 0;
+                    JsonDocument bblDoc;
+                    if (!deserializeJson(bblDoc, (const char*)bblBuf.data())) {
+                        JsonArrayConst arr = bblDoc["ams mapping"].as<JsonArrayConst>();
+                        if (arr) {
+                            for (JsonVariantConst v : arr) bblAmsMapping.push_back(v.as<int>());
+                            dlog("ftp", "%s parsed: %d entries", bblPath.c_str(),
+                                 (int)bblAmsMapping.size());
+                        }
+                    }
+                }
+            } else {
+                dlog("ftp", ".bbl skipped: SIZE %ld for %s",
+                     (long)bblSize, bblPath.c_str());
+            }
+        }
     }
     ftp.quit();
     if (!ok) return fail("gcode fetch: " + ftp.lastError());
 
     analyzer.finalise();
+
+    // Helper: resolve a slicer tool-idx → physical AMS tray index.
+    //   * Returns 0..15 for an AMS slot, 254 for vt_tray, -1 for unknown.
+    //   * Priority: .bbl `ams mapping` (canonical) → gcode header
+    //     filament_ids match → header filament_colour match →
+    //     _state.active_tray (single-tool fallback).
+    auto resolveTray = [&](int tool_idx) -> int {
+        // 1. .bbl mapping
+        if (tool_idx < (int)bblAmsMapping.size()) {
+            int v = bblAmsMapping[tool_idx];
+            if (v >= 0) return v;   // -1 means "unused"; fall through to fallbacks
+        }
+        // 2. filament_ids → tray_info_idx
+        const auto& slot = analyzer.slicerSlot(tool_idx);
+        if (slot.filament_id.length()) {
+            for (int u2 = 0; u2 < _state.ams_count; ++u2) {
+                for (int s = 0; s < 4; ++s) {
+                    if (_state.ams[u2].trays[s].tray_info_idx == slot.filament_id) {
+                        return u2 * 4 + s;
+                    }
+                }
+            }
+            if (_state.has_vt_tray && _state.vt_tray.tray_info_idx == slot.filament_id) {
+                return 254;
+            }
+        }
+        // 3. filament_colour → tray_color (RGBA prefix-match, case-insensitive)
+        if (slot.color_rgb != 0) {
+            auto trayMatchesColour = [&](const AmsTray& tr) {
+                if (tr.tray_color.length() < 6) return false;
+                uint32_t c = (uint32_t)strtoul(
+                    tr.tray_color.substring(0, 6).c_str(), nullptr, 16);
+                return c == slot.color_rgb;
+            };
+            for (int u2 = 0; u2 < _state.ams_count; ++u2) {
+                for (int s = 0; s < 4; ++s) {
+                    if (trayMatchesColour(_state.ams[u2].trays[s])) return u2 * 4 + s;
+                }
+            }
+            if (_state.has_vt_tray && trayMatchesColour(_state.vt_tray)) return 254;
+        }
+        // 4. Single-tool fallback: whatever the printer says is feeding now.
+        if (_state.active_tray >= 0 && _state.active_tray < 16) {
+            return _state.active_tray;
+        }
+        if (_state.active_tray == 254 && _state.has_vt_tray) return 254;
+        return -1;
+    };
 
     // Pack results + correlate tools with AMS slots and spool ids for the UI.
     int emitted = 0;
@@ -1199,14 +1490,23 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
         out.tool_idx = i;
         out.mm       = u.mm;
         out.grams    = u.grams;
-        int ams_u = i / 4, slot = i % 4;
-        if (ams_u < _state.ams_count) {
-            const AmsTray& tr = _state.ams[ams_u].trays[slot];
-            out.ams_unit = ams_u;
-            out.slot_id  = slot;
-            out.spool_id = tr.mapped_spool_id;
-            out.material = tr.tray_type;
-            out.color    = tr.tray_color;
+        int tray = resolveTray(i);
+        if (tray == 254 && _state.has_vt_tray) {
+            out.ams_unit = 254;
+            out.slot_id  = 0;
+            out.spool_id = _state.vt_tray.mapped_spool_id;
+            out.material = _state.vt_tray.tray_type;
+            out.color    = _state.vt_tray.tray_color;
+        } else if (tray >= 0 && tray < 16) {
+            int u2 = tray / 4, s = tray % 4;
+            if (u2 < _state.ams_count) {
+                const AmsTray& tr = _state.ams[u2].trays[s];
+                out.ams_unit = u2;
+                out.slot_id  = s;
+                out.spool_id = tr.mapped_spool_id;
+                out.material = tr.tray_type;
+                out.color    = tr.tray_color;
+            }
         }
         result.tools[emitted++] = out;
     }
@@ -1290,7 +1590,20 @@ static void _analyseTaskTrampoline(void* arg) {
     auto* ctx = static_cast<AnalyseTaskCtx*>(arg);
     ctx->printer->analyseRemote(ctx->path);
     delete ctx;
+    s_analyseSlot.busy = false;   // safe no-op when running on internal stack
     vTaskDelete(nullptr);
+}
+
+bool BambuPrinter::startAnalyseTask(const String& path) {
+    auto* ctx = new AnalyseTaskCtx{this, path};
+    bool ok = spawnPSRAMFallbackTask(_analyseTaskTrampoline, ctx, "ana",
+                                     /*core*/0, /*priority*/1, s_analyseSlot);
+    if (!ok) {
+        delete ctx;
+        Serial.printf("[Bambu %s] startAnalyseTask: both internal + PSRAM "
+                      "stack alloc failed\n", _cfg.serial.c_str());
+    }
+    return ok;
 }
 
 void BambuPrinter::_maybeRetryAnalysis() {
@@ -1309,11 +1622,7 @@ void BambuPrinter::_maybeRetryAnalysis() {
     // with an FTP-listing fallback. The old "/cache/.3mf" hardcode was
     // a leftover guess that 550'd as soon as Bambu started naming the
     // job something other than empty.
-    auto* ctx = new AnalyseTaskCtx{this, ""};
-    BaseType_t rc = xTaskCreatePinnedToCore(_analyseTaskTrampoline, "ana",
-                                            16384, ctx, 1, nullptr, 0);
-    if (rc != pdPASS) {
-        delete ctx;
+    if (!startAnalyseTask("")) {
         Serial.printf("[Bambu %s] analyse retry task alloc failed\n",
                       _cfg.serial.c_str());
         // Re-arm a longer retry so we don't spin on task-alloc failures.
@@ -1422,6 +1731,7 @@ static void _ftpDebugTrampoline(void* arg) {
     auto* ctx = static_cast<FtpDebugCtx*>(arg);
     ctx->printer->_runFtpDebug(ctx->op, ctx->path, ctx->sink);
     delete ctx;
+    s_ftpDebugSlot.busy = false;
     vTaskDelete(nullptr);
 }
 
@@ -1431,12 +1741,13 @@ bool BambuPrinter::startFtpDebug(const String& op, const String& path,
     if (!sink || !sink->sb) return false;
     _ftpDebugBusy = true;
     auto* ctx = new FtpDebugCtx{this, op, path, sink};
-    BaseType_t rc = xTaskCreatePinnedToCore(_ftpDebugTrampoline, "ftpdbg",
-                                            16384, ctx, 1, nullptr, 0);
-    if (rc != pdPASS) {
+    bool ok = spawnPSRAMFallbackTask(_ftpDebugTrampoline, ctx, "ftpdbg",
+                                     /*core*/0, /*priority*/1, s_ftpDebugSlot);
+    if (!ok) {
         delete ctx;
         _ftpDebugBusy = false;
-        Serial.printf("[Bambu %s] ftp-debug task alloc failed\n", _cfg.serial.c_str());
+        Serial.printf("[Bambu %s] ftp-debug task alloc failed (internal+PSRAM)\n",
+                      _cfg.serial.c_str());
         return false;
     }
     return true;
@@ -1556,24 +1867,17 @@ void BambuPrinter::_handleGcodeStateTransition(const String& prev, const String&
         if (_cfg.track_print_consume && !_analysisInProgress) {
             Serial.printf("[Bambu %s] print started — queuing background analysis\n",
                           _cfg.serial.c_str());
-            // Empty path → analyseRemote auto-resolves from MQTT subtask_name
-    // with an FTP-listing fallback. The old "/cache/.3mf" hardcode was
-    // a leftover guess that 550'd as soon as Bambu started naming the
-    // job something other than empty.
-    auto* ctx = new AnalyseTaskCtx{this, ""};
-            // 16 KiB stack — analyseRemote heap-allocates the analyzer into
-            // PSRAM and writes the result directly into _lastAnalysis, so
-            // the stack holds the PrinterFtp (with its WiFiClientSecure) plus
-            // the ZIP parser's locals and mbedTLS handshake state. 8 KiB
-            // overflowed the first time mbedtls tried a handshake; 16 KiB
-            // leaves headroom without burning an internal-DRAM contiguous
-            // block the size of 24 KiB (which the 30 KiB TLS ctx would then
-            // fail to allocate on top of).
-            BaseType_t rc = xTaskCreatePinnedToCore(_analyseTaskTrampoline, "ana",
-                                                    16384, ctx, 1, nullptr, 0);
-            if (rc != pdPASS) {
-                delete ctx;
-                Serial.printf("[Bambu %s] analysis task alloc failed\n", _cfg.serial.c_str());
+            // Empty path → analyseRemote auto-resolves from MQTT
+            // subtask_name with an FTP-listing fallback. The old
+            // "/cache/.3mf" hardcode was a leftover guess that 550'd
+            // as soon as Bambu started naming the job something other
+            // than empty. startAnalyseTask handles the spawn (internal
+            // stack first, PSRAM-static stack on fallback) so the
+            // RUNNING-edge auto-trigger doesn't get starved by the
+            // contiguous-internal-DRAM crunch we hit mid-print.
+            if (!startAnalyseTask("")) {
+                Serial.printf("[Bambu %s] analysis task alloc failed\n",
+                              _cfg.serial.c_str());
             }
         }
         return;

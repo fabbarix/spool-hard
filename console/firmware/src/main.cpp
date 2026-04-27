@@ -23,6 +23,7 @@
 #include "bambu_discovery.h"
 #include "core_weights.h"
 #include "calibration_presets.h"
+#include "ring_log.h"
 #include "pending_ams.h"
 #include <lvgl.h>   // LV_SYMBOL_* FontAwesome glyphs baked into Montserrat
 #include "scale_discovery.h"
@@ -530,8 +531,11 @@ void setup() {
     // Refresh button on the printer card → re-probe SSDP and force a
     // reconnect on every configured printer. Same payload as the web
     // POST /api/printers/refresh — keeps the LCD and the web in sync.
+    // Also tagged into the dlog ring so a "the button does nothing"
+    // bug report can be verified remotely via /api/logs?tag=ui.
     ui_set_printer_refresh_callback([]() {
         Serial.println("[UI] Printer refresh tapped");
+        dlog("ui", "reconnect tapped: probe + reconnectAll");
         g_bambu_discovery.probe();
         g_bambu.reconnectAll();
     });

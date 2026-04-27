@@ -8,6 +8,49 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.5.9] - 2026-04-27
+
+Print-analysis accuracy + AMS-slot resolution overhaul, plus
+heap-pressure resilience for the FTPS analyser.
+
+- feat(analyzer): parse G2/G3 arc moves. Bambu's slicer rewrites runs
+  of short G1 segments as arcs by default, so the old "G1 only" path
+  was silently under-counting extruded length by ~30 % on any print
+  with curved walls (1.72 m → 1.2 m kind of miss).
+- feat(analyzer): parse `; filament_ids`, `; filament_colour`, and
+  `; filament_density` slicer-header comments into a per-slot table.
+  Densities also override the family-default so gram totals stay
+  accurate on mixed-material prints.
+- feat(analyzer): fetch the `.bbl` companion JSON
+  (`/cache/<N>_<name>.gcode.bbl`) right after the gcode and parse its
+  `ams mapping` array.
+- feat(analyzer): 4-tier slicer-tool → physical-AMS-slot resolver —
+  `.bbl ams_mapping[i]` first, then `filament_ids[i]` matched against
+  each tray's `tray_info_idx` (incl. `vt_tray`), then `filament_colour`
+  RGB-prefix matched against `tray_color`, then the live
+  `active_tray` for single-tool prints. Fixes the case where a
+  single-tool slicer T4 was reporting `tool_idx=4 / ams_unit=-1 /
+  spool_id=""` instead of the loaded AMS slot.
+- feat(analyzer): streaming inflate for ZIP method=8 entries via the
+  ROM-bundled miniz `tinfl_decompress`, with a 32 KiB PSRAM sliding
+  dictionary. Pipes FTP retrieve-range chunks through the inflater so
+  the analyser can read deflated 3MFs without buffering the whole
+  archive in RAM.
+- feat(infra): `BambuPrinter::startAnalyseTask` (and equivalents for
+  the FTP-debug and MQTT-connect tasks) now allocates the FreeRTOS
+  stack in internal DRAM first, falling back to a static PSRAM-backed
+  stack when contiguous internal heap is fragmented (typical mid-print
+  with MQTT pushall + mbedtls + LVGL all live).
+- fix(ui): LCD "Reconnect" button was silently failing under heap
+  pressure because the MQTT-connect task spawn returned `pdFAIL`. The
+  PSRAM fallback above plus a `dlog("ui", "reconnect tapped …")` in
+  the handler make the button work and the failure visible in
+  `/api/logs?tag=ui`.
+- fix(web): `POST /api/printers/<serial>/analyze` now rejects with
+  409 when the printer isn't `RUNNING` or `PAUSE`. Bambu tears the
+  FTPS cache down within seconds of `FINISH` and the task would
+  otherwise race the teardown for an opaque mbedtls error.
+
 ## [0.5.4] - 2026-04-26
 
 Tare + multi-point calibrate directly from the console LCD, plus a

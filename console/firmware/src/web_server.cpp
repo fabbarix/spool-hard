@@ -2304,20 +2304,9 @@ void ConsoleWebServer::_handlePrinterDelete(AsyncWebServerRequest* req) {
 
 // Kick off an FTP+gcode analysis for a printer. The fetch can take seconds so
 // we dispatch it to a short-lived FreeRTOS task on core 0 (network core) and
-// return 202 immediately. Progress is then read via GET /analysis. The task
-// self-destructs once BambuPrinter::analyseRemote() returns.
-struct AnalyzeTaskCtx {
-    BambuPrinter* printer;
-    String        path;
-};
-
-static void _analyzeTaskTrampoline(void* arg) {
-    auto* ctx = static_cast<AnalyzeTaskCtx*>(arg);
-    ctx->printer->analyseRemote(ctx->path);
-    delete ctx;
-    vTaskDelete(nullptr);
-}
-
+// return 202 immediately. Progress is then read via GET /analysis. Spawning
+// goes through BambuPrinter::startAnalyseTask which falls back to a
+// PSRAM-static stack when internal DRAM is fragmented (typical mid-print).
 void ConsoleWebServer::_handlePrinterAnalyzeStart(AsyncWebServerRequest* req,
                                                   uint8_t* data, size_t len) {
     String serial = req->pathArg(0);
@@ -2325,6 +2314,21 @@ void ConsoleWebServer::_handlePrinterAnalyzeStart(AsyncWebServerRequest* req,
     if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
     if (p->analysisInProgress()) {
         req->send(409, "application/json", "{\"error\":\"analysis already running\"}");
+        return;
+    }
+    // Reject when the printer isn't actively running. Bambu starts
+    // tearing the FTPS session down within seconds of FINISH (the
+    // peer sends `connection going to close` mid-fetch), so there's
+    // no point spawning the task — it'd just race the teardown and
+    // fail with an opaque mbedtls error. The auto-trigger on the
+    // IDLE→RUNNING edge is the canonical entry point; this manual
+    // route is for re-trying mid-print after a transient failure.
+    const char* gs = p->state().gcode_state.c_str();
+    bool active = !strcmp(gs, "RUNNING") || !strcmp(gs, "PAUSE");
+    if (!active) {
+        req->send(409, "application/json",
+                  "{\"error\":\"printer not in RUNNING/PAUSE — Bambu closes the "
+                  "cached 3MF after FINISH; analysis can only run during a print\"}");
         return;
     }
     // Empty path → analyseRemote() auto-resolves from MQTT subtask_name
@@ -2338,15 +2342,9 @@ void ConsoleWebServer::_handlePrinterAnalyzeStart(AsyncWebServerRequest* req,
             if (requested.length()) path = requested;
         }
     }
-    auto* ctx = new AnalyzeTaskCtx{p, path};
-    // 16 KB stack — see matching note in bambu_printer.cpp where the
-    // print-start auto-analyse task is spawned; mbedtls handshake + ZIP
-    // parser + PrinterFtp locals tipped over 8 KiB in practice.
-    BaseType_t rc = xTaskCreatePinnedToCore(_analyzeTaskTrampoline, "ana", 16384, ctx,
-                                            1, nullptr, 0);
-    if (rc != pdPASS) {
-        delete ctx;
-        req->send(500, "application/json", "{\"error\":\"task alloc failed\"}");
+    if (!p->startAnalyseTask(path)) {
+        req->send(500, "application/json",
+                  "{\"error\":\"task alloc failed (internal+PSRAM)\"}");
         return;
     }
     req->send(202, "application/json", "{\"ok\":true}");

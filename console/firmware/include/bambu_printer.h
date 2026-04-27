@@ -158,6 +158,16 @@ public:
     // specific file.
     bool analyseRemote(const String& path = "");
 
+    // Non-blocking variant of analyseRemote — spawns a FreeRTOS task
+    // that calls analyseRemote(path) and exits. Tries the internal
+    // heap first; falls back to a PSRAM-backed static stack if
+    // contiguous internal DRAM isn't available (typical mid-print
+    // when MQTT pushall + mbedtls + LVGL crowd the budget). Returns
+    // false only if both internal and PSRAM allocations fail — in
+    // that case the caller can retry later. Used by the web
+    // POST /analyze handler and the auto-trigger on RUNNING edge.
+    bool startAnalyseTask(const String& path);
+
     // Interactive FTP debug — kicks off a background task that runs the
     // requested operation against the printer's FTPS server and pushes
     // NDJSON events (one `{"kind":"trace"...}` or `{"kind":"done"...}` JSON

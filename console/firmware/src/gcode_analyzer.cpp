@@ -13,15 +13,23 @@ void GCodeAnalyzer::reset() {
     _totalMm  = 0.f;
     _swaps    = 0;
     _pctEverSeen = false;
+    _slicerHeaderParsed = false;
     for (int i = 0; i < MAX_TOOLS; ++i) {
         _tools[i] = ToolUsage{};
         _diameters[i] = DEFAULT_DIAMETER;
         _densities[i] = DEFAULT_DENSITY;
+        _slicerSlots[i] = SlicerSlot{};
     }
     for (int p = 0; p < PCT_SLOTS; ++p) {
         for (int i = 0; i < MAX_TOOLS; ++i) _mmAtPct[p][i] = -1.f;
     }
     _lineBuf = "";
+}
+
+const GCodeAnalyzer::SlicerSlot& GCodeAnalyzer::slicerSlot(int idx) const {
+    static const SlicerSlot empty;
+    if (idx < 0 || idx >= MAX_TOOLS) return empty;
+    return _slicerSlots[idx];
 }
 
 void GCodeAnalyzer::setDiameter(int tool, float d) {
@@ -39,6 +47,14 @@ void GCodeAnalyzer::_addExtrusion(float delta_mm) {
 }
 
 void GCodeAnalyzer::_processLine(const String& rawLine) {
+    // Header comments (`; key = ...`) carry slicer→AMS hints we need
+    // for the result packer. Parse them BEFORE the strip-comment step
+    // — once we hit real G-code those don't recur.
+    if (rawLine.length() && rawLine[0] == ';') {
+        if (_maybeParseSlicerHeader(rawLine)) return;
+        // Other comments are noise — fall through and let the strip-
+        // comment step below ignore them.
+    }
     // Strip a trailing comment if any (Bambu uses ';').
     int semi = rawLine.indexOf(';');
     String line = (semi >= 0) ? rawLine.substring(0, semi) : rawLine;
@@ -100,8 +116,13 @@ void GCodeAnalyzer::_processLine(const String& rawLine) {
         return;
     }
 
-    // G1 / G0 moves carry the E parameter we care about.
-    if (line.startsWith("G1 ") || line.startsWith("G0 ")) {
+    // G0 / G1 (linear) and G2 / G3 (CW / CCW arc) all carry an E
+    // parameter when extruding. Bambu's slicer enables arc-fitting by
+    // default — runs of short G1 segments get rewritten as G2/G3
+    // arcs, so dropping them silently under-counts mm by ~30 % on
+    // any print with curved walls (1.72 m → 1.2 m kind of miss).
+    if (line.startsWith("G1 ") || line.startsWith("G0 ") ||
+        line.startsWith("G2 ") || line.startsWith("G3 ")) {
         int ePos = line.indexOf(" E");
         if (ePos < 0) return;
         float e = atof(line.c_str() + ePos + 2);
@@ -186,4 +207,80 @@ float GCodeAnalyzer::gramsAtPct(int pct, int tool) const {
     float den = _densities[tool];
     float area = 3.14159265f * d * d / 4.f;
     return mm * area * den / 1000.f;
+}
+
+// Parse Bambu's `; key = a;b;c[,d…]` slicer-header lines into the
+// per-slot table. Returns true if `rawLine` matched a known key (so
+// the caller can short-circuit the regular G-code path). Bambu is
+// inconsistent with the delimiter — `;` for filament_ids /
+// filament_colour, `,` for filament_density — so we accept either.
+bool GCodeAnalyzer::_maybeParseSlicerHeader(const String& rawLine) {
+    struct Spec {
+        const char* prefix;   // matched against rawLine.startsWith(...)
+        enum Kind { Ids, Colour, Density } kind;
+    };
+    static const Spec specs[] = {
+        { "; filament_ids ",     Spec::Ids     },
+        { "; filament_ids=",     Spec::Ids     },
+        { "; filament_colour ",  Spec::Colour  },
+        { "; filament_colour=",  Spec::Colour  },
+        { "; filament_color ",   Spec::Colour  },   // US spelling, just in case
+        { "; filament_color=",   Spec::Colour  },
+        { "; filament_density ", Spec::Density },
+        { "; filament_density=", Spec::Density },
+    };
+    const Spec* match = nullptr;
+    for (const auto& s : specs) {
+        if (rawLine.startsWith(s.prefix)) { match = &s; break; }
+    }
+    if (!match) return false;
+    int eq = rawLine.indexOf('=');
+    if (eq < 0) return true;   // matched key but no value — consume + ignore
+    String values = rawLine.substring(eq + 1);
+    values.trim();
+
+    int idx = 0;
+    int start = 0;
+    int len = (int)values.length();
+    for (int i = 0; i <= len && idx < MAX_TOOLS; ++i) {
+        bool boundary = (i == len) || values[i] == ';' || values[i] == ',';
+        if (!boundary) continue;
+        String tok = values.substring(start, i);
+        tok.trim();
+        // Trim wrapping double-quotes — filament_settings_id-style
+        // values use them; our three known keys don't, but cheap
+        // safety for possible future additions.
+        if (tok.length() >= 2 && tok[0] == '"' && tok[tok.length() - 1] == '"') {
+            tok = tok.substring(1, tok.length() - 1);
+        }
+        if (tok.length()) {
+            switch (match->kind) {
+                case Spec::Ids:
+                    _slicerSlots[idx].filament_id = tok;
+                    break;
+                case Spec::Colour: {
+                    // Hex like "#FFDE0A" → 0xFFDE0A. Skip leading '#'.
+                    const char* p = tok.c_str();
+                    if (*p == '#') p++;
+                    if (strlen(p) >= 6) {
+                        _slicerSlots[idx].color_rgb =
+                            (uint32_t)strtoul(String(p).substring(0, 6).c_str(), nullptr, 16);
+                    }
+                    break;
+                }
+                case Spec::Density: {
+                    float d = tok.toFloat();
+                    if (d > 0.f) {
+                        _slicerSlots[idx].density = d;
+                        _densities[idx] = d;   // override the family-default
+                    }
+                    break;
+                }
+            }
+        }
+        idx++;
+        start = i + 1;
+    }
+    _slicerHeaderParsed = true;
+    return true;
 }

@@ -46,6 +46,21 @@ public:
     float  mmAtPct(int pct, int tool)   const;
     float  gramsAtPct(int pct, int tool) const;
 
+    // Per-slicer-slot metadata captured from Bambu's gcode header
+    // comments at the top of the file. Indexed by slicer project-
+    // filament index (0-based — matches the gcode's `T<n>` numbering).
+    // Used by the result packer to map T<n> → physical AMS slot when
+    // the .bbl manifest's `ams mapping` isn't available, and to
+    // override the per-tool density with the slicer's exact value
+    // for accurate gram totals on mixed-material prints.
+    struct SlicerSlot {
+        String   filament_id;   // "GFG00" — matches AMS tray's tray_info_idx
+        uint32_t color_rgb = 0; // 0xRRGGBB; 0 means "no colour parsed"
+        float    density   = 0.f; // g/cm³; 0 means "no density parsed"
+    };
+    const SlicerSlot& slicerSlot(int idx) const;
+    bool              slicerHeaderParsed() const { return _slicerHeaderParsed; }
+
 private:
     int        _active = 0;
     float      _lastE  = 0.f;      // last seen absolute E (from G1/G92)
@@ -68,6 +83,18 @@ private:
     // buffer until we hit '\n'.
     String _lineBuf;
 
+    // Slicer header metadata (one entry per project-filament slot in
+    // Bambu Studio). Populated as we encounter `; filament_ids =` /
+    // `; filament_colour =` / `; filament_density =` comment lines at
+    // the top of the gcode. _slicerHeaderParsed flips true on the
+    // first such match so callers know whether to trust the table.
+    SlicerSlot _slicerSlots[MAX_TOOLS];
+    bool       _slicerHeaderParsed = false;
+
     void _processLine(const String& line);
     void _addExtrusion(float delta_mm);
+    // Try to parse a header `; key = a;b;c[;d…]` line into slicer-slot
+    // metadata. Returns true if the line matched and was consumed (so
+    // _processLine can skip the normal G-code branch).
+    bool _maybeParseSlicerHeader(const String& rawLine);
 };
