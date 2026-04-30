@@ -42,6 +42,74 @@ const char kSpoolHardVersionMarker[] = SPOOLHARD_VERSION_MARKER;
 // lambdas (which compile inside _setupRoutes below) can reach them.
 extern UserFilamentsStore  g_user_filaments;
 extern StockFilamentsStore g_stock_filaments;
+extern ScaleLink           g_scale;
+
+// One-line diagnostic snapshot — heap, PSRAM, WiFi, every printer's MQTT
+// link, scale handshake. Pushed through dlog so it's visible via
+// `/api/logs` after the fact, even if Serial wasn't attached. Cheap (cached
+// state reads only) so safe to call at every entry/exit of a suspect
+// handler.
+//
+// Added to chase a "console loses link to printer + scale during filament
+// onboarding" report: the suspect is heap pressure or main-loop starvation
+// while a synchronous Bambu Cloud call runs in an AsyncWebServer handler.
+// The snapshot at the start vs. end of each cloud handler tells us which
+// of free_heap / psram_free / mqtt-last-report-ms / scale-handshake moved.
+static void _diagSnapshot(const char* phase) {
+    String mqtt;
+    uint32_t now = millis();
+    for (auto& up : g_bambu.printers()) {
+        if (mqtt.length()) mqtt += ",";
+        const auto& s = up->state();
+        const char* link = "?";
+        switch (s.link) {
+            case BambuLinkState::Disconnected: link = "disc"; break;
+            case BambuLinkState::Connecting:   link = "conn"; break;
+            case BambuLinkState::Connected:    link = "ok";   break;
+            case BambuLinkState::Failed:       link = "fail"; break;
+        }
+        long ago = s.last_report_ms ? (long)(now - s.last_report_ms) : -1;
+        mqtt += String(up->config().name) + "=" + link
+              + "/r" + String(ago) + "ms";
+    }
+    if (mqtt.isEmpty()) mqtt = "none";
+    const char* sc = "?";
+    switch (g_scale.handshake()) {
+        case ScaleLink::Handshake::Encrypted:    sc = "enc";  break;
+        case ScaleLink::Handshake::Unencrypted:  sc = "plain";break;
+        case ScaleLink::Handshake::Failed:       sc = "fail"; break;
+        case ScaleLink::Handshake::Disconnected: sc = "down"; break;
+    }
+    dlog("Diag", "%s heap=%u psram=%u rssi=%d scale=%s mqtt=[%s]",
+         phase,
+         (unsigned)ESP.getFreeHeap(),
+         (unsigned)ESP.getFreePsram(),
+         (int)WiFi.RSSI(),
+         sc,
+         mqtt.c_str());
+}
+
+// RAII tracer: snapshots at ctor (start) and dtor (end-with-elapsed) so
+// every return path of a wrapped handler is captured without sprinkling
+// _diagSnapshot calls before each `return`. Uses a tag of the form
+// "<op>-start" / "<op>-end <ms>ms".
+namespace {
+struct _DiagTrace {
+    const char* op;
+    uint32_t    t0;
+    char        startBuf[40];
+    char        endBuf[48];
+    explicit _DiagTrace(const char* op_) : op(op_), t0(millis()) {
+        snprintf(startBuf, sizeof(startBuf), "%s-start", op);
+        _diagSnapshot(startBuf);
+    }
+    ~_DiagTrace() {
+        snprintf(endBuf, sizeof(endBuf), "%s-end %lums", op,
+                 (unsigned long)(millis() - t0));
+        _diagSnapshot(endBuf);
+    }
+};
+}  // namespace
 
 void ConsoleWebServer::begin()  {
     // The %p reference forces the linker to retain kSpoolHardVersionMarker.
@@ -455,6 +523,32 @@ void ConsoleWebServer::_setupRoutes() {
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handlePrinterFtpDebug(req, data, len);
+        });
+    // Wipe the cached FTPS data-channel quirk learned for one printer. Use
+    // when a firmware update has flipped the printer's session-reuse
+    // behaviour and you want to force re-discovery on the next FTPS open
+    // instead of waiting for the self-healing fallback to kick in.
+    _server.on("^\\/api\\/printers\\/([^/]+)\\/ftp-quirks\\/reset$", HTTP_POST,
+        [this](AsyncWebServerRequest* req) {
+            if (!_requireAuth(req)) return;
+            String serial = req->pathArg(0);
+            if (serial.isEmpty()) {
+                req->send(400, "application/json", "{\"error\":\"serial required\"}");
+                return;
+            }
+            // NVS keys are <=15 chars; serials happen to be exactly 15.
+            String key = serial.length() <= 15 ? serial : serial.substring(0, 15);
+            Preferences p;
+            p.begin(NVS_NS_FTP_QUIRKS, /*ro*/false);
+            bool existed = p.isKey(key.c_str());
+            if (existed) p.remove(key.c_str());
+            p.end();
+            JsonDocument resp;
+            resp["ok"]      = true;
+            resp["existed"] = existed;
+            resp["serial"]  = serial;
+            String out; serializeJson(resp, out);
+            req->send(200, "application/json", out);
         });
 
     // Registered before the `^\/api\/printers\/(.+)$` GET regex so the
@@ -1326,6 +1420,7 @@ void ConsoleWebServer::_handleSpoolGet(AsyncWebServerRequest* req) {
 }
 
 void ConsoleWebServer::_handleSpoolPost(AsyncWebServerRequest* req, uint8_t* data, size_t len) {
+    _DiagTrace _trace("spool-post");
     if (!_requireAuth(req)) return;
     if (!_store) { req->send(503, "application/json", "{\"error\":\"store unavailable\"}"); return; }
     JsonDocument doc;
@@ -1415,6 +1510,7 @@ void ConsoleWebServer::_handleUserFilamentGet(AsyncWebServerRequest* req) {
 
 void ConsoleWebServer::_handleUserFilamentPost(AsyncWebServerRequest* req,
                                                uint8_t* data, size_t len) {
+    _DiagTrace _trace("user-filament-write");
     if (!_requireAuth(req)) return;
     JsonDocument doc;
     if (deserializeJson(doc, data, len)) {
@@ -1649,6 +1745,7 @@ void ConsoleWebServer::_handleUserFilamentsCloudSyncStatus(AsyncWebServerRequest
 }
 
 void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) {
+    _DiagTrace _trace("cloud-push");
     if (!g_bambu_cloud.haveToken()) {
         req->send(400, "application/json",
                   "{\"error\":\"no Bambu Cloud token configured\"}");
@@ -1722,6 +1819,7 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
 }
 
 void ConsoleWebServer::_handleUserFilamentCloudDetail(AsyncWebServerRequest* req) {
+    _DiagTrace _trace("cloud-detail");
     if (!g_bambu_cloud.haveToken()) {
         req->send(400, "application/json",
                   "{\"error\":\"no Bambu Cloud token configured\"}");
@@ -1922,6 +2020,7 @@ RefreshResult refreshPublicCache(int& entriesOut, String& errMsgOut) {
 }  // namespace
 
 void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
+    _DiagTrace _trace("cloud-by-name");
     if (!g_bambu_cloud.haveToken()) {
         req->send(400, "application/json",
                   "{\"error\":\"no Bambu Cloud token configured\"}");
@@ -2036,6 +2135,7 @@ void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
 }
 
 void ConsoleWebServer::_handleCloudPresetById(AsyncWebServerRequest* req) {
+    _DiagTrace _trace("cloud-preset");
     if (!g_bambu_cloud.haveToken()) {
         req->send(400, "application/json",
                   "{\"error\":\"no Bambu Cloud token configured\"}");
@@ -2107,6 +2207,7 @@ void ConsoleWebServer::_handleCloudPublicCacheGet(AsyncWebServerRequest* req) {
 }
 
 void ConsoleWebServer::_handleCloudPublicCacheRefresh(AsyncWebServerRequest* req) {
+    _DiagTrace _trace("cloud-cache-refresh");
     if (!g_bambu_cloud.haveToken()) {
         req->send(400, "application/json",
                   "{\"error\":\"no Bambu Cloud token configured\"}");

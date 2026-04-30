@@ -21,6 +21,7 @@
 #include "bambu_manager.h"
 #include "bambu_cloud.h"
 #include "bambu_discovery.h"
+#include "mbedtls_psram_alloc.h"
 #include "core_weights.h"
 #include "calibration_presets.h"
 #include "ring_log.h"
@@ -140,6 +141,13 @@ void setup() {
     delay(200);
     Serial.printf("\n[Main] SpoolHardConsole fw %s starting\n", FW_VERSION);
 
+    // Route mbedtls allocations to PSRAM before anything TLS-touching runs
+    // (MQTT to Bambu printers, OTA HTTPS, Bambu Cloud REST, FTPS analyzer).
+    // Without this, internal DRAM exhausts on the first onboarding cloud
+    // fetch that piles on top of the always-on MQTT connection — AsyncTCP
+    // and PubSubClient both lose their connections.
+    mbedtls_install_psram_alloc();
+
     // Filesystems
     if (!SPIFFS.begin(true)) {
         Serial.println("[Main] SPIFFS mount failed");
@@ -207,6 +215,10 @@ void setup() {
     // rescan flow: open the spool-detail screen + arm PendingAms so the
     // next AMS-load auto-assigns to the just-created spool.
     ui_wizard_set_save_callback([](const String& spool_id) {
+        dlog("Wizard", "save id=%s heap=%u psram=%u",
+             spool_id.c_str(),
+             (unsigned)ESP.getFreeHeap(),
+             (unsigned)ESP.getFreePsram());
         SpoolRecord rec;
         if (!g_store.findById(spool_id, rec)) {
             ui_show_home();
@@ -255,6 +267,7 @@ void setup() {
     // Scale link: SSDP-discovered, WebSocket client.
     g_scale.begin();
     g_scale.onConnect([]() {
+        dlog("Scale", "WS connected (heap=%u)", (unsigned)ESP.getFreeHeap());
         JsonDocument d; d["connected"] = true;
         g_web.broadcastDebug("scale_link", d);
         // Pull the scale's current weight immediately. The scale only
@@ -266,6 +279,7 @@ void setup() {
         g_scale.requestCurrentWeight();
     });
     g_scale.onDisconnect([]() {
+        dlog("Scale", "WS disconnected (heap=%u)", (unsigned)ESP.getFreeHeap());
         JsonDocument d; d["connected"] = false;
         g_web.broadcastDebug("scale_link", d);
     });

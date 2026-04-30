@@ -1,6 +1,8 @@
 #include "printer_ftp.h"
+#include "mbedtls_psram_alloc.h"
+#include "config.h"          // NVS_NS_FTP_QUIRKS, FTP_REUSE_*
 #include <WiFi.h>
-#include <esp_heap_caps.h>
+#include <Preferences.h>
 #include <algorithm>      // std::rotate
 #include <ctype.h>        // isdigit
 
@@ -8,33 +10,28 @@
 // can stash in _lastError. mbedtls_strerror needs MBEDTLS_ERROR_C in the
 // build; arduino-esp32's mbedtls config has it, so we use the real one.
 #include <mbedtls/error.h>
-#include <mbedtls/platform.h>
 
-// PSRAM-preferring calloc/free for mbedtls. Arduino-esp32's mbedtls 2.28
-// pre-allocates ~32 KB of in+out buffers per ssl_context at setup time,
-// and the FTPS session-reuse pattern needs control AND data contexts
-// live simultaneously — that's ~64 KB of contiguous internal DRAM,
-// which the ESP32-S3 just doesn't have free mid-session. PSRAM has
-// nearly 2 MB free, so we route calloc through there. AES ops in PSRAM
-// are slower (~4-5×) but FTPS payloads are bulk-copied, not crypto-
-// hot, and the alternative (recompile mbedtls with VARIABLE_BUFFER) is
-// out of reach from a sketch. Override is global; installed once and
-// left in place — other mbedtls users (MQTT, OTA HTTPS, cloud sync)
-// inherit the same allocator without behavioural change beyond
-// throughput.
-static void* _psram_calloc(size_t n, size_t size) {
-    size_t bytes = n * size;
-    void* p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) p = heap_caps_calloc(n, size, MALLOC_CAP_DEFAULT);  // fallback DRAM
-    (void)bytes;
-    return p;
+// NVS keys are capped at 15 chars; Bambu serials are exactly 15 chars
+// (e.g. "0938AJ622700835"). Use the serial directly as the key.
+static String _ftpQuirkKey(const String& serial) {
+    return serial.length() <= 15 ? serial : serial.substring(0, 15);
 }
-static void _psram_free(void* p) { heap_caps_free(p); }
-static bool _mbed_alloc_overridden = false;
-static void _install_psram_alloc_once() {
-    if (_mbed_alloc_overridden) return;
-    mbedtls_platform_set_calloc_free(_psram_calloc, _psram_free);
-    _mbed_alloc_overridden = true;
+
+static uint8_t _loadFtpReuseQuirk(const String& serial) {
+    if (serial.isEmpty()) return FTP_REUSE_UNKNOWN;
+    Preferences p;
+    p.begin(NVS_NS_FTP_QUIRKS, /*ro*/true);
+    uint8_t v = p.getUChar(_ftpQuirkKey(serial).c_str(), FTP_REUSE_UNKNOWN);
+    p.end();
+    return v;
+}
+
+static void _saveFtpReuseQuirk(const String& serial, uint8_t v) {
+    if (serial.isEmpty()) return;
+    Preferences p;
+    p.begin(NVS_NS_FTP_QUIRKS, /*ro*/false);
+    p.putUChar(_ftpQuirkKey(serial).c_str(), v);
+    p.end();
 }
 
 static String _mbedErr(int rc) {
@@ -75,7 +72,7 @@ void PrinterFtp::_emit(const char* step, int code, const String& text) {
 
 bool PrinterFtp::_initMbedtlsOnce() {
     if (_mbed_inited) return true;
-    _install_psram_alloc_once();   // before any mbedtls_*_init
+    mbedtls_install_psram_alloc();   // before any mbedtls_*_init (idempotent)
     mbedtls_entropy_init(&_entropy);
     mbedtls_ctr_drbg_init(&_drbg);
     mbedtls_ssl_config_init(&_conf);
@@ -101,6 +98,12 @@ bool PrinterFtp::_initMbedtlsOnce() {
     // 32 KiB-buffered contexts — ssl_setup() returns SSL_ALLOC_FAILED.
     // 4096-byte records work fine for FTPS payloads.
     mbedtls_ssl_conf_max_frag_len(&_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
+    // Cap any blocking read at 15 s so a stuck data-channel handshake
+    // can't wedge the analyzer for the full TCP connect-timeout window.
+    // H2S, in particular, silently drops the data connection when the
+    // ClientHello carries a session ID; without this we'd wait ~5 minutes
+    // before deciding to fall back to a fresh handshake.
+    mbedtls_ssl_conf_read_timeout(&_conf, 15000);
     _mbed_inited = true;
     return true;
 }
@@ -200,6 +203,21 @@ bool PrinterFtp::connect(const IPAddress& ip, const String& access_code,
     _ip  = ip;
     _sni = sni_hostname;
     _lastError = "";
+
+    // Hydrate the data-channel reuse preference learned on a previous
+    // FTP session. Saves us the 15-second fallback round-trip every time
+    // we connect to a printer whose quirk we already know.
+    uint8_t learned = _loadFtpReuseQuirk(sni_hostname);
+    if (learned == FTP_REUSE_WORKS) {
+        _data_reuse_known = true;
+        _data_reuse_works = true;
+    } else if (learned == FTP_REUSE_FRESH) {
+        _data_reuse_known = true;
+        _data_reuse_works = false;
+    } else {
+        _data_reuse_known = false;
+        _data_reuse_works = true;   // optimistic: try the X1/H2D path first
+    }
 
     if (!_initMbedtlsOnce()) return false;
     _resetCtrl();
@@ -310,13 +328,13 @@ bool PrinterFtp::_parsePasv(const String& line, IPAddress& ip, uint16_t& port) {
     return true;
 }
 
-bool PrinterFtp::_openDataChannel(mbedtls_net_context* data_net,
-                                  mbedtls_ssl_context* data_ssl) {
+// Phase 1: PASV + TCP connect to the data port + ssl_init/setup. NO
+// handshake, NO session-reuse / SNI binding yet — those go in phase 2 so
+// each retry attempt starts from a clean slate (mbedtls won't let you
+// switch session reuse on/off after handshake start).
+bool PrinterFtp::_openDataTcp(mbedtls_net_context* data_net,
+                              mbedtls_ssl_context* data_ssl) {
     if (!_ctrl_open) { _lastError = "control closed"; return false; }
-    if (!_ctrl_session_saved) {
-        _lastError = "no saved control session — connect() not run?";
-        return false;
-    }
 
     // PASV — Bambu's data port is one-shot per PASV.
     int code = mbedtls_ssl_write(&_ctrl_ssl, (const unsigned char*)"PASV\r\n", 6);
@@ -342,45 +360,101 @@ bool PrinterFtp::_openDataChannel(mbedtls_net_context* data_net,
         mbedtls_net_free(data_net);
         return false;
     }
-    rc = mbedtls_ssl_setup(data_ssl, &_conf);
+    _emit("data tcp", 0, dip.toString() + ":" + String(dport));
+    return true;
+}
+
+// Phase 2: TLS handshake on a TCP-connected data socket. Caller has
+// already issued the data-transfer command (LIST/RETR/STOR) on the
+// control channel and read its 150 reply — so vsftpd is ready to drive
+// the server-side handshake on the data port. Auto-discovers and caches
+// whether this printer accepts session reuse vs. requires a fresh
+// handshake.
+bool PrinterFtp::_doDataHandshake(mbedtls_net_context* data_net,
+                                  mbedtls_ssl_context* data_ssl) {
+    // Cached preference: try learned mode first; on failure, self-heal
+    // by tearing down ssl state and retrying with the other mode.
+    if (_data_reuse_known) {
+        if (_doDataHandshakeOnce(data_net, data_ssl, _data_reuse_works)) return true;
+        _emit("data handshake retry", 0,
+              _data_reuse_works
+                ? "cached reuse path failed — trying fresh handshake"
+                : "cached fresh path failed — trying session reuse");
+        // Tear down + re-init the ssl context: a half-failed handshake
+        // can't be re-driven into a fresh handshake on the same context,
+        // and session reuse settings can't be flipped after setup.
+        mbedtls_ssl_free(data_ssl);
+        mbedtls_ssl_init(data_ssl);
+        if (_doDataHandshakeOnce(data_net, data_ssl, !_data_reuse_works)) {
+            _data_reuse_works = !_data_reuse_works;
+            _saveFtpReuseQuirk(_sni,
+                _data_reuse_works ? FTP_REUSE_WORKS : FTP_REUSE_FRESH);
+            return true;
+        }
+        return false;
+    }
+
+    // First-ever attempt for this printer: try reuse, fall back to fresh.
+    if (_doDataHandshakeOnce(data_net, data_ssl, /*use_session_reuse*/true)) {
+        _data_reuse_known = true;
+        _data_reuse_works = true;
+        _saveFtpReuseQuirk(_sni, FTP_REUSE_WORKS);
+        return true;
+    }
+    _emit("data handshake retry", 0, "session reuse failed — trying fresh handshake");
+    mbedtls_ssl_free(data_ssl);
+    mbedtls_ssl_init(data_ssl);
+    if (_doDataHandshakeOnce(data_net, data_ssl, /*use_session_reuse*/false)) {
+        _data_reuse_known = true;
+        _data_reuse_works = false;
+        _saveFtpReuseQuirk(_sni, FTP_REUSE_FRESH);
+        return true;
+    }
+    return false;
+}
+
+bool PrinterFtp::_doDataHandshakeOnce(mbedtls_net_context* data_net,
+                                      mbedtls_ssl_context* data_ssl,
+                                      bool use_session_reuse) {
+    if (use_session_reuse && !_ctrl_session_saved) {
+        _lastError = "no saved control session — connect() not run?";
+        return false;
+    }
+
+    int rc = mbedtls_ssl_setup(data_ssl, &_conf);
     if (rc != 0) {
         _lastError = "data ssl_setup " + _mbedErr(rc);
-        mbedtls_ssl_free(data_ssl);
-        mbedtls_net_free(data_net);
         return false;
     }
     if (_sni.length()) {
         rc = mbedtls_ssl_set_hostname(data_ssl, _sni.c_str());
         if (rc != 0) {
             _lastError = "data set_hostname " + _mbedErr(rc);
-            mbedtls_ssl_free(data_ssl);
-            mbedtls_net_free(data_net);
             return false;
         }
     }
-    // The whole point — resume the control session so Bambu's FTPS
-    // daemon accepts the data handshake.
-    rc = mbedtls_ssl_set_session(data_ssl, &_ctrl_session);
-    if (rc != 0) {
-        _lastError = "data set_session " + _mbedErr(rc);
-        mbedtls_ssl_free(data_ssl);
-        mbedtls_net_free(data_net);
-        return false;
+    if (use_session_reuse) {
+        rc = mbedtls_ssl_set_session(data_ssl, &_ctrl_session);
+        if (rc != 0) {
+            _lastError = "data set_session " + _mbedErr(rc);
+            return false;
+        }
     }
-    mbedtls_ssl_set_bio(data_ssl, data_net, mbedtls_net_send, mbedtls_net_recv, NULL);
+    // BIO is the data_net set up in phase 1. Use the timeout-aware recv
+    // path so a stuck handshake bails after the configured 15 s.
+    mbedtls_ssl_set_bio(data_ssl, data_net,
+                        mbedtls_net_send, NULL, mbedtls_net_recv_timeout);
 
     while ((rc = mbedtls_ssl_handshake(data_ssl)) != 0) {
         if (rc != MBEDTLS_ERR_SSL_WANT_READ && rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            _lastError = "data handshake " + _mbedErr(rc) + " (session reuse rejected?)";
+            const char* mode = use_session_reuse ? " (session reuse rejected?)" : " (fresh handshake)";
+            _lastError = "data handshake " + _mbedErr(rc) + mode;
             _emit("data handshake", -1, _lastError);
-            mbedtls_ssl_close_notify(data_ssl);
-            mbedtls_ssl_free(data_ssl);
-            mbedtls_net_free(data_net);
             return false;
         }
     }
     _emit("data handshake", 0,
-          String("ok ") + dip.toString() + ":" + String(dport));
+          use_session_reuse ? "ok (resumed)" : "ok (fresh)");
     return true;
 }
 
@@ -399,28 +473,41 @@ bool PrinterFtp::_openDataAndRetrieve(const String& path, uint32_t offset,
                                       std::function<bool(mbedtls_ssl_context&)> reader) {
     mbedtls_net_context data_net;
     mbedtls_ssl_context data_ssl;
-    if (!_openDataChannel(&data_net, &data_ssl)) return false;
+    // Phase 1: PASV + TCP only — H2S won't drive the data-port TLS
+    // handshake until the control side has issued RETR (curl on OpenSSL
+    // does the same dance). X1/H2D tolerate either order.
+    if (!_openDataTcp(&data_net, &data_ssl)) return false;
 
-    // REST <offset> for range requests. Sent on control AFTER data
-    // channel is up so PASV's port stays valid.
+    // REST <offset> for range requests. Goes on control before RETR.
     bool did_rest = false;
     if (offset > 0) {
         char buf[32]; snprintf(buf, sizeof(buf), "REST %u", offset);
         if (_sendCmd(buf) == 350) did_rest = true;
     }
 
-    // RETR — server replies 150 (or 125) on control.
+    // RETR on control — server replies 150 (or 125), then starts driving
+    // the data-port TLS handshake.
     String retr = "RETR " + path + "\r\n";
     int rc = mbedtls_ssl_write(&_ctrl_ssl, (const unsigned char*)retr.c_str(), retr.length());
     if (rc < 0) {
         _lastError = "RETR write " + _mbedErr(rc);
-        _closeData(&data_net, &data_ssl);
+        mbedtls_ssl_free(&data_ssl);
+        mbedtls_net_free(&data_net);
         return false;
     }
     int retr_code = _readResponse();
     if (retr_code != 150 && retr_code != 125) {
         _lastError = "RETR rejected (got " + String(retr_code) + ")";
-        _closeData(&data_net, &data_ssl);
+        mbedtls_ssl_free(&data_ssl);
+        mbedtls_net_free(&data_net);
+        return false;
+    }
+
+    // Phase 2: now do the TLS handshake on the data port.
+    if (!_doDataHandshake(&data_net, &data_ssl)) {
+        mbedtls_net_free(&data_net);
+        // Drain whatever the server sends on control after data abort.
+        _readResponse();
         return false;
     }
 
@@ -543,13 +630,15 @@ bool PrinterFtp::listDir(const String& path, std::vector<String>& out) {
     out.clear();
     mbedtls_net_context data_net;
     mbedtls_ssl_context data_ssl;
-    if (!_openDataChannel(&data_net, &data_ssl)) return false;
+    // Phase 1: PASV + data-port TCP connect only.
+    if (!_openDataTcp(&data_net, &data_ssl)) return false;
 
     String cmd = "LIST " + path + "\r\n";
     int rc = mbedtls_ssl_write(&_ctrl_ssl, (const unsigned char*)cmd.c_str(), cmd.length());
     if (rc < 0) {
         _lastError = "LIST write " + _mbedErr(rc);
-        _closeData(&data_net, &data_ssl);
+        mbedtls_ssl_free(&data_ssl);
+        mbedtls_net_free(&data_net);
         return false;
     }
     String body;
@@ -557,7 +646,16 @@ bool PrinterFtp::listDir(const String& path, std::vector<String>& out) {
     _emit(("LIST " + path).c_str(), list_code, body);
     if (list_code != 150 && list_code != 125) {
         _lastError = "LIST rejected (got " + String(list_code) + ")";
-        _closeData(&data_net, &data_ssl);
+        mbedtls_ssl_free(&data_ssl);
+        mbedtls_net_free(&data_net);
+        return false;
+    }
+
+    // Phase 2: TLS handshake on the data port AFTER server has accepted
+    // LIST — H2S's vsftpd drives the handshake only after this point.
+    if (!_doDataHandshake(&data_net, &data_ssl)) {
+        mbedtls_net_free(&data_net);
+        _readResponse();   // drain whatever the server says on control
         return false;
     }
 

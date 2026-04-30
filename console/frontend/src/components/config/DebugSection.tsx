@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bug, Pause, Play, Trash2, Copy, Zap, CheckCircle2, XCircle, Loader2, FolderOpen, Download } from 'lucide-react';
+import { Bug, Pause, Play, Trash2, Copy, Zap, CheckCircle2, XCircle, Loader2, FolderOpen, Download, Eraser } from 'lucide-react';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { Button } from '@spoolhard/ui/components/Button';
 import { useWebSocket, type DebugEntry } from '@spoolhard/ui/providers/WebSocketProvider';
@@ -196,8 +196,31 @@ function FtpDebugRow({ p }: { p: Printer }) {
   const [trace, setTrace]   = useState<FtpTraceLine[]>([]);
   const [done, setDone]     = useState<FtpDoneLine | null>(null);
   const [error, setError]   = useState<string | null>(null);
+  const [quirkMsg, setQuirkMsg] = useState<string | null>(null);
 
   const running = op !== '' && !done;
+
+  // Force the firmware to re-probe whether this printer's FTPS daemon
+  // accepts data-channel session reuse. Use after a printer firmware
+  // update if the cached preference is stale and the self-healing
+  // fallback's 15 s extra round-trip is annoying.
+  const resetQuirks = async () => {
+    setQuirkMsg(null);
+    try {
+      const r = await fetch(`/api/printers/${encodeURIComponent(p.serial)}/ftp-quirks/reset`, {
+        method: 'POST',
+      });
+      const payload = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setQuirkMsg(payload.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      setQuirkMsg(payload.existed ? 'cleared' : 'no entry');
+      setTimeout(() => setQuirkMsg(null), 3000);
+    } catch (e) {
+      setQuirkMsg(String(e));
+    }
+  };
 
   const start = async (nextOp: 'probe' | 'list' | 'download') => {
     setTrace([]);
@@ -285,6 +308,20 @@ function FtpDebugRow({ p }: { p: Printer }) {
           <Button variant="secondary" onClick={() => start('download')} disabled={running} className="!py-1 !px-2">
             <Download size={13} className="mr-1 inline" />Download
           </Button>
+          <Button
+            variant="secondary"
+            onClick={resetQuirks}
+            disabled={running}
+            className="!py-1 !px-2"
+            title="Forget the cached TLS-session-reuse preference for this printer (re-probes on the next FTPS open)"
+          >
+            <Eraser size={13} className="mr-1 inline" />Reset quirks
+          </Button>
+          {quirkMsg && (
+            <span className="inline-flex items-center gap-1 text-xs text-text-muted">
+              {quirkMsg}
+            </span>
+          )}
           {running && (
             <span className="inline-flex items-center gap-1 text-xs text-text-muted ml-auto">
               <Loader2 size={12} className="animate-spin" />

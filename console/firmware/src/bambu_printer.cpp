@@ -221,7 +221,8 @@ void BambuPrinter::_ensureConnected() {
     if (_connectTaskState == ConnectTaskState::Done) {
         _connectTaskState = ConnectTaskState::Idle;
         if (_connectTaskResult && _mqtt->connected()) {
-            Serial.printf("[Bambu %s] Connected\n", _cfg.serial.c_str());
+            dlog("Bambu", "%s connected (heap=%u)",
+                 _cfg.serial.c_str(), (unsigned)ESP.getFreeHeap());
             _state.link = BambuLinkState::Connected;
             _state.error_message = "";
             String topic = "device/" + _cfg.serial + "/report";
@@ -232,12 +233,23 @@ void BambuPrinter::_ensureConnected() {
             char err[32];
             snprintf(err, sizeof(err), "mqtt rc=%d", _mqtt->state());
             _state.error_message = err;
-            Serial.printf("[Bambu %s] Connect failed: %s\n", _cfg.serial.c_str(), err);
+            dlog("Bambu", "%s connect failed: %s (heap=%u)",
+                 _cfg.serial.c_str(), err, (unsigned)ESP.getFreeHeap());
         }
         return;
     }
     if (_connectTaskState == ConnectTaskState::Pending) return;
     if (_mqtt->connected()) return;
+
+    // Surface unexpected MQTT drops (we WERE Connected, link is now down).
+    // Includes the PubSubClient internal state code so a -2 / -3 / -4 in the
+    // log feed lets us tell heap exhaustion / TLS reset / keepalive timeout
+    // apart after the fact.
+    if (_state.link == BambuLinkState::Connected) {
+        dlog("Bambu", "%s link dropped: rc=%d heap=%u",
+             _cfg.serial.c_str(), _mqtt->state(),
+             (unsigned)ESP.getFreeHeap());
+    }
 
     uint32_t now = millis();
     if (now - _lastConnectAttemptMs < 5000) return;
@@ -842,10 +854,13 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
     String payload;
     serializeJson(doc, payload);
     String topic = "device/" + _cfg.serial + "/request";
-    _mqtt->publish(topic.c_str(), payload.c_str());
-    Serial.printf("[Bambu %s] ams_filament_setting → AMS %d slot %d (%s %s, %u-%u°C)\n",
-                  _cfg.serial.c_str(), ams_unit, slot_id,
-                  rec.material_type.c_str(), color.c_str(), tmin, tmax);
+    bool ok = _mqtt->publish(topic.c_str(), payload.c_str());
+    dlog("Bambu", "%s ams_filament_setting AMS=%d slot=%d %s %s %u-%u°C "
+                  "pub=%s len=%u heap=%u",
+         _cfg.serial.c_str(), ams_unit, slot_id,
+         rec.material_type.c_str(), color.c_str(), tmin, tmax,
+         ok ? "ok" : "FAIL", (unsigned)payload.length(),
+         (unsigned)ESP.getFreeHeap());
 }
 
 // ----------------------------------------------------------------------------

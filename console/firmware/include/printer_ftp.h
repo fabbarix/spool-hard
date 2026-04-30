@@ -84,6 +84,17 @@ private:
     mbedtls_ssl_session _ctrl_session;
     bool                _ctrl_session_saved = false;
 
+    // Some Bambu firmwares (X1/H2D) reject a fresh data-channel handshake
+    // and demand TLS session resumption from the control channel — RFC 4217
+    // style. Newer firmwares (H2S, internal model "O1S") flipped that and
+    // silently hang for ~5 minutes if the data ClientHello carries a session
+    // ID hint. We try the X1/H2D mode first (matches existing fleet) and
+    // fall back to fresh handshake on failure; the result is cached for the
+    // lifetime of this PrinterFtp object so subsequent listDir / RETR /
+    // SIZE calls don't retry the wrong mode every time.
+    bool _data_reuse_known = false;
+    bool _data_reuse_works = true;   // optimistic default = old behaviour
+
     // For the data channel's TLS handshake — the SNI hostname is the
     // printer's serial (cert CN), kept around between login and each
     // data-channel open.
@@ -105,13 +116,24 @@ private:
     bool _initMbedtlsOnce();
     void _resetCtrl();          // clear control ssl/net contexts (no resource leak)
 
-    // Open one data-channel TLS connection by reissuing PASV and
-    // resuming `_ctrl_session`. On success, `data_net` and `data_ssl`
-    // are connected and TLS-handshaked; caller is responsible for
-    // tearing them down via `_closeData()` once the data transfer is
-    // done. Returns false on any failure with `_lastError` set.
-    bool _openDataChannel(mbedtls_net_context* data_net,
+    // Open one data-channel TLS connection. Two-phase so the caller can
+    // slot the data-transfer command (LIST/RETR/STOR) onto the control
+    // channel BETWEEN the data-port TCP connect and the data-port TLS
+    // handshake — H2S's vsftpd refuses to process the queued ClientHello
+    // until the control channel has issued a transfer command (curl on
+    // OpenSSL does it the same way). Older firmwares (X1/H2D) tolerate
+    // either order.
+    //
+    // Both phases honour the cached per-printer reuse preference (NVS
+    // `ftp_quirks` keyed by serial). If the cached preference fails, the
+    // wrapper retries with the opposite mode and updates the cache.
+    bool _openDataTcp(mbedtls_net_context* data_net,
+                      mbedtls_ssl_context* data_ssl);
+    bool _doDataHandshake(mbedtls_net_context* data_net,
                           mbedtls_ssl_context* data_ssl);
+    bool _doDataHandshakeOnce(mbedtls_net_context* data_net,
+                              mbedtls_ssl_context* data_ssl,
+                              bool use_session_reuse);
     void _closeData(mbedtls_net_context* data_net,
                     mbedtls_ssl_context* data_ssl);
 

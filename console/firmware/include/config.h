@@ -91,6 +91,15 @@
 #define NVS_NS_PRINTERS      "printers_cfg"
 #define NVS_KEY_PRINTERS_LIST "list"
 
+// Per-printer learned FTPS quirks. Key = printer serial (15 chars,
+// matches NVS key length cap). Value = uint8 enum:
+//   0 = unknown, 1 = data-channel reuse works (X1/H2D),
+//   2 = data-channel reuse hangs — use fresh handshake (H2S).
+#define NVS_NS_FTP_QUIRKS    "ftp_quirks"
+#define FTP_REUSE_UNKNOWN    0
+#define FTP_REUSE_WORKS      1
+#define FTP_REUSE_FRESH      2
+
 // Display.
 #define NVS_NS_DISPLAY         "display_cfg"
 #define NVS_KEY_DISP_SLEEP_S   "sleep_s"
