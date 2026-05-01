@@ -365,6 +365,11 @@ void BambuPrinter::_onMessage(const char* /*topic*/, uint8_t* payload, unsigned 
     }
     _parseReport(doc);
     _state.last_report_ms = millis();
+    // Push the freshly-updated printers list to all WS clients. Rate-
+    // gated to ≤ 2 Hz inside broadcastState so a fast-pushing H2S can't
+    // flood the queue. Whole-list push is simpler than per-printer
+    // diff and matches the React Query cache key the dashboard reads.
+    g_web.pushPrintersList();
 }
 
 void BambuPrinter::_parseReport(const JsonDocument& doc) {
@@ -1372,6 +1377,10 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             result.progress_bytes = (uint32_t)total;
             result.running_grams  = analyzer.totalGrams();
             result.running_mm     = analyzer.totalMm();
+            // Push to WS clients — rate-gated to ≤ 4 Hz inside
+            // broadcastState so this fires per-chunk but the actual
+            // serialize+send only happens 4× per second at most.
+            g_web.pushPrinterAnalysis(*this);
             return true;
         });
     } else if (data_method == 0) {
@@ -1383,6 +1392,7 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             result.progress_bytes = consumed;
             result.running_grams  = analyzer.totalGrams();
             result.running_mm     = analyzer.totalMm();
+            g_web.pushPrinterAnalysis(*this);
             return true;
         });
     } else {
@@ -1411,7 +1421,7 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
         } st = { inflator, dict, 0, 0, data_length, &analyzer, true, "" };
 
         ok = ftp.retrieveRange(path, data_offset, data_length,
-                               [&st, &result, &analyzer](const uint8_t* d, size_t n) {
+                               [&st, &result, &analyzer, this](const uint8_t* d, size_t n) {
             const uint8_t* in_ptr = d;
             size_t         in_remain = n;
             st.consumed_in += n;
@@ -1423,6 +1433,7 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             result.progress_bytes = st.consumed_in;
             result.running_grams  = analyzer.totalGrams();
             result.running_mm     = analyzer.totalMm();
+            g_web.pushPrinterAnalysis(*this);
             // Inner loop: a single FTP chunk may contain bytes that
             // produce multiple output windows (e.g. when the
             // decompressed stream is much larger than the compressed
@@ -1625,6 +1636,10 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
     result.valid        = true;
     // `result` is already a reference to `_lastAnalysis`, so no copy needed.
     _analysisInProgress = false;
+    // Final push — `valid=true` now, in_progress=false. The rate-limit
+    // gate could swallow this if a recent in_progress push consumed the
+    // 250 ms slot. Use the forced-push variant to guarantee delivery.
+    g_web.pushPrinterAnalysisForce(*this);
 
     Serial.printf("[Bambu %s] analysis ok: %d tools, total %.1fg%s\n",
                   _cfg.serial.c_str(), emitted, result.total_grams,

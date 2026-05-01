@@ -198,7 +198,7 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, label, external }: {
       <button
         type="button"
         onClick={() => setPicking(true)}
-        className={`group relative overflow-hidden rounded-md border text-left transition-all hover:border-brand-400/60 ${active ? 'border-brand-500 ring-1 ring-brand-500/30' : 'border-surface-border'} ${isEmpty ? 'bg-surface-card/40' : 'bg-surface-card'}`}
+        className={`group relative overflow-hidden rounded-md border text-left transition-all hover:border-brand-400/60 h-full flex flex-col ${active ? 'border-brand-500 ring-1 ring-brand-500/30' : 'border-surface-border'} ${isEmpty ? 'bg-surface-card/40' : 'bg-surface-card'}`}
         title={title}
       >
         {/* Color swatch — dominates the card when populated, leaving a
@@ -233,11 +233,15 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, label, external }: {
           </div>
         </div>
 
-        {/* Data strip — weight + K, truncate-friendly */}
-        <div className="px-2 py-1.5 text-xs space-y-0.5">
-          {subtitle && (
-            <div className="text-text-muted truncate">{subtitle}</div>
-          )}
+        {/* Data strip — weight + K, truncate-friendly. Always reserves the
+            subtitle line (even when the slot has no brand/colour mapped)
+            so all four AMS cards line up at the same height in the grid.
+            mt-auto pushes the strip to the bottom when the card is
+            stretched by a taller sibling. */}
+        <div className="px-2 py-1.5 text-xs space-y-0.5 mt-auto">
+          <div className="text-text-muted truncate min-h-[1em]">
+            {subtitle || ' '}
+          </div>
           <div className="flex items-baseline gap-2 font-mono tabular-nums">
             <span className="text-brand-400">
               {weightG != null ? `${weightG} g` : <span className="text-text-muted">— g</span>}

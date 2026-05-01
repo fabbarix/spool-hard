@@ -45,6 +45,20 @@ extern UserFilamentsStore  g_user_filaments;
 extern StockFilamentsStore g_stock_filaments;
 extern ScaleLink           g_scale;
 
+// Forward declarations for the static resource-serializer helpers,
+// which are defined further down alongside their HTTP-handler peers.
+// The push methods near the top of the file need to call them.
+class BambuPrinter;
+struct PrinterConfig;
+static void serializePrinter (JsonObject out, const PrinterConfig& cfg, const BambuPrinter* p);
+static void serializeAnalysis(JsonObject doc, BambuPrinter* p);
+static void serializeScaleLink(JsonObject doc, ScaleLink* sc);
+static void serializeWifiStatus(JsonDocument& doc);
+static void serializeOtaStatus(JsonDocument& doc, ScaleLink* sc);
+static void serializeFirmwareInfo(JsonDocument& doc);
+static void serializeDiscoveryPrinters(JsonDocument& doc);
+static void serializeDiscoveryScales(JsonDocument& doc, ScaleLink* sc);
+
 // One-line diagnostic snapshot — heap, PSRAM, WiFi, every printer's MQTT
 // link, scale handshake. Pushed through dlog so it's visible via
 // `/api/logs` after the fact, even if Serial wasn't attached. Cheap (cached
@@ -133,6 +147,200 @@ void ConsoleWebServer::broadcastDebug(const String& type, const JsonDocument& pa
     _ws.textAll(out);
 }
 
+// Per-resource rate-limit table for broadcastState. Producers that fire
+// at high rates (analyzer FTPS chunk callbacks at 5–20 Hz, MQTT pushall
+// state updates at 1 Hz with bursts) get a min-interval gate so the WS
+// queue doesn't flood under load. Edge-only producers (spool upsert,
+// scale-link transitions, OTA phase changes) are absent from the table
+// and bypass the gate entirely.
+namespace {
+struct StateRateLimit { const char* key; uint32_t min_interval_ms; uint32_t last_ms; };
+static StateRateLimit s_stateRates[] = {
+    {"printers",          500, 0},     // MQTT pushall ~1 Hz; UI doesn't need >2 Hz
+    {"printer_analysis",  250, 0},     // FTPS chunk callbacks 5–20 Hz
+    {"wifi_status",     30000, 0},     // RSSI bucket changes only
+    {"firmware_info",   30000, 0},     // heap fluctuates continuously
+    {"ota",              5000, 0},     // periodic-check completion + edge updates
+    {"discovery_printers", 2000, 0},   // SSDP NOTIFY can burst on flap
+    {"discovery_scales",   2000, 0},
+};
+
+static bool _stateRateGate(const char* resource) {
+    uint32_t now = millis();
+    for (auto& r : s_stateRates) {
+        if (strcmp(r.key, resource) != 0) continue;
+        if (r.last_ms != 0 && (now - r.last_ms) < r.min_interval_ms) return false;
+        r.last_ms = now;
+        return true;
+    }
+    return true;   // not in table = no gate
+}
+}  // namespace
+
+void ConsoleWebServer::broadcastState(const char* resource, const JsonDocument& payload) {
+    if (_ws.count() == 0) return;
+    if (!_stateRateGate(resource)) return;
+    JsonDocument env;
+    String type = "state.";
+    type += resource;
+    env["type"] = type;
+    env["data"] = payload;
+    String out;
+    serializeJson(env, out);
+    _ws.textAll(out);
+}
+
+// Resource push helpers — each serializes via the same static helper
+// the matching HTTP handler uses, so the WS-pushed payload is byte-
+// identical to what `useQuery`'s `queryFn` would have fetched. The rate
+// gate inside `broadcastState` decides whether the actual send happens.
+void ConsoleWebServer::pushPrintersList() {
+    if (_ws.count() == 0) return;   // skip serialization when nobody's listening
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (const auto& cfg : g_printers_cfg.list()) {
+        JsonObject row = arr.add<JsonObject>();
+        serializePrinter(row, cfg, g_bambu.find(cfg.serial));
+    }
+    broadcastState("printers", doc);
+}
+
+void ConsoleWebServer::pushScaleLink() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    serializeScaleLink(doc.to<JsonObject>(), _scale);
+    broadcastState("scale_link", doc);
+}
+
+void ConsoleWebServer::pushPrinterAnalysis(const BambuPrinter& printer) {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    serializeAnalysis(doc.to<JsonObject>(), const_cast<BambuPrinter*>(&printer));
+    broadcastState("printer_analysis", doc);
+}
+
+void ConsoleWebServer::pushPrinterAnalysisForce(const BambuPrinter& printer) {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    serializeAnalysis(doc.to<JsonObject>(), const_cast<BambuPrinter*>(&printer));
+    // Bypass the rate gate by emitting the envelope directly. Reaches
+    // the same wire shape `broadcastState` would produce.
+    JsonDocument env;
+    env["type"] = "state.printer_analysis";
+    env["data"] = doc;
+    String out;
+    serializeJson(env, out);
+    _ws.textAll(out);
+}
+
+void ConsoleWebServer::pushSpoolsList() {
+    if (_ws.count() == 0) return;
+    if (!_store) return;
+    // Cap at 200 records — matches the canonical query key the
+    // dashboard reads, and keeps a runaway count from blowing the WS
+    // payload past the per-client queue's per-frame budget. Beyond 200
+    // the UI uses paginated HTTP reads anyway.
+    auto rows = _store->list(0, 200, String());
+    JsonDocument doc;
+    doc["total"]  = (unsigned)_store->count();
+    doc["offset"] = 0;
+    doc["limit"]  = 200;
+    JsonArray arr = doc["rows"].to<JsonArray>();
+    for (auto& r : rows) {
+        JsonDocument row; r.toJson(row);
+        arr.add(row);
+    }
+    broadcastState("spools", doc);
+}
+
+void ConsoleWebServer::pushCoreWeights() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (const auto& e : CoreWeights::list()) {
+        JsonObject o = arr.add<JsonObject>();
+        o["brand"]      = e.brand;
+        o["material"]   = e.material;
+        o["advertised"] = e.advertised;
+        o["grams"]      = e.grams;
+        o["updated_ms"] = e.updated_ms;
+    }
+    broadcastState("core_weights", doc);
+}
+
+void ConsoleWebServer::pushOtaStatus() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    serializeOtaStatus(doc, _scale);
+    broadcastState("ota", doc);
+}
+
+void ConsoleWebServer::pushDiscoveryPrinters() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    serializeDiscoveryPrinters(doc);
+    broadcastState("discovery_printers", doc);
+}
+
+void ConsoleWebServer::pushDiscoveryScales() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    serializeDiscoveryScales(doc, _scale);
+    broadcastState("discovery_scales", doc);
+}
+
+void ConsoleWebServer::pushWifiStatus() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    serializeWifiStatus(doc);
+    broadcastState("wifi_status", doc);
+}
+
+void ConsoleWebServer::pushFirmwareInfo() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    serializeFirmwareInfo(doc);
+    broadcastState("firmware_info", doc);
+}
+
+void ConsoleWebServer::pushFilamentsInfo() {
+    if (_ws.count() == 0) return;
+    // Match the exact shape `/api/filaments/info` returns so React Query's
+    // setQueryData lands on the same fields the HTTP queryFn would have.
+    JsonDocument doc;
+    doc["present"]    = false;
+    doc["sd_mounted"] = g_sd.isMounted();
+    if (g_sd.isMounted() && SD.exists(FILAMENTS_PATH)) {
+        File f = SD.open(FILAMENTS_PATH, FILE_READ);
+        if (f) {
+            doc["present"] = true;
+            doc["size"]    = (uint32_t)f.size();
+            doc["mtime_s"] = (uint32_t)f.getLastWrite();
+            f.close();
+        }
+    }
+    broadcastState("filaments_info", doc);
+}
+
+void ConsoleWebServer::pushCloudPublicCache() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    if (g_sd.isMounted()) {
+        File f = SD.open(CLOUD_PUBLIC_CACHE_PATH);
+        if (f) {
+            doc["present"]  = true;
+            doc["size"]     = (uint32_t)f.size();
+            doc["modified"] = (uint32_t)f.getLastWrite();
+            f.close();
+        } else {
+            doc["present"] = false;
+        }
+    } else {
+        doc["present"] = false;
+    }
+    broadcastState("cloud_public_cache", doc);
+}
+
 // ── Auth ─────────────────────────────────────────────────────
 
 bool ConsoleWebServer::_requireAuth(AsyncWebServerRequest* req) {
@@ -179,8 +387,37 @@ void ConsoleWebServer::_handleAuthStatus(AsyncWebServerRequest* req) {
 // ── Routes ───────────────────────────────────────────────────
 
 void ConsoleWebServer::_setupRoutes() {
-    _ws.onEvent([](AsyncWebSocket*, AsyncWebSocketClient*, AwsEventType,
-                   void*, uint8_t*, size_t) {});
+    // Auth gate on the WS upgrade. The handshake handler runs BEFORE
+    // the upgrade is committed; returning false makes ESPAsyncWebServer
+    // 401 the request. Same `?key=` semantics the HTTP routes use via
+    // _requireAuth, so a single stored key gates both transports.
+    // No-op when no key is configured (matches HTTP behaviour).
+    _ws.handleHandshake([](AsyncWebServerRequest* req) -> bool {
+        Preferences prefs;
+        prefs.begin(NVS_NS_WIFI, true);
+        String stored = prefs.getString(NVS_KEY_FIXED_KEY, "");
+        prefs.end();
+        if (stored.isEmpty() || stored == DEFAULT_FIXED_KEY) return true;
+        if (req->hasParam("key") && req->getParam("key")->value() == stored) return true;
+        return false;
+    });
+    _ws.onEvent([](AsyncWebSocket* server, AsyncWebSocketClient* client,
+                   AwsEventType type, void*, uint8_t*, size_t) {
+        if (type == WS_EVT_CONNECT) {
+            // Drop frames instead of closing on a full per-client queue
+            // (default 32 messages). State-update broadcasts can come
+            // faster than a slow tab can drain them; we'd rather lose
+            // a frame and let the next state push reconcile than tear
+            // down the connection. Per-client setting, applied here.
+            client->setCloseClientOnQueueFull(false);
+            Serial.printf("[WS] Client #%u connected from %s (total=%u)\n",
+                          client->id(), client->remoteIP().toString().c_str(),
+                          server->count());
+        } else if (type == WS_EVT_DISCONNECT) {
+            Serial.printf("[WS] Client #%u disconnected (total=%u)\n",
+                          client->id(), server->count());
+        }
+    });
     _server.addHandler(&_ws);
 
     // Always-open auth probe. Never 401s; reports whether a key is set and
@@ -966,6 +1203,7 @@ void ConsoleWebServer::_setupRoutes() {
                     // wizard's New Filament picker will see the new
                     // rows on next open.
                     g_stock_filaments.reload();
+                    pushFilamentsInfo();
                 }
             }
         }
@@ -1037,6 +1275,7 @@ void ConsoleWebServer::_setupRoutes() {
             req->send(500, "application/json", "{\"error\":\"delete failed\"}");
             return;
         }
+        pushFilamentsInfo();
         req->send(200, "application/json", "{\"ok\":true}");
     });
 
@@ -1139,8 +1378,9 @@ void ConsoleWebServer::_handleDeviceName(AsyncWebServerRequest* req) {
     req->send(200, "application/json", r);
 }
 
-void ConsoleWebServer::_handleWifiStatus(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
+// Same shape `/api/wifi-status` returns. Shared between the HTTP
+// handler and `pushWifiStatus()` so the wire bytes are identical.
+static void serializeWifiStatus(JsonDocument& doc) {
     Preferences prefs;
     prefs.begin(NVS_NS_WIFI, true);
     bool configured = prefs.isKey(NVS_KEY_SSID);
@@ -1148,12 +1388,17 @@ void ConsoleWebServer::_handleWifiStatus(AsyncWebServerRequest* req) {
     prefs.end();
 
     bool connected = (WiFi.status() == WL_CONNECTED);
-    JsonDocument doc;
     doc["configured"] = configured && !ssid.isEmpty();
     doc["connected"]  = connected;
     doc["ssid"]       = connected ? WiFi.SSID() : ssid;
     doc["ip"]         = connected ? WiFi.localIP().toString() : "";
     doc["rssi"]       = connected ? WiFi.RSSI() : 0;
+}
+
+void ConsoleWebServer::_handleWifiStatus(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    JsonDocument doc;
+    serializeWifiStatus(doc);
     String r; serializeJson(doc, r);
     req->send(200, "application/json", r);
 }
@@ -1202,18 +1447,12 @@ void ConsoleWebServer::_handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t*
     req->send(200, "application/json", s);
 }
 
-// Surface what the periodic checker has learned: the timestamp of the
-// last attempt, its tag, the latest-known versions for each component
-// the device tracks, and a pending-updates summary the React side
-// (and later the LCD banner) can render. Doesn't touch the network —
-// it's all in-memory cache from the last check.
-void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
+// Same shape `/api/ota-status` returns. Shared between the HTTP
+// handler and `pushOtaStatus()`.
+static void serializeOtaStatus(JsonDocument& doc, ScaleLink* sc) {
     OtaConfig cfg; cfg.load();
     auto p = g_ota_checker.pending();
-
-    JsonDocument doc;
-    doc["check_enabled"]    = cfg.check_enabled;
+    doc["check_enabled"]     = cfg.check_enabled;
     doc["check_interval_h"] = cfg.check_interval_h;
     doc["last_check_ts"]    = g_ota_checker.lastCheckTs();
     doc["last_check_status"] = g_ota_checker.lastStatus();
@@ -1241,9 +1480,9 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
     // cache survives disconnects (see ScaleLink::_markDisconnected) so
     // the UI keeps the last-known snapshot until a fresh one arrives.
     JsonObject scale = doc["scale"].to<JsonObject>();
-    bool linkUp = _scale && _scale->isConnected();
-    const auto& sop = _scale ? _scale->scaleOtaPending() : ScaleLink::ScaleOtaPending{};
-    String fwFromHandshake = _scale ? _scale->scaleFirmwareVersion() : String();
+    bool linkUp = sc && sc->isConnected();
+    const auto& sop = sc ? sc->scaleOtaPending() : ScaleLink::ScaleOtaPending{};
+    String fwFromHandshake = sc ? sc->scaleFirmwareVersion() : String();
     // Three-tier link state: offline (no WS), waiting (WS up but we have
     // no version info at all), online (we have at least the current FW
     // version from the ScaleVersion handshake). The OtaPending push from
@@ -1269,15 +1508,20 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
     } else {
         scale["pending"] = false;
     }
-    if (_scale) {
-        const auto& sif = _scale->scaleOtaInFlight();
+    if (sc) {
+        const auto& sif = sc->scaleOtaInFlight();
         if (sif.valid) {
             JsonObject ip = scale["in_progress"].to<JsonObject>();
             ip["kind"]    = sif.kind;
             ip["percent"] = sif.percent;
         }
     }
+}
 
+void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    JsonDocument doc;
+    serializeOtaStatus(doc, _scale);
     String s; serializeJson(doc, s);
     req->send(200, "application/json", s);
 }
@@ -1326,9 +1570,8 @@ void ConsoleWebServer::_handleFixedKeyConfigPost(AsyncWebServerRequest* req, uin
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
-void ConsoleWebServer::_handleFirmwareInfo(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    JsonDocument doc;
+// Same shape `/api/firmware-info` returns. Shared.
+static void serializeFirmwareInfo(JsonDocument& doc) {
     doc["fw_version"]   = FW_VERSION;
     doc["fe_version"]   = FE_VERSION;
     doc["flash_size"]   = ESP.getFlashChipSize();
@@ -1339,8 +1582,14 @@ void ConsoleWebServer::_handleFirmwareInfo(AsyncWebServerRequest* req) {
     doc["free_heap"]    = ESP.getFreeHeap();
     doc["psram_free"]   = ESP.getFreePsram();
     doc["sd_mounted"]   = g_sd.isMounted();
-    doc["sd_total"]     = (double)g_sd.totalBytes();  // 64-bit → JSON double
+    doc["sd_total"]     = (double)g_sd.totalBytes();
     doc["sd_used"]      = (double)g_sd.usedBytes();
+}
+
+void ConsoleWebServer::_handleFirmwareInfo(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    JsonDocument doc;
+    serializeFirmwareInfo(doc);
     String r; serializeJson(doc, r);
     req->send(200, "application/json", r);
 }
@@ -2389,6 +2638,7 @@ void ConsoleWebServer::_handleCloudPublicCacheRefresh(AsyncWebServerRequest* req
             doc["error"]  = why;
             break;
     }
+    if (rr == RefreshResult::Ok) pushCloudPublicCache();
     String out; serializeJson(doc, out);
     int code = (rr == RefreshResult::Ok) ? 200 : 200; // always 200 — frontend reads `status`
     req->send(code, "application/json", out);
@@ -2415,6 +2665,7 @@ void ConsoleWebServer::_handleCloudPublicCacheUpload(AsyncWebServerRequest* req,
             SD.remove(CLOUD_PUBLIC_CACHE_PATH);
             SD.rename(tmpPath, CLOUD_PUBLIC_CACHE_PATH);
             dlog("CloudFil", "public-cache upload: %s", CLOUD_PUBLIC_CACHE_PATH);
+            pushCloudPublicCache();
         }
     }
 }
@@ -2424,6 +2675,7 @@ void ConsoleWebServer::_handleCloudPublicCacheDelete(AsyncWebServerRequest* req)
     if (g_sd.isMounted() && SD.exists(CLOUD_PUBLIC_CACHE_PATH)) {
         removed = SD.remove(CLOUD_PUBLIC_CACHE_PATH);
     }
+    if (removed) pushCloudPublicCache();
     JsonDocument doc;
     doc["ok"]      = true;
     doc["removed"] = removed;
@@ -2600,20 +2852,18 @@ void ConsoleWebServer::_handlePrinterAnalyzeStart(AsyncWebServerRequest* req,
     req->send(202, "application/json", "{\"ok\":true}");
 }
 
-void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    String serial = req->pathArg(0);
-    BambuPrinter* p = g_bambu.find(serial);
-    if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
+// Same shape `/api/printers/<serial>/analysis` returns. Factored so both
+// the HTTP handler and the WS push helper produce bytes-identical
+// payloads — the React Query cache `setQueryData` lands on the same
+// shape `useQuery`'s `queryFn` would have produced.
+static void serializeAnalysis(JsonObject doc, BambuPrinter* p) {
+    if (!p) return;
     const auto& a = p->lastAnalysis();
     const PrinterState& s = p->state();
-    // Current progress clamped to [0..100]; drives the live `grams_consumed`
-    // lookup. -1 (no report yet) collapses to 0 so the web UI can still
-    // render "0.0 / X g" while we wait for the first MQTT tick.
     int pct = s.progress_pct;
     if (pct < 0)   pct = 0;
     if (pct > 100) pct = 100;
-    JsonDocument doc;
+    doc["serial"]        = p->config().serial;   // for per-key dispatch on the WS side
     doc["in_progress"]   = p->analysisInProgress();
     doc["valid"]         = a.valid;
     doc["path"]          = a.path;
@@ -2625,10 +2875,6 @@ void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
     doc["has_pct_table"] = a.has_pct_table;
     doc["progress_pct"]  = pct;
     doc["gcode_state"]   = s.gcode_state;
-    // Live counters — meaningful while in_progress=true so the web UI can
-    // render a per-second progress bar instead of a mystery spinner. Stay
-    // populated post-completion (last snapshot) which is harmless since
-    // total_grams/total_mm are then the authoritative final values.
     doc["progress_bytes"]       = (uint32_t)a.progress_bytes;
     doc["progress_total_bytes"] = (uint32_t)a.progress_total_bytes;
     doc["running_grams"]        = (float)a.running_grams;
@@ -2645,8 +2891,6 @@ void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
         row["spool_id"] = t.spool_id;
         row["material"] = t.material;
         row["color"]    = t.color;
-        // Live consumption: exact from the M73 table when present, otherwise
-        // linear. Mirrors the logic in BambuPrinter::_commitIncrementalConsumption.
         float consumed = 0.f;
         if (a.valid && t.tool_idx >= 0 && t.tool_idx < 16) {
             if (a.has_pct_table) {
@@ -2657,6 +2901,15 @@ void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
         }
         row["grams_consumed"] = consumed;
     }
+}
+
+void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    String serial = req->pathArg(0);
+    BambuPrinter* p = g_bambu.find(serial);
+    if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
+    JsonDocument doc;
+    serializeAnalysis(doc.to<JsonObject>(), p);
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }
@@ -2762,9 +3015,8 @@ void ConsoleWebServer::_handlePrinterRefresh(AsyncWebServerRequest* req) {
     req->send(200, "application/json", body);
 }
 
-void ConsoleWebServer::_handleDiscoveryPrinters(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    JsonDocument doc;
+// Same shape `/api/discovery/printers` returns. Shared.
+static void serializeDiscoveryPrinters(JsonDocument& doc) {
     JsonArray arr = doc.to<JsonArray>();
     uint32_t now = millis();
     for (const auto& e : g_bambu_discovery.entries()) {
@@ -2775,6 +3027,12 @@ void ConsoleWebServer::_handleDiscoveryPrinters(AsyncWebServerRequest* req) {
         row["last_seen_ago"] = (int)(now - e.last_seen_ms);
         row["configured"]    = g_printers_cfg.find(e.serial) != nullptr;
     }
+}
+
+void ConsoleWebServer::_handleDiscoveryPrinters(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    JsonDocument doc;
+    serializeDiscoveryPrinters(doc);
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }
@@ -2788,16 +3046,14 @@ static const char* handshakeStr(ScaleLink::Handshake h) {
     }
 }
 
-void ConsoleWebServer::_handleDiscoveryScales(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    JsonDocument doc;
+// Same shape `/api/discovery/scales` returns. Shared.
+static void serializeDiscoveryScales(JsonDocument& doc, ScaleLink* sc) {
     JsonArray arr = doc.to<JsonArray>();
     uint32_t now = millis();
-    String pairedIp    = _scale ? _scale->scaleIp()   : "";
-    String pairedName  = _scale ? _scale->scaleName() : "";
-    bool   pairedConn  = _scale ? _scale->isConnected() : false;
-    const char* pairedHandshake = _scale ? handshakeStr(_scale->handshake()) : "disconnected";
-
+    String pairedIp    = sc ? sc->scaleIp()   : "";
+    String pairedName  = sc ? sc->scaleName() : "";
+    bool   pairedConn  = sc ? sc->isConnected() : false;
+    const char* pairedHandshake = sc ? handshakeStr(sc->handshake()) : "disconnected";
     for (const auto& e : g_scale_discovery.entries()) {
         JsonObject row = arr.add<JsonObject>();
         row["name"]          = e.name;
@@ -2808,6 +3064,12 @@ void ConsoleWebServer::_handleDiscoveryScales(AsyncWebServerRequest* req) {
         row["connected"]     = paired && pairedConn;
         row["handshake"]     = paired ? pairedHandshake : "disconnected";
     }
+}
+
+void ConsoleWebServer::_handleDiscoveryScales(AsyncWebServerRequest* req) {
+    if (!_requireAuth(req)) return;
+    JsonDocument doc;
+    serializeDiscoveryScales(doc, _scale);
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }
@@ -3125,49 +3387,48 @@ void ConsoleWebServer::_handleBambuCloudClear(AsyncWebServerRequest* req) {
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
+// Same shape `/api/scale-link` returns. Factored so the HTTP handler
+// and the WS push helper produce identical payloads.
+static void serializeScaleLink(JsonObject doc, ScaleLink* sc) {
+    if (!sc) {
+        doc["connected"] = false;
+        return;
+    }
+    doc["connected"] = sc->isConnected();
+    doc["handshake"] = handshakeStr(sc->handshake());
+    doc["ip"]        = sc->scaleIp();
+    doc["name"]      = sc->scaleName();
+
+    JsonObject ev = doc["last_event"].to<JsonObject>();
+    if (sc->lastEventMs() > 0) {
+        ev["kind"]       = sc->lastEventKind();
+        ev["detail"]     = sc->lastEventDetail();
+        ev["scale_name"] = sc->lastEventScale();
+        ev["ago_ms"]     = (int)(millis() - sc->lastEventMs());
+    } else {
+        ev["kind"]       = "";
+        ev["detail"]     = "";
+        ev["scale_name"] = "";
+        ev["ago_ms"]     = -1;
+    }
+
+    JsonObject w = doc["weight"].to<JsonObject>();
+    w["precision"] = sc->scalePrecision();
+    if (sc->lastWeightMs() > 0) {
+        w["grams"]  = sc->lastWeightG();
+        w["state"]  = sc->lastWeightState();
+        w["ago_ms"] = (int)(millis() - sc->lastWeightMs());
+    } else {
+        w["grams"]  = 0;
+        w["state"]  = "";
+        w["ago_ms"] = -1;
+    }
+}
+
 void ConsoleWebServer::_handleScaleLinkStatus(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
     JsonDocument doc;
-    if (_scale) {
-        doc["connected"] = _scale->isConnected();
-        doc["handshake"] = handshakeStr(_scale->handshake());
-        doc["ip"]        = _scale->scaleIp();
-        doc["name"]      = _scale->scaleName();
-
-        JsonObject ev = doc["last_event"].to<JsonObject>();
-        if (_scale->lastEventMs() > 0) {
-            ev["kind"]   = _scale->lastEventKind();
-            ev["detail"] = _scale->lastEventDetail();
-            ev["scale_name"] = _scale->lastEventScale();
-            ev["ago_ms"] = (int)(millis() - _scale->lastEventMs());
-        } else {
-            ev["kind"]   = "";
-            ev["detail"] = "";
-            ev["scale_name"] = "";
-            ev["ago_ms"] = -1;
-        }
-
-        // Latest weight snapshot for "capture current weight" in the spool
-        // editor. `state` is the stability signal; the UI will only accept
-        // "stable" as a capture trigger to avoid committing a wobbly reading.
-        // `precision` mirrors the scale's saved decimal-places setting so
-        // the dashboard shows the same precision the scale itself uses
-        // (with the raw float still available for a muted full-precision
-        // fallback alongside).
-        JsonObject w = doc["weight"].to<JsonObject>();
-        w["precision"] = _scale->scalePrecision();
-        if (_scale->lastWeightMs() > 0) {
-            w["grams"]  = _scale->lastWeightG();
-            w["state"]  = _scale->lastWeightState();
-            w["ago_ms"] = (int)(millis() - _scale->lastWeightMs());
-        } else {
-            w["grams"]  = 0;
-            w["state"]  = "";
-            w["ago_ms"] = -1;
-        }
-    } else {
-        doc["connected"] = false;
-    }
+    serializeScaleLink(doc.to<JsonObject>(), _scale);
     String r; serializeJson(doc, r);
     req->send(200, "application/json", r);
 }
@@ -3206,6 +3467,9 @@ void ConsoleWebServer::_handleCoreWeightsPut(AsyncWebServerRequest* req, uint8_t
             "{\"error\":\"brand, material, advertised (>0) and grams (>=0) required\"}");
         return;
     }
+    // Push fires automatically via CoreWeights::onChange — see main.cpp
+    // setup. Same for the DELETE path below and the wizard / capture
+    // sites that mutate via CoreWeights::set.
     CoreWeights::set(brand, material, advertised, grams);
     req->send(200, "application/json", "{\"ok\":true}");
 }

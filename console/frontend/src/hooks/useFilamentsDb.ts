@@ -108,7 +108,9 @@ export function useFilamentsDbInfo() {
   return useQuery<FilamentsDbInfo>({
     queryKey: ['filaments-db-info'],
     queryFn: () => fetch('/api/filaments/info').then((r) => r.json()),
-    refetchInterval: 30_000,
+    // Push-driven via WS `state.filaments_info` — fired on upload /
+    // delete handlers. Polling fallback kept off; the JSONL only
+    // changes on user action.
   });
 }
 

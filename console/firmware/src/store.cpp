@@ -117,6 +117,7 @@ bool SpoolStore::upsert(const SpoolRecord& rec) {
 
     _idIndex[rec.id] = offset;
     if (rec.tag_id.length()) _tagIndex[rec.tag_id] = rec.id;
+    if (_onChange) _onChange();
     return true;
 }
 
@@ -132,6 +133,7 @@ bool SpoolStore::remove(const String& id) {
         _tagIndex.erase(rec.tag_id);
     }
     _idIndex.erase(it);
+    if (_onChange) _onChange();
     return true;
 }
 
@@ -170,6 +172,7 @@ bool SpoolStore::pack() {
     _fs->rename(tmpPath.c_str(), _path.c_str());
     _rebuildIndexes();
     Serial.printf("[Store] Packed, %u records remain\n", (unsigned)_idIndex.size());
+    if (_onChange) _onChange();
     return true;
 }
 

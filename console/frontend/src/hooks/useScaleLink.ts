@@ -27,7 +27,10 @@ export function useScaleLink() {
   return useQuery<ScaleLinkStatus>({
     queryKey: ['scale-link'],
     queryFn: () => fetch('/api/scale-link').then((r) => r.json()),
-    refetchInterval: 2000,
+    // Push-driven via WS `state.scale_link` — fired by ScaleLink on
+    // every recorded event (weight, tag, OTA, version, calibration)
+    // and on every handshake transition. HTTP queryFn covers initial
+    // mount and WS-reconnect invalidation.
   });
 }
 

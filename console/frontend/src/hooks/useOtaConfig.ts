@@ -77,7 +77,13 @@ export function useOtaStatus(opts: { fast?: boolean } = {}) {
   return useQuery<OtaStatusT>({
     queryKey: STATUS_KEY,
     queryFn: () => fetch('/api/ota-status').then((r) => r.json()),
-    refetchInterval: opts.fast ? 2000 : 5000,
+    // Push-driven via WS `state.ota` — fired periodically from main
+    // loop (rate-gated 5s) and on every OTA-config / check / run
+    // mutation. While an OTA is mid-flight the device reboots and the
+    // WS drops; React Query's reconnect-invalidate + the 30s safety
+    // poll below catch that. `fast` is now a hint not a knob — kept
+    // for source compatibility with existing call sites.
+    refetchInterval: opts.fast ? 5000 : 30000,   // safety poll only
     // While the device is rebooting mid-update the request fails. React
     // Query's default `retry: 3 + exponential backoff` would mask the
     // gap; turning it off makes failure surface immediately so the UI

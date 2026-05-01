@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <FS.h>
+#include <functional>
 #include <map>
 #include <vector>
 #include "spool_record.h"
@@ -66,12 +67,20 @@ public:
     // tell the user where bytes land without re-querying NVS).
     void markBackendIsSd(bool b) { _backend_is_sd = b; }
 
+    // Observer for any mutation (upsert / remove / pack). Fires AFTER
+    // the index is updated and the on-disk file is consistent. Single
+    // callback (set-replaces-set) — we only have one observer (the WS
+    // pusher) and a vector of callbacks would be overkill. Set to {}
+    // (default-constructed) to clear.
+    void onChange(std::function<void()> cb) { _onChange = std::move(cb); }
+
 private:
     fs::FS* _fs   = nullptr;
     String  _path;
     Status  _status = Status::NoBackend;
     String  _lastError;
     bool    _backend_is_sd = false;
+    std::function<void()> _onChange;   // fired after upsert/remove/pack
 
     // id → byte offset of start of line in the file
     std::map<String, size_t> _idIndex;

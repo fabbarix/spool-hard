@@ -13,6 +13,19 @@ public:
 
     void broadcastDebug(const String& type, const JsonDocument& payload);
     void broadcastConsoleFrame(const char* dir, const String& frame);
+    // Push-model state update — wraps `payload` in
+    // `{type:"state.<resource>", data:…}` so the frontend's
+    // WebSocketProvider dispatch table can drop it into React-Query's
+    // cache. Mirror of ConsoleWebServer::broadcastState. Only the
+    // resources the scale UI needs are produced (wifi_status, ota,
+    // firmware_info); every push is rate-gated per resource.
+    void broadcastState(const char* resource, const JsonDocument& payload);
+
+    // Resource push helpers. Called periodically from main loop +
+    // edge handlers; the rate gate inside broadcastState handles
+    // throttling. Mirror of the console's helpers.
+    void pushWifiStatus();
+    void pushOtaStatus();
 
     // Called when a direct upload begins. Arg: "firmware" or "spiffs".
     void onUploadStarted(std::function<void(const char* type)> cb) { _onUploadStarted = std::move(cb); }

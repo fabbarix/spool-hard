@@ -9,6 +9,39 @@ import {
 } from 'react';
 import type { RawSample, WeightState, NfcEvent, ConsoleConn, LogEntry, WsMessage } from '../types/websocket';
 import { queryClient } from './QueryProvider';
+import { getStoredKey } from '../utils/authStorage';
+
+// Map of `state.<resource>` wire-types to the React-Query cache key the
+// firmware push should overwrite. Adding a new state resource is one
+// entry here + one matching firmware producer call — no other plumbing.
+//
+// state.printer_analysis is the one shape with a per-key parameter
+// (the printer serial), so it gets a special case in the dispatch
+// rather than living in this table.
+const STATE_TO_QUERY: Record<string, readonly unknown[]> = {
+  'state.printers':            ['printers'],
+  'state.spools':              ['spools', 0, 200, ''],
+  'state.core_weights':        ['core-weights'],
+  'state.scale_link':          ['scale-link'],
+  'state.ota':                 ['ota-status'],
+  'state.firmware_info':       ['firmware-info'],
+  'state.wifi_status':         ['wifi-status'],
+  'state.discovery_printers':  ['discovery-printers'],
+  'state.discovery_scales':    ['discovery-scales'],
+  'state.filaments_info':      ['filaments-db-info'],
+  'state.cloud_public_cache':  ['bambu-cloud-public-cache'],
+};
+
+// Query keys to invalidate on a fresh WS connect (or reconnect after a
+// drop) — these are the live resources where stale data is misleading
+// (a stuck progress bar, an offline-but-shown-online printer). The HTTP
+// `queryFn` re-runs once and the next state push from the firmware
+// corrects course. Other resources ride on whatever change-event happens
+// next; their staleness is bounded by the `30_000` fallback poll.
+const RECONNECT_INVALIDATE: readonly (readonly unknown[])[] = [
+  ['printers'],
+  ['scale-link'],
+];
 
 // Opaque structured debug payload. AMS-raw is the first consumer but
 // keeping this generic lets us plumb additional debug streams later
@@ -75,12 +108,27 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
 
     function connect() {
       if (unmounted) return;
-      const ws = new WebSocket(`ws://${location.host}/ws`);
+      // Carry the stored auth key on the WS handshake. Firmware-side
+      // gate (mirror of `_requireAuth` for HTTP) closes the socket
+      // immediately if the key is set on the device but missing/wrong
+      // here. When no key is configured the device accepts anyone, same
+      // as the HTTP routes — `getStoredKey()` returning null produces
+      // an empty `?key=` which the firmware treats as "no key".
+      const key = getStoredKey() ?? '';
+      const url = `ws://${location.host}/ws?key=${encodeURIComponent(key)}`;
+      const ws = new WebSocket(url);
       wsRef.current = ws;
 
       ws.onopen = () => {
         setIsConnected(true);
         retryDelay.current = 1000;
+        // After a fresh connect (including reconnect), invalidate the
+        // live resources so React Query refetches once via HTTP and
+        // resyncs against the device's current truth. Subsequent
+        // updates flow over the WS via state.* pushes.
+        for (const key of RECONNECT_INVALIDATE) {
+          queryClient.invalidateQueries({ queryKey: key });
+        }
       };
 
       ws.onclose = () => {
@@ -106,6 +154,23 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
         }
 
         const now = new Date().toLocaleTimeString();
+
+        // `state.<resource>` family — push-model cache replacement.
+        // Handled before the typed switch so we don't have to enumerate
+        // every resource in the union.
+        if (typeof msg.type === 'string' && msg.type.startsWith('state.')) {
+          if (msg.type === 'state.printer_analysis') {
+            // Per-printer key ['printer-analysis', <serial>] — extract
+            // serial from the payload and write the rest under that key.
+            const data = msg.data as { serial?: string } | undefined;
+            const serial = data?.serial;
+            if (serial) queryClient.setQueryData(['printer-analysis', serial], data);
+          } else {
+            const queryKey = STATE_TO_QUERY[msg.type];
+            if (queryKey) queryClient.setQueryData(queryKey, msg.data);
+          }
+          return;
+        }
 
         switch (msg.type) {
           case 'raw_sample':

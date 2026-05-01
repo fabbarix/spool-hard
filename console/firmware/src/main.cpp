@@ -253,6 +253,13 @@ void setup() {
             g_store.markBackendIsSd(false);
         }
     }
+    // Wire push-model observers so any spool / core-weights mutation
+    // fans out to all connected WS clients via state.* messages,
+    // regardless of which call site (web POST, wizard, AMS auto-bind,
+    // BambuPrinter::_commitConsumptionTo, etc.) caused it. See
+    // /home/mrwho/.claude/plans/the-web-interface-is-iridescent-acorn.md.
+    g_store.onChange([]() { g_web.pushSpoolsList(); });
+    CoreWeights::onChange([]() { g_web.pushCoreWeights(); });
     // User-managed filament presets (SD-backed; no-op if SD didn't mount).
     g_user_filaments.begin();
     // Stock filament library — read-only JSONL on SD, RAM-cached.
@@ -329,6 +336,9 @@ void setup() {
     // the stale config and the slow 5 s × 30 s TLS retry cycle.
     g_bambu_discovery.setOnSeen([](const BambuDiscovery::Entry& e) {
         g_bambu.onAnnounce(e.serial, e.ip);
+        // Push the discovery list — frontend uses it for the
+        // "Add printer" picker. Rate-gated 2 s to absorb NOTIFY bursts.
+        g_web.pushDiscoveryPrinters();
     });
 
     // Kick one active probe so we don't have to wait the full ~30 s for
@@ -1030,6 +1040,20 @@ void loop() {
         LAT_STEP("ams_panel", _refreshHomeAmsPanel());
         LAT_STEP("home_foot", _refreshHomeFooter());
         LAT_STEP("ota_banner", _refreshOtaBanner());
+
+        // Push the slow-changing infra resources. Each push helper is
+        // rate-gated inside broadcastState (5–30 s gates) so a 1 Hz
+        // call here yields the right effective cadence per resource:
+        //   * ota:           5 s   — captures periodic checker completion
+        //   * discovery:     2 s   — picks up between SSDP NOTIFY bursts
+        //   * wifi/firmware: 30 s  — RSSI bucket / heap sample
+        // Cheap when no WS clients (each helper short-circuits on
+        // _ws.count() == 0).
+        g_web.pushOtaStatus();
+        g_web.pushDiscoveryPrinters();
+        g_web.pushDiscoveryScales();
+        g_web.pushWifiStatus();
+        g_web.pushFirmwareInfo();
     }
     uint32_t __loop_dt = millis() - __loop_t0;
     if (__loop_dt > 100) Serial.printf("[LoopLat] total=%lums\n",

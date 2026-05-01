@@ -53,7 +53,9 @@ export function usePrinters() {
   return useQuery<Printer[]>({
     queryKey: ['printers'],
     queryFn: () => fetch('/api/printers').then((r) => r.json()),
-    refetchInterval: 3000,
+    // Push-driven via WS `state.printers` — see WebSocketProvider.
+    // The HTTP queryFn is only used on initial mount and on WS-reconnect
+    // invalidation (so a long disconnect doesn't leave stale data).
   });
 }
 
@@ -140,16 +142,10 @@ export function usePrinterAnalysis(serial: string | undefined) {
     queryFn: () =>
       fetch(`/api/printers/${encodeURIComponent(serial!)}/analysis`).then((r) => r.json()),
     enabled: !!serial,
-    // Poll fast while the fetch+parse is running OR while the printer is
-    // actively printing (progress_pct advances), so the live "grams
-    // consumed" counter tracks reality with minimal lag.
-    refetchInterval: (q) => {
-      const a = q.state.data;
-      if (!a) return false;
-      if (a.in_progress) return 1500;
-      const active = a.gcode_state === 'RUNNING' || a.gcode_state === 'PAUSE';
-      return active ? 3000 : false;
-    },
+    // Push-driven via WS `state.printer_analysis` — the firmware fires
+    // it at ≤4 Hz during in-progress (rate-gated in broadcastState) and
+    // unconditionally at completion. HTTP queryFn covers the initial
+    // mount and WS-reconnect invalidation only.
   });
 }
 

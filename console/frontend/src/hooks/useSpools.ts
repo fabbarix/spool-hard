@@ -67,7 +67,9 @@ export function useSpools(offset = 0, limit = 50, material?: string) {
   return useQuery<SpoolsPage>({
     queryKey: ['spools', offset, limit, material],
     queryFn: () => fetch(`/api/spools?${params}`).then((r) => r.json()),
-    refetchInterval: 4000,
+    // Push-driven via WS `state.spools` for the canonical (0, 200, '')
+    // entry the dashboard reads. Other paginated reads stay HTTP-only;
+    // mutations invalidate the whole 'spools' tree as before.
   });
 }
 

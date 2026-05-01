@@ -17,6 +17,7 @@ export function useDiscoveredScales() {
   return useQuery<DiscoveredScale[]>({
     queryKey: ['discovery-scales'],
     queryFn: () => fetch('/api/discovery/scales').then((r) => r.json()),
-    refetchInterval: 5000,
+    // Push-driven via WS `state.discovery_scales` — fired periodically
+    // from main loop, rate-gated 2s.
   });
 }

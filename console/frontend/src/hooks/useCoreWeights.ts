@@ -14,16 +14,13 @@ export const coreKey = (e: Pick<CoreWeightEntry, 'brand' | 'material' | 'adverti
   `${e.brand}/${e.material}/${e.advertised}`;
 
 export function useCoreWeights() {
-  // Poll every 4s so entries learned by the LCD wizard surface in the
-  // web UI without a manual refresh. The wizard writes straight to NVS
-  // (CoreWeights::set) and has no way to invalidate the React Query
-  // cache from across the firmware/browser boundary, so the only
-  // alternatives are this poll or wiring a /ws "core-weights changed"
-  // broadcast — overkill for a table this small.
+  // Push-driven via WS `state.core_weights`. The firmware fires it
+  // from CoreWeights::onChange (set/removeKey) so any mutation —
+  // wizard, AMS auto-bind, web POST, scale capture — surfaces
+  // immediately. HTTP queryFn covers initial mount only.
   return useQuery<CoreWeightEntry[]>({
     queryKey: ['core-weights'],
     queryFn: () => fetch('/api/core-weights').then((r) => r.json()),
-    refetchInterval: 4000,
   });
 }
 

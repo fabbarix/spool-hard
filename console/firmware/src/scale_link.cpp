@@ -2,6 +2,7 @@
 #include "config.h"
 #include "ssdp_hub.h"
 #include "scale_secrets.h"
+#include "web_server.h"           // g_web.pushScaleLink()
 #include <Preferences.h>
 #include <WiFi.h>
 #include "serial_mirror.h"
@@ -26,6 +27,11 @@ void ScaleLink::_refreshHandshakeState() {
     if (before != _handshake && _onHandshake) {
         _onHandshake(_handshake, _scaleName);
     }
+    // Push to WS clients on every handshake refresh — covers connect,
+    // disconnect, and key-pair changes. Also fires on no-op refreshes
+    // but the rate gate in broadcastState (no entry for `scale_link` =
+    // no gate, edge-only producer) means each call results in one push.
+    g_web.pushScaleLink();
 }
 
 void ScaleLink::begin() {
@@ -222,6 +228,11 @@ void ScaleLink::_recordEvent(const char* kind, const String& detail) {
     _lastEventMs = millis();
     _lastEventKind = kind;
     _lastEventDetail = detail;
+    // Every dispatched event (weight, tag, ota, calibration, version)
+    // funnels through here and updates last_event_*. Push the new
+    // scale_link snapshot so the dashboard's StatsRow + scale-link
+    // panel update without polling. Edge-only — no rate gate needed.
+    g_web.pushScaleLink();
 }
 
 void ScaleLink::_dispatch(const ScaleToConsole::Message& msg) {

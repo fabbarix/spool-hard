@@ -44,7 +44,8 @@ export function CloudPublicCacheSection() {
   const status = useQuery<CacheStatus>({
     queryKey: ['bambu-cloud-public-cache'],
     queryFn: () => fetch('/api/bambu-cloud/public-cache').then((r) => r.json()),
-    refetchInterval: 30_000,
+    // Push-driven via WS `state.cloud_public_cache` — fired on cache
+    // refresh / upload / delete handlers.
   });
 
   const refresh = useMutation<RefreshResult, Error, void>({

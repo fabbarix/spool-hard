@@ -625,6 +625,12 @@ void loop() {
     pushOtaPendingIfChanged(g_pendingPushPending);
     g_pendingPushPending = false;
 
+    // Browser-WS push for the scale's own dashboard. Each helper is
+    // rate-gated inside broadcastState (5–30 s) and short-circuits when
+    // no clients are connected, so a per-loop call is cheap.
+    g_web.pushOtaStatus();
+    g_web.pushWifiStatus();
+
     // OTA (triggered by console command or UpdateFirmware message)
     if (g_pendingOta) {
         g_pendingOta = false;

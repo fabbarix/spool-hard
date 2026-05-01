@@ -44,6 +44,41 @@ void ScaleWebServer::broadcastConsoleFrame(const char* dir, const String& frame)
     _ws.textAll(out);
 }
 
+// Per-resource rate-limit table for broadcastState. Mirror of the
+// console's table; the scale only needs entries for resources whose
+// producers can fire faster than ~2 Hz. Edge-only producers bypass.
+namespace {
+struct StateRateLimit { const char* key; uint32_t min_interval_ms; uint32_t last_ms; };
+static StateRateLimit s_stateRates[] = {
+    {"wifi_status", 30000, 0},   // RSSI bucket changes only
+    {"ota",          5000, 0},   // periodic-checker completion + edge updates
+};
+
+static bool _stateRateGate(const char* resource) {
+    uint32_t now = millis();
+    for (auto& r : s_stateRates) {
+        if (strcmp(r.key, resource) != 0) continue;
+        if (r.last_ms != 0 && (now - r.last_ms) < r.min_interval_ms) return false;
+        r.last_ms = now;
+        return true;
+    }
+    return true;
+}
+}  // namespace
+
+void ScaleWebServer::broadcastState(const char* resource, const JsonDocument& payload) {
+    if (_ws.count() == 0) return;
+    if (!_stateRateGate(resource)) return;
+    JsonDocument env;
+    String type = "state.";
+    type += resource;
+    env["type"] = type;
+    env["data"] = payload;
+    String out;
+    serializeJson(env, out);
+    _ws.textAll(out);
+}
+
 // ── Route setup ──────────────────────────────────────────────
 
 
@@ -89,20 +124,42 @@ void ScaleWebServer::_handleAuthStatus(AsyncWebServerRequest* req) {
 }
 
 void ScaleWebServer::_setupRoutes() {
-    // Debug WebSocket for live dashboard events. On connect, push a
-    // snapshot of the current console-link state so the dashboard doesn't
-    // sit at "Console N/A" if the console paired before the UI was opened
-    // (the console_conn broadcast otherwise only fires on edge events).
-    _ws.onEvent([](AsyncWebSocket*, AsyncWebSocketClient* client, AwsEventType type,
-                   void*, uint8_t*, size_t) {
-        if (type != WS_EVT_CONNECT) return;
-        JsonDocument env;
-        env["type"] = "console_conn";
-        JsonObject data = env["data"].to<JsonObject>();
-        data["connected"] = g_console.isConnected();
-        if (g_console.isConnected()) data["ip"] = g_console.lastClientIp();
-        String out; serializeJson(env, out);
-        client->text(out);
+    // Auth gate on the WS upgrade. Mirrors `_requireAuth` for HTTP —
+    // both transports gated by the same stored fixed key. Returning
+    // false here makes ESPAsyncWebServer 401 the upgrade.
+    _ws.handleHandshake([](AsyncWebServerRequest* req) -> bool {
+        Preferences prefs;
+        prefs.begin(NVS_NS_WIFI, true);
+        String stored = prefs.getString(NVS_KEY_FIXED_KEY, "");
+        prefs.end();
+        if (stored.isEmpty() || stored == DEFAULT_FIXED_KEY) return true;
+        if (req->hasParam("key") && req->getParam("key")->value() == stored) return true;
+        return false;
+    });
+    // Browser-facing dashboard WebSocket. On connect: push the current
+    // console-link state (so the dashboard doesn't sit at "Console N/A"
+    // if the console paired before the UI was opened — the console_conn
+    // broadcast otherwise only fires on edge events) and switch the
+    // client's queue-full behaviour to drop-on-full so a slow tab can't
+    // cause us to tear down the connection mid-state-push.
+    _ws.onEvent([](AsyncWebSocket* server, AsyncWebSocketClient* client,
+                   AwsEventType type, void*, uint8_t*, size_t) {
+        if (type == WS_EVT_CONNECT) {
+            client->setCloseClientOnQueueFull(false);
+            Serial.printf("[WS] Client #%u connected from %s (total=%u)\n",
+                          client->id(), client->remoteIP().toString().c_str(),
+                          server->count());
+            JsonDocument env;
+            env["type"] = "console_conn";
+            JsonObject data = env["data"].to<JsonObject>();
+            data["connected"] = g_console.isConnected();
+            if (g_console.isConnected()) data["ip"] = g_console.lastClientIp();
+            String out; serializeJson(env, out);
+            client->text(out);
+        } else if (type == WS_EVT_DISCONNECT) {
+            Serial.printf("[WS] Client #%u disconnected (total=%u)\n",
+                          client->id(), server->count());
+        }
     });
     _server.addHandler(&_ws);
 
@@ -654,6 +711,50 @@ void ScaleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
 
     String s; serializeJson(doc, s);
     req->send(200, "application/json", s);
+}
+
+// Resource push helpers — same shape `/api/wifi-status` and
+// `/api/ota-status` return so React Query's setQueryData lands on
+// bytes-identical data.
+void ScaleWebServer::pushWifiStatus() {
+    if (_ws.count() == 0) return;
+    Preferences prefs;
+    prefs.begin(NVS_NS_WIFI, true);
+    bool   configured = prefs.isKey(NVS_KEY_SSID);
+    String ssid       = prefs.getString(NVS_KEY_SSID, "");
+    prefs.end();
+    bool connected = (WiFi.status() == WL_CONNECTED);
+    JsonDocument doc;
+    doc["configured"] = configured && !ssid.isEmpty();
+    doc["connected"]  = connected;
+    doc["ssid"]       = connected ? WiFi.SSID() : ssid;
+    doc["ip"]         = connected ? WiFi.localIP().toString() : "";
+    doc["rssi"]       = connected ? WiFi.RSSI() : 0;
+    broadcastState("wifi_status", doc);
+}
+
+void ScaleWebServer::pushOtaStatus() {
+    if (_ws.count() == 0) return;
+    OtaConfig cfg; cfg.load();
+    auto p = g_ota_checker.pending();
+    JsonDocument doc;
+    doc["check_enabled"]     = cfg.check_enabled;
+    doc["check_interval_h"]  = cfg.check_interval_h;
+    doc["last_check_ts"]     = g_ota_checker.lastCheckTs();
+    doc["last_check_status"] = g_ota_checker.lastStatus();
+    doc["check_in_flight"]   = g_ota_checker.checkInFlight();
+    JsonObject scale = doc["scale"].to<JsonObject>();
+    scale["firmware_current"] = p.firmware_current;
+    scale["firmware_latest"]  = p.firmware_latest;
+    scale["frontend_current"] = p.frontend_current;
+    scale["frontend_latest"]  = p.frontend_latest;
+    scale["pending"]          = p.firmware || p.frontend;
+    if (g_ota_in_flight.valid) {
+        JsonObject ip = scale["in_progress"].to<JsonObject>();
+        ip["kind"]    = g_ota_in_flight.kind;
+        ip["percent"] = g_ota_in_flight.percent;
+    }
+    broadcastState("ota", doc);
 }
 
 void ScaleWebServer::_handleReset(AsyncWebServerRequest* req) {

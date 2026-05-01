@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <functional>
 #include <vector>
 
 // Empty-spool-core weight database.
@@ -44,5 +45,10 @@ bool removeKey(const String& key);
 
 // Return every entry currently stored. Order is unspecified.
 std::vector<Entry> list();
+
+// Observer for any mutation. Single callback (set-replaces-set); used
+// by ConsoleWebServer to push state.core_weights on change. Set to {}
+// to clear.
+void onChange(std::function<void()> cb);
 
 } // namespace CoreWeights

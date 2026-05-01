@@ -19,6 +19,8 @@ export function useFirmwareInfo() {
   return useQuery<FirmwareInfo>({
     queryKey: ['firmware-info'],
     queryFn: () => fetch('/api/firmware-info').then((r) => r.json()),
-    refetchInterval: 5000,
+    // Push-driven via WS `state.firmware_info` — fired periodically
+    // from the firmware's main loop, rate-gated 30s. Heap fluctuates
+    // continuously so a finer cadence isn't useful for the UI.
   });
 }

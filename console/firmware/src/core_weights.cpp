@@ -46,6 +46,12 @@ bool _parseKey(const String& key, String& brand, String& material, int& advertis
 
 namespace CoreWeights {
 
+namespace {
+std::function<void()> s_onChange;
+}
+
+void onChange(std::function<void()> cb) { s_onChange = std::move(cb); }
+
 String keyFor(const String& brand, const String& material, int advertised) {
     return brand + "/" + material + "/" + String(advertised);
 }
@@ -73,6 +79,7 @@ void set(const String& brand, const String& material, int advertised, int grams)
         e["updated_ms"] = millis();
     }
     _saveAll(doc);
+    if (s_onChange) s_onChange();
 }
 
 bool removeKey(const String& key) {
@@ -81,6 +88,7 @@ bool removeKey(const String& key) {
     if (!root[key].is<JsonVariantConst>()) return false;
     root.remove(key);
     _saveAll(doc);
+    if (s_onChange) s_onChange();
     return true;
 }
 

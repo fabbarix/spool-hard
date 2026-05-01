@@ -18,6 +18,56 @@ public:
     AsyncWebServer& server() { return _server; }
 
     void broadcastDebug(const String& type, const JsonDocument& payload);
+    // Push-model state update — wraps `payload` in the
+    // `{type:"state.<resource>", data:…}` envelope that the frontend's
+    // WebSocketProvider dispatch table maps to React-Query cache keys.
+    // Subjects to a per-resource rate-limit gate (see `_stateRateGate`)
+    // so noisy producers (analyzer FTPS chunk callbacks, MQTT pushalls)
+    // can't flood the WS queue. Returns nothing — drop on rate-limit
+    // is silent. Safe to call from any FreeRTOS task; AsyncWebSocket's
+    // textAll() queues internally.
+    void broadcastState(const char* resource, const JsonDocument& payload);
+
+    // Resource-specific push helpers. Each serializes the same shape
+    // its HTTP GET counterpart (`/api/<resource>`) returns and feeds it
+    // through `broadcastState`, so the frontend's setQueryData lands on
+    // bytes-identical data. Called from the firmware's mutation/event
+    // sites — see plan `the-web-interface-is-iridescent-acorn.md`.
+    void pushPrintersList();
+    void pushScaleLink();
+    void pushPrinterAnalysis(const class BambuPrinter& printer);
+    // Same as pushPrinterAnalysis but bypasses the rate-limit gate.
+    // Used at the analysis-complete edge so the in_progress=false /
+    // valid=true terminal frame always lands even if a recent in-flight
+    // push consumed the rate-limit slot.
+    void pushPrinterAnalysisForce(const class BambuPrinter& printer);
+    // Spool DB updates — wired from SpoolStore::onChange. Whole list
+    // pushed (capped to 200 entries — same shape `useSpools(0,200,'')`
+    // bootstraps with). Edge-only producer; no rate gate.
+    void pushSpoolsList();
+    // Core-weights DB updates — fired from /api/core-weights handlers.
+    void pushCoreWeights();
+    // OTA status — fired by OtaChecker/Updater phase changes and from
+    // ScaleLink when its OtaPending cache mutates. Edge-only.
+    void pushOtaStatus();
+    // SSDP discovery results — fired from BambuDiscovery / ScaleDiscovery
+    // onSeen callbacks. Edge-only.
+    void pushDiscoveryPrinters();
+    void pushDiscoveryScales();
+    // Filaments DB metadata — fired after upload/delete of the SD-side
+    // filaments.jsonl. Edge-only.
+    void pushFilamentsInfo();
+    // Cloud public-cache status — fired after refresh/upload/delete.
+    // Edge-only.
+    void pushCloudPublicCache();
+    // WiFi status — periodic broadcast on RSSI bucket change. Rate-
+    // gated to 30 s inside broadcastState so we don't flood on the
+    // ~per-second fluctuations of the underlying RSSI metric.
+    void pushWifiStatus();
+    // Firmware info — fired on settle changes (sd mount/unmount, etc.).
+    // Heap drifts continuously so we don't auto-broadcast on every
+    // change; rate-gated 30 s like wifi_status.
+    void pushFirmwareInfo();
 
     void setStore(SpoolStore* s)      { _store = s; }
     void setScaleLink(ScaleLink* s)   { _scale = s; }

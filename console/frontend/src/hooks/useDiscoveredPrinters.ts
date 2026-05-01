@@ -12,6 +12,8 @@ export function useDiscoveredPrinters() {
   return useQuery<DiscoveredPrinter[]>({
     queryKey: ['discovery-printers'],
     queryFn: () => fetch('/api/discovery/printers').then((r) => r.json()),
-    refetchInterval: 5000,
+    // Push-driven via WS `state.discovery_printers` — fired from
+    // BambuDiscovery::setOnSeen on every NOTIFY/M-SEARCH match plus
+    // a periodic 1 Hz tick. Rate-gated 2s on the firmware side.
   });
 }
