@@ -60,15 +60,26 @@ export default function App() {
       <AuthProvider>
         <ReconnectProvider>
           <WebSocketProvider>
-            <div className="min-h-screen bg-surface-body font-sans text-text-primary selection:bg-brand-500/30">
-              <Header />
-              <NavTabs activeTab={tab} onTabChange={navigate} />
-              <main className="mx-auto max-w-[1100px] p-4">
-                {tab === 'dashboard'     && <DashboardPage />}
-                {tab === 'spools'        && <SpoolsPage />}
-                {tab === 'empty-weights' && <EmptyWeightsPage />}
-                {tab === 'filaments'     && <FilamentsPage />}
-                {tab === 'config'        && <ConfigPage />}
+            {/* App shell — pin Header + NavTabs at the viewport top and let
+                only <main> scroll. Earlier the whole page scrolled, which
+                pushed the WiFi / Scale / WS status pills + tab nav off
+                screen during long pages (Config → Device, Spools, etc).
+                A viewport-height flex column with shrink-0 on the chrome
+                gives a desktop-app feel and keeps the status row always
+                glanceable. */}
+            <div className="h-screen flex flex-col bg-surface-body font-sans text-text-primary selection:bg-brand-500/30">
+              <div className="shrink-0">
+                <Header />
+                <NavTabs activeTab={tab} onTabChange={navigate} />
+              </div>
+              <main className="flex-1 overflow-y-auto">
+                <div className="mx-auto max-w-[1100px] p-4">
+                  {tab === 'dashboard'     && <DashboardPage />}
+                  {tab === 'spools'        && <SpoolsPage />}
+                  {tab === 'empty-weights' && <EmptyWeightsPage />}
+                  {tab === 'filaments'     && <FilamentsPage />}
+                  {tab === 'config'        && <ConfigPage />}
+                </div>
               </main>
             </div>
             <ReconnectOverlay />

@@ -52,11 +52,19 @@ export default function App() {
       <AuthProvider>
         <ReconnectProvider>
           <WebSocketProvider>
-            <div className="min-h-screen bg-surface-body font-sans text-text-primary selection:bg-brand-500/30">
-              <Header />
-              <NavTabs activeTab={tab} onTabChange={navigate} />
-              <main className="mx-auto max-w-[1100px] p-4">
-                {tab === 'dashboard' ? <DashboardPage /> : <ConfigPage />}
+            {/* App shell — pin Header + NavTabs at the viewport top, only
+                <main> scrolls. Same shape as the console's App.tsx; keeps
+                the WiFi / link / WS pills and tab row always visible
+                regardless of how long the active page is. */}
+            <div className="h-screen flex flex-col bg-surface-body font-sans text-text-primary selection:bg-brand-500/30">
+              <div className="shrink-0">
+                <Header />
+                <NavTabs activeTab={tab} onTabChange={navigate} />
+              </div>
+              <main className="flex-1 overflow-y-auto">
+                <div className="mx-auto max-w-[1100px] p-4">
+                  {tab === 'dashboard' ? <DashboardPage /> : <ConfigPage />}
+                </div>
               </main>
             </div>
             <ReconnectOverlay />
