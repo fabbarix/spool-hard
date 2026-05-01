@@ -71,6 +71,12 @@ public:
     // CurrentWeight response. Default 1 until the scale announces itself so
     // there's always a sensible value to render with.
     int           scalePrecision()   const { return _scalePrecision; }
+    // Scale's reported firmware version (from the ScaleVersion handshake
+    // message it pushes on every connect). Empty until the first message
+    // arrives; persisted across WS flaps the same way scaleOtaPending() is
+    // — a flap rarely changes versions and the cached value is strictly
+    // more useful than blanking the OTA panel.
+    const String& scaleFirmwareVersion() const { return _scaleFirmwareVersion; }
 
     // Callbacks — called from main loop after update() drains the WS queue.
     void onConnect(VoidCb cb)      { _onConnect = std::move(cb); }
@@ -202,6 +208,7 @@ private:
     // Display precision announced by the scale (0..4 decimals). 1 is a
     // sensible pre-handshake default — matches the scale's own default.
     int      _scalePrecision  = 1;
+    String   _scaleFirmwareVersion;   // populated from ScaleVersion msg
 
     VoidCb     _onConnect;
     VoidCb     _onDisconnect;

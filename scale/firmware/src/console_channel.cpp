@@ -35,7 +35,18 @@ void ConsoleChannel::_handleEvent(AsyncWebSocket*, AsyncWebSocketClient* client,
             _lastIp = client->remoteIP().toString();
             Serial.printf("[Console] Client connected #%u from %s (total=%d)\n",
                           client->id(), _lastIp.c_str(), _clientCount);
-            if (_clientCount == 1 && _onConnected) _onConnected(_lastIp);
+            // Fire on EVERY connect, not just the 0→1 transition. The
+            // 0→1 gate left a stale-count hole: when the console reboots
+            // ungracefully (no clean WS close), the scale doesn't observe
+            // a disconnect, _clientCount stays >0, and the new connection
+            // arrives as 1→2 — never crossing the gate. The handshake
+            // messages (ScaleVersion / CalibrationStatus / OtaPending)
+            // never fire and the console's OTA panel sits on "scale
+            // waiting" until the scale itself reboots. Each new client
+            // wants its own handshake regardless; the messages are
+            // broadcast (sent to all clients), so an existing console
+            // re-receiving them is harmless — versions don't change.
+            if (_onConnected) _onConnected(_lastIp);
             break;
         }
         case WS_EVT_DISCONNECT: {

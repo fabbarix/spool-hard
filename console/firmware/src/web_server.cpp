@@ -1243,7 +1243,15 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
     JsonObject scale = doc["scale"].to<JsonObject>();
     bool linkUp = _scale && _scale->isConnected();
     const auto& sop = _scale ? _scale->scaleOtaPending() : ScaleLink::ScaleOtaPending{};
-    scale["link"] = linkUp ? (sop.valid ? "online" : "waiting") : "offline";
+    String fwFromHandshake = _scale ? _scale->scaleFirmwareVersion() : String();
+    // Three-tier link state: offline (no WS), waiting (WS up but we have
+    // no version info at all), online (we have at least the current FW
+    // version from the ScaleVersion handshake). The OtaPending push from
+    // the scale's own checker may arrive seconds-to-minutes later — in
+    // the meantime the user still wants to see what version is running,
+    // not a perpetual "waiting" pill.
+    bool haveAnyInfo = sop.valid || fwFromHandshake.length() > 0;
+    scale["link"] = linkUp ? (haveAnyInfo ? "online" : "waiting") : "offline";
     if (sop.valid) {
         scale["firmware_current"]  = sop.firmware_current;
         scale["firmware_latest"]   = sop.firmware_latest;
@@ -1252,6 +1260,12 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
         scale["last_check_ts"]     = sop.last_check_ts;
         scale["last_check_status"] = sop.last_check_status;
         scale["pending"]           = sop.firmware_update || sop.frontend_update;
+    } else if (fwFromHandshake.length()) {
+        // Partial info: the scale told us its current FW on handshake but
+        // hasn't pushed an OtaPending yet (its checker may not have
+        // completed a manifest fetch). Surface what we know.
+        scale["firmware_current"]  = fwFromHandshake;
+        scale["pending"]           = false;
     } else {
         scale["pending"] = false;
     }

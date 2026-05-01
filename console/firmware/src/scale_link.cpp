@@ -160,6 +160,20 @@ void ScaleLink::_onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
             // Re-derive handshake now that we're connected — this is where
             // the LCD + web status flip from red "offline" to amber/green.
             _refreshHandshakeState();
+            // Kick the scale's OTA checker. Two reasons:
+            //   1. The scale's onConnected callback only fires when its
+            //      client-count goes 0→1; a console reboot that doesn't
+            //      close TCP cleanly leaves the count stuck and the
+            //      handshake messages (ScaleVersion / CalibrationStatus
+            //      / OtaPending) never get pushed. CheckOtaUpdates
+            //      always triggers a push because g_ota_checker.kickNow()
+            //      flips the cached state and pushOtaPendingIfChanged
+            //      sees the change on its next loop tick.
+            //   2. Even on a clean reconnect, this forces a fresh
+            //      manifest fetch so "last_check_ts" tracks the live
+            //      session rather than something stale from the scale's
+            //      last own-scheduled check.
+            _send(ConsoleToScale::build(ConsoleToScale::Type::CheckOtaUpdates));
             break;
         case WStype_DISCONNECTED:
             _markDisconnected("ws-event");
@@ -326,6 +340,7 @@ void ScaleLink::_dispatch(const ScaleToConsole::Message& msg) {
         }
         case T::ScaleVersion: {
             const char* v = msg.doc["version"] | "";
+            if (v && *v) _scaleFirmwareVersion = v;
             // The scale also includes its current display-precision here so
             // the console can render the live weight with the same number
             // of decimals the scale's own screen would show. Re-emitted by
