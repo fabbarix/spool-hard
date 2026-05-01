@@ -15,6 +15,8 @@ void SpoolRecord::toJson(JsonDocument& doc) const {
     doc["is_empty"]          = is_empty;
     doc["consumed_since_add"]    = consumed_since_add;
     doc["consumed_since_weight"] = consumed_since_weight;
+    doc["last_committed_job"]    = last_committed_job;
+    doc["last_committed_grams"]  = last_committed_grams;
     doc["nozzle_temp_min"]   = nozzle_temp_min;
     doc["nozzle_temp_max"]   = nozzle_temp_max;
     doc["density"]           = density;
@@ -68,6 +70,8 @@ bool SpoolRecord::fromJson(const JsonDocument& doc) {
     b  ("is_empty",          is_empty);
     f32("consumed_since_add",    consumed_since_add);
     f32("consumed_since_weight", consumed_since_weight);
+    str("last_committed_job",    last_committed_job);
+    f32("last_committed_grams",  last_committed_grams);
     i32("nozzle_temp_min",   nozzle_temp_min);
     i32("nozzle_temp_max",   nozzle_temp_max);
     f32("density",           density);

@@ -10,6 +10,7 @@
 // can stash in _lastError. mbedtls_strerror needs MBEDTLS_ERROR_C in the
 // build; arduino-esp32's mbedtls config has it, so we use the real one.
 #include <mbedtls/error.h>
+#include "serial_mirror.h"
 
 // NVS keys are capped at 15 chars; Bambu serials are exactly 15 chars
 // (e.g. "0938AJ622700835"). Use the serial directly as the key.
@@ -549,6 +550,11 @@ bool PrinterFtp::retrieveRange(const String& path, uint32_t offset, uint32_t len
             if (!cb(buf, (size_t)n)) return false;
             read_total += n;
             start = millis();
+            // Yield once per chunk so IDLE0 gets to run — without this,
+            // the analyzer's gcode parsing + tinfl_decompress per chunk
+            // can hog Core 0 long enough to trip the 5 s task watchdog
+            // mid-2 MB body fetch.
+            vTaskDelay(1);
         }
         return read_total == length;
     });
@@ -578,6 +584,7 @@ bool PrinterFtp::retrieveStream(const String& path, ChunkCb cb) {
             total += n;
             if (!cb(buf, (size_t)n, total)) return false;
             start = millis();
+            vTaskDelay(1);   // IDLE0 yield, see retrieveRange comment
         }
         return true;
     });

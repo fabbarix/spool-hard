@@ -44,6 +44,18 @@ void GCodeAnalyzer::_addExtrusion(float delta_mm) {
     if (_active < 0 || _active >= MAX_TOOLS) return;
     _tools[_active].mm += delta_mm;
     _totalMm += delta_mm;
+    // Running grams update so callers polling totalGrams() during a
+    // streaming feed() see a live progress number — used by the
+    // dashboard's "Analysing…" progress bar. finalise() recomputes the
+    // exact final value the same way; this is the running sum of the
+    // same per-extrusion contribution, so the two converge to the same
+    // number on the last move. Cost: one extra float multiply per
+    // extrusion line (Bambu prints have tens of thousands).
+    const float d   = _diameters[_active];
+    const float den = _densities[_active];
+    const float area = (3.14159265f / 4.f) * d * d;   // mm²
+    _tools[_active].grams += delta_mm * area * den / 1000.f;
+    _totalG               += delta_mm * area * den / 1000.f;
 }
 
 void GCodeAnalyzer::_processLine(const String& rawLine) {

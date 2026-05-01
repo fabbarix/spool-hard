@@ -5,6 +5,7 @@
 #include <lvgl.h>
 #include <LovyanGFX.hpp>
 #include <esp_heap_caps.h>
+#include "serial_mirror.h"
 
 // ── LovyanGFX board definition for the WT32-SC01-Plus ────────
 // Pin assignments are from the WT32-SC01-Plus vendor schematic.

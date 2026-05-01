@@ -1,6 +1,7 @@
 #include "scale_discovery.h"
 #include "config.h"
 #include "ssdp_hub.h"
+#include "serial_mirror.h"
 
 ScaleDiscovery g_scale_discovery;
 

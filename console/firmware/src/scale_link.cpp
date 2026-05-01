@@ -4,6 +4,7 @@
 #include "scale_secrets.h"
 #include <Preferences.h>
 #include <WiFi.h>
+#include "serial_mirror.h"
 
 void ScaleLink::_refreshHandshakeState() {
     Handshake before = _handshake;

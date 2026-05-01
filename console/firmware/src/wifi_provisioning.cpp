@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include "serial_mirror.h"
 
 #define CONNECT_TIMEOUT_MS  45000
 #define AP_PREFIX           "SpoolHardConsole-"

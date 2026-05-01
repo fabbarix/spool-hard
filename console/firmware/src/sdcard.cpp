@@ -2,6 +2,7 @@
 #include "config.h"
 #include <SPI.h>
 #include <SD.h>
+#include "serial_mirror.h"
 
 SdCard g_sd;
 

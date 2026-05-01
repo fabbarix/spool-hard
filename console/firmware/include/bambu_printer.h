@@ -65,6 +65,23 @@ struct GcodeAnalysis {
     // extrapolation from total_grams. 16 tools × 101 pcts × 4 B ≈ 6.4 KiB.
     bool   has_pct_table = false;
     float  grams_at_pct[101][16] = {};
+
+    // Live counters updated from the analyzer task while in_progress=true,
+    // so the dashboard can show a per-second progress bar instead of a
+    // mystery spinner during the 30-40 s body fetch+parse. Single writer
+    // (analyzer task) + multiple readers (web /analysis poll); 32-bit
+    // aligned reads on ESP32-S3 are atomic so we don't need a mutex.
+    //   * progress_bytes:       bytes consumed by analyzer so far (post-
+    //     decompression for deflate, raw for stored / un-zipped paths).
+    //   * progress_total_bytes: expected total once known (set after
+    //     EOCD parse for ZIP, after SIZE for raw). 0 = unknown, frontend
+    //     should fall back to indeterminate.
+    //   * running_grams / _mm:  accumulated totals as the parser walks
+    //     extrusions. Same units as the final total_grams / total_mm.
+    volatile uint32_t progress_bytes        = 0;
+    volatile uint32_t progress_total_bytes  = 0;
+    volatile float    running_grams         = 0.f;
+    volatile float    running_mm            = 0.f;
 };
 
 struct PrinterState {
@@ -83,6 +100,15 @@ struct PrinterState {
     //     on-disk filename and the path resolver tries it as a fallback).
     //   - Cloud / MakerWorld: usually empty, subtask_name carries the name.
     String  gcode_file;
+    // Per-printer monotonic counter for prints. Bambu issues a fresh value
+    // on every print start (e.g. "1948", "1949", …) and the same value
+    // sticks for the duration of the job — across MQTT reconnects, console
+    // reboots, and re-analyses. Empty / "0" on some firmware variants
+    // (older P1, certain LAN-only first-prints) — `_jobKey()` falls back
+    // to gcode_file in that case. Used by the consumption tracker as a
+    // stable per-job identifier so re-running the analyzer doesn't
+    // double-bill grams that were already committed.
+    String  task_id;
     int     progress_pct = -1;
     int     layer_num    = -1;
     int     total_layers = -1;
@@ -307,6 +333,17 @@ private:
     // spool-pull doesn't wipe the printer's settings.
     void _syncSpoolToPrinter(int ams_unit, int slot_id, const class AmsTray& tr);
     void _handleGcodeStateTransition(const String& prev, const String& now);
+    // Idempotent commit helper — see implementation. Both
+    // _commitPrintConsumption (terminal, to_pct=100) and
+    // _commitIncrementalConsumption (live mid-print) route through it.
+    void _commitConsumptionTo(int to_pct, const String& job_key,
+                              const char* reason_tag);
+    // Stable identifier for the current print, used as the high-water-
+    // mark key on each SpoolRecord. Prefers task_id ("1948" — Bambu's
+    // own monotonic counter, stable across console reboots and
+    // re-analyses); falls back to gcode_file when task_id is empty or
+    // "0" (older firmwares, edge cases). Empty when no active print.
+    String _jobKey() const;
     void _commitPrintConsumption();
     // Called once per BambuPrinter::loop() tick to spawn a retry of
     // analyseRemote when the previous attempt hit a memory-pressure

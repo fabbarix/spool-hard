@@ -1,4 +1,5 @@
 #include "pending_ams.h"
+#include "serial_mirror.h"
 
 namespace PendingAms {
 

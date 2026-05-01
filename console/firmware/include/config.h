@@ -100,6 +100,26 @@
 #define FTP_REUSE_WORKS      1
 #define FTP_REUSE_FRESH      2
 
+// Storage backend selection for the spool store. The spool JSONL is the
+// only frequently-rewritten file on internal flash (every 5%-progress
+// commit during prints). Moving it to SD reduces the wear on the
+// userfs LittleFS partition. Default is auto-detect on first boot —
+// SD if mounted, else internal.
+//   value:
+//     not present → first-boot auto: SD if mounted, else internal
+//     "0"         → forced internal (LittleFS)
+//     "1"         → forced SD; if SD missing the store stays unavailable
+//                   until the user inserts SD or overrides back to internal.
+#define NVS_NS_STORAGE       "storage_cfg"
+#define NVS_KEY_SPOOLS_ON_SD "spools_on_sd"
+
+// Where the spool JSONL lives on each backend. Same filename on both;
+// the SD variant is parented under /spoolease/ to keep the SD root tidy
+// and to make hand-inspection / hand-backup obvious.
+#define SPOOLS_PATH_INTERNAL "/spools.jsonl"
+#define SPOOLS_PATH_SD       "/spoolease/spools.jsonl"
+#define SPOOLEASE_SD_DIR     "/spoolease"
+
 // Display.
 #define NVS_NS_DISPLAY         "display_cfg"
 #define NVS_KEY_DISP_SLEEP_S   "sleep_s"

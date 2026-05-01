@@ -3,6 +3,7 @@
 #include "sdcard.h"
 #include <SD.h>
 #include <esp_random.h>
+#include "serial_mirror.h"
 
 void UserFilamentsStore::begin() {
     _mounted = g_sd.isMounted();

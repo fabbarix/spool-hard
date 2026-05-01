@@ -12,6 +12,7 @@
 #include <lvgl.h>
 #include <cstdio>
 #include <cstring>
+#include "serial_mirror.h"
 
 // Globals the wizard needs to talk to — defined elsewhere, declared here.
 extern SpoolStore          g_store;

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bug, Pause, Play, Trash2, Copy, Zap, CheckCircle2, XCircle, Loader2, FolderOpen, Download, Eraser } from 'lucide-react';
+import { Bug, Pause, Play, Trash2, Copy, Zap, CheckCircle2, XCircle, Loader2, FolderOpen, Download, Eraser, HardDrive, Database, AlertTriangle } from 'lucide-react';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { Button } from '@spoolhard/ui/components/Button';
 import { useWebSocket, type DebugEntry } from '@spoolhard/ui/providers/WebSocketProvider';
@@ -75,6 +75,8 @@ export function DebugSection() {
       description="Firmware-side debug toggles. Sessions are not persisted — everything defaults off on boot. Leave disabled during normal use; each AMS report is 1–5 KB of WebSocket traffic."
     >
       <FtpAnalysisProbe />
+
+      <SpoolStorageBackend />
 
       <div className="flex items-center justify-between gap-3 py-2 border-b border-surface-border">
         <div>
@@ -152,6 +154,173 @@ function LogRow({ entry }: { entry: DebugEntry }) {
 {pretty}
         </pre>
       )}
+    </div>
+  );
+}
+
+// Spool-storage backend toggle. The spool JSONL is the only frequently
+// rewritten file on internal flash, so steering it to the SD card avoids
+// userfs wear during long prints. UI shows current backend + SD presence
+// + any startup error (e.g. "configured for SD but card missing"), and
+// offers a one-click migrate-and-switch.
+type SpoolStorageStatus = {
+  configured: 'sd' | 'internal' | 'auto';
+  backend:    'sd' | 'internal' | 'none';
+  path?:      string;
+  ready:      boolean;
+  error:      string;
+  sd_mounted: boolean;
+  count?:     number;
+};
+
+function SpoolStorageBackend() {
+  const [status, setStatus] = useState<SpoolStorageStatus | null>(null);
+  const [busy, setBusy]     = useState(false);
+  const [msg, setMsg]       = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await fetch('/api/storage/spools');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setStatus(await r.json());
+    } catch (e) {
+      setStatus(null);
+    }
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const set = async (target: 'sd' | 'internal', migrate: boolean) => {
+    setBusy(true); setMsg(null);
+    try {
+      const r = await fetch('/api/storage/spools', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target, migrate }),
+      });
+      const payload = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setMsg(payload.error ?? `HTTP ${r.status}`);
+      } else {
+        setMsg(payload.message ?? 'ok');
+      }
+      await refresh();
+    } catch (e) {
+      setMsg(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!status) {
+    return (
+      <div className="py-2 border-b border-surface-border text-xs text-text-muted">
+        loading storage status…
+      </div>
+    );
+  }
+
+  const onSd        = status.backend === 'sd';
+  const onInternal  = status.backend === 'internal';
+  const noBackend   = status.backend === 'none';
+  const wantSd      = status.configured === 'sd';
+
+  return (
+    <div className="py-2 border-b border-surface-border space-y-2">
+      <div className="flex items-center gap-2">
+        <Database size={14} className="text-text-muted" />
+        <div className="text-sm text-text-primary">Spool storage backend</div>
+      </div>
+      <div className="text-xs text-text-muted">
+        The spool database is the only file the firmware rewrites frequently
+        (every 5% of every print). Moving it to the SD card avoids wearing
+        the ESP32's internal flash. NVS settings (Wi-Fi, printer config,
+        cloud token) and the read-only filaments library are unaffected.
+      </div>
+
+      {/* Status row */}
+      <div className="flex items-center gap-2 text-xs flex-wrap">
+        <span className="text-text-muted">Currently:</span>
+        {onSd && <span className="inline-flex items-center gap-1 text-green-400 font-mono"><HardDrive size={12} /> SD</span>}
+        {onInternal && <span className="inline-flex items-center gap-1 text-text-primary font-mono"><Database size={12} /> internal</span>}
+        {noBackend && <span className="inline-flex items-center gap-1 text-red-400 font-mono"><AlertTriangle size={12} /> unavailable</span>}
+        {status.path && <span className="font-mono text-text-muted">{status.path}</span>}
+        {typeof status.count === 'number' && status.ready && (
+          <span className="text-text-muted ml-auto">{status.count} record{status.count === 1 ? '' : 's'}</span>
+        )}
+      </div>
+
+      {/* SD presence */}
+      <div className="text-[11px] text-text-muted font-mono">
+        SD card {status.sd_mounted ? 'mounted' : 'not mounted'}
+        {' · '}preference saved as {status.configured}
+      </div>
+
+      {/* Error surface — typically "configured for SD but no card" */}
+      {!status.ready && status.error && (
+        <div className="rounded bg-red-500/10 border border-red-500/30 p-2 text-xs text-red-300">
+          <div className="flex items-start gap-2">
+            <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+            <div>
+              <div className="font-medium mb-1">Spool tracker not running</div>
+              <div className="text-red-200">{status.error}</div>
+            </div>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            <Button
+              variant="secondary"
+              onClick={() => set('internal', false)}
+              disabled={busy}
+              className="!py-1 !px-2"
+              title="Override to internal flash. Spool DB starts empty until you reboot or insert the SD card."
+            >
+              Override → internal flash
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Action buttons */}
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <Button
+          variant="secondary"
+          onClick={() => set('sd', true)}
+          disabled={busy || onSd || !status.sd_mounted}
+          className="!py-1 !px-2"
+          title={status.sd_mounted ? 'Copy spools.jsonl to /spoolease/ on the SD card and switch the live store to it.' : 'Insert an SD card first'}
+        >
+          <HardDrive size={12} className="mr-1 inline" />
+          Move to SD
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={() => set('internal', true)}
+          disabled={busy || onInternal}
+          className="!py-1 !px-2"
+          title="Copy spools.jsonl back to internal flash and switch the live store to it."
+        >
+          <Database size={12} className="mr-1 inline" />
+          Move to internal
+        </Button>
+        {wantSd && !status.sd_mounted && (
+          <Button
+            variant="secondary"
+            onClick={() => set('internal', false)}
+            disabled={busy}
+            className="!py-1 !px-2"
+            title="Stop trying to use SD; on next reboot, run from internal flash."
+          >
+            Stop trying SD
+          </Button>
+        )}
+        {busy && (
+          <span className="inline-flex items-center gap-1 text-xs text-text-muted">
+            <Loader2 size={12} className="animate-spin" /> working…
+          </span>
+        )}
+        {msg && !busy && (
+          <span className="text-xs text-text-muted ml-auto">{msg}</span>
+        )}
+      </div>
     </div>
   );
 }

@@ -2,6 +2,7 @@
 #include "config.h"
 #include "sdcard.h"
 #include <SD.h>
+#include "serial_mirror.h"
 
 void StockFilamentsStore::begin() {
     reload();

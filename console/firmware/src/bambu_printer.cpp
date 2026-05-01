@@ -55,7 +55,15 @@ BambuPrinter::SpoolAssignedCb BambuPrinter::s_onSpoolAssigned;
 // free memory; reusing the buffer avoids a leak.
 namespace {
 
-constexpr size_t TASK_STACK_BYTES = 16384;
+// Bumped 16K -> 24K once the serial-mirror landed: the FTPS analyzer's
+// mbedtls_ssl_handshake already eats ~10 KB on its own, and any
+// Serial.printf inside that call chain now adds Print::printf's local
+// 64-byte buffer + the wrapper's call frame + RingLog::push String
+// alloc. Stack overflow in arduino-esp32 takes the whole chip down
+// (panic abort), which was the bootloop trigger after the serial-
+// mirror OTA. PSRAM-fallback stack picks this size up too, so the
+// slow-path task slot gets the same headroom.
+constexpr size_t TASK_STACK_BYTES = 24576;
 constexpr size_t TASK_STACK_WORDS = TASK_STACK_BYTES / sizeof(StackType_t);
 
 // Three reusable PSRAM stacks — one each for the analyse, FTP-debug,
@@ -111,6 +119,37 @@ bool spawnPSRAMFallbackTask(TaskFunction_t fn, void* arg, const char* name,
     Serial.printf("[Task %s] running on PSRAM stack\n", name);
     return true;
 }
+
+// PSRAM-preferring allocator for ArduinoJson 7. The H2S sends ~17 KB
+// pushall reports every ~1.2 s and ArduinoJson internally allocates
+// nodes that, for a deeply-nested 17 KB JSON, can occupy 30-40 KB of
+// transient heap. Routing those to PSRAM frees internal DRAM for the
+// FTPS analyzer's mbedTLS handshake context (~30 KB) which has to be
+// internal and would otherwise collide with the JsonDocument every
+// time MQTT processes a message during analysis. PSRAM has ~1.7 MB
+// free; the throughput hit on AES/JSON parsing is ~3-4× but only on
+// the parse pass — we never copy the doc again.
+class PsramJsonAllocator : public ArduinoJson::Allocator {
+public:
+    void* allocate(size_t n) override {
+        void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!p) p = heap_caps_malloc(n, MALLOC_CAP_DEFAULT);  // DRAM fallback
+        return p;
+    }
+    void deallocate(void* p) override { heap_caps_free(p); }
+    void* reallocate(void* p, size_t n) override {
+        // No PSRAM realloc API; do alloc+memcpy+free. Fine for JSON node
+        // growth — the doc grows monotonically during deserialization.
+        if (!p) return allocate(n);
+        size_t old = heap_caps_get_allocated_size(p);
+        void* np = allocate(n);
+        if (!np) return nullptr;
+        memcpy(np, p, old < n ? old : n);
+        heap_caps_free(p);
+        return np;
+    }
+};
+static PsramJsonAllocator s_psramJsonAlloc;
 
 }  // namespace
 
@@ -315,7 +354,9 @@ void BambuPrinter::loop() {
 }
 
 void BambuPrinter::_onMessage(const char* /*topic*/, uint8_t* payload, unsigned int length) {
-    JsonDocument doc;
+    // PSRAM-backed JsonDocument so a 17 KB H2S pushall doesn't fight
+    // the FTPS analyzer for internal DRAM during a print analysis.
+    JsonDocument doc(&s_psramJsonAlloc);
     DeserializationError err = deserializeJson(doc, payload, length);
     if (err) {
         Serial.printf("[Bambu %s] parse error: %s (len=%u)\n",
@@ -335,6 +376,11 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
     if (print["gcode_state"].is<const char*>())  _state.gcode_state  = print["gcode_state"].as<String>();
     if (print["subtask_name"].is<const char*>()) _state.subtask_name = print["subtask_name"].as<String>();
     if (print["gcode_file"].is<const char*>())   _state.gcode_file   = print["gcode_file"].as<String>();
+    // task_id is the per-printer monotonic counter we use as a stable
+    // job key. Bambu serialises it as a string ("1948") on H2S/H2D and
+    // as an int on some older firmwares — accept both shapes.
+    if (print["task_id"].is<const char*>())      _state.task_id      = print["task_id"].as<String>();
+    else if (print["task_id"].is<int>())         _state.task_id      = String(print["task_id"].as<int>());
     if (_state.gcode_state != prevGcode) {
         _handleGcodeStateTransition(prevGcode, _state.gcode_state);
     }
@@ -1142,16 +1188,21 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
         // ── ZIP-wrapped 3MF path ─────────────────────────────────
         // Grab the trailing EOCD window. ZIP's EOCD record is 22 fixed
         // bytes plus up to 65535 bytes of comment; Bambu's 3mf never
-        // sets a ZIP comment, so 4 KiB is ample and keeps the backing
-        // std::vector small enough that the internal heap stays
-        // healthy for the simultaneous mbedTLS handshake context
-        // (~30 KiB) on the same task.
+        // sets a ZIP comment, so 4 KiB is ample. Allocate from PSRAM —
+        // internal DRAM is the scarce resource (mbedTLS handshake
+        // context for the FTPS data channel, transient JsonDocument
+        // for concurrent MQTT pushalls), and 4 KiB / cd_size is just
+        // raw bytes we'll memscan once.
         uint32_t eocd_window = (total > 0 && (uint32_t)total < 4096) ? (uint32_t)total : 4096;
         uint32_t eocd_start = 0;
-        std::vector<uint8_t> eocdBuf(eocd_window);
+        uint8_t* eocdBuf = (uint8_t*)heap_caps_malloc(eocd_window,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!eocdBuf) { ftp.quit(); return fail("eocd buffer alloc failed"); }
+        struct PsBufGuard { uint8_t* p; ~PsBufGuard() { if (p) heap_caps_free(p); } };
+        PsBufGuard eocd_guard{eocdBuf};
         if (total > 0) {
             eocd_start = total - eocd_window;
-            if (!ftp.retrieveInto(path, eocd_start, eocd_window, eocdBuf.data())) {
+            if (!ftp.retrieveInto(path, eocd_start, eocd_window, eocdBuf)) {
                 ftp.quit();
                 return fail("eocd fetch: " + ftp.lastError());
             }
@@ -1161,7 +1212,7 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             // the real bytes — pull them all and keep the trailing
             // eocd_window for the EOCD parse below.
             uint32_t streamed = 0, tailGot = 0;
-            if (!ftp.retrieveTrailing(path, eocd_window, eocdBuf.data(),
+            if (!ftp.retrieveTrailing(path, eocd_window, eocdBuf,
                                       &streamed, &tailGot)) {
                 ftp.quit();
                 return fail("trailing fetch: " + ftp.lastError());
@@ -1182,18 +1233,21 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
 
         uint32_t cd_offset = 0, cd_size = 0;
         uint16_t entry_count = 0;
-        if (!ZipReader::parseEOCD(eocdBuf.data(), eocd_window, cd_offset, cd_size, entry_count)) {
+        if (!ZipReader::parseEOCD(eocdBuf, eocd_window, cd_offset, cd_size, entry_count)) {
             ftp.quit();
             return fail("EOCD not found");
         }
 
-        std::vector<uint8_t> cdBuf(cd_size);
-        if (!ftp.retrieveInto(path, cd_offset, cd_size, cdBuf.data())) {
+        uint8_t* cdBuf = (uint8_t*)heap_caps_malloc(cd_size,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!cdBuf) { ftp.quit(); return fail("cd buffer alloc failed"); }
+        PsBufGuard cd_guard{cdBuf};
+        if (!ftp.retrieveInto(path, cd_offset, cd_size, cdBuf)) {
             ftp.quit();
             return fail("cd fetch: " + ftp.lastError());
         }
 
-        auto entries = ZipReader::parseCentralDirectory(cdBuf.data(), cd_size, entry_count);
+        auto entries = ZipReader::parseCentralDirectory(cdBuf, cd_size, entry_count);
         // Pick the first .gcode entry. Bambu's layout puts plate_<n>.gcode under
         // Metadata/ or directly at the root depending on slicer version.
         ZipReader::Entry gcode;
@@ -1301,16 +1355,34 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
     //     output wrap-around for us by returning the per-call written
     //     length; we just have to split the feed across the ring's
     //     wrap point when it occurs.
+    // Seed the live progress total so the dashboard can show a percentage.
+    // For raw streams we don't know it (data_length=0 → leave 0, frontend
+    // shows indeterminate); for ZIP entries this is the gcode entry's
+    // (compressed) size — gives us a usable progress bar even for the
+    // deflate path since 1 byte in ≈ 1 unit of progress.
+    result.progress_total_bytes = data_length;
     bool ok;
     if (data_length == 0) {
-        ok = ftp.retrieveStream(path, [&](const uint8_t* d, size_t n, size_t) {
+        ok = ftp.retrieveStream(path, [&](const uint8_t* d, size_t n, size_t total) {
             analyzer.feed(d, n);
+            // Per-chunk live snapshot. Floats are aligned 32-bit writes
+            // — ESP32-S3 makes those atomic for the web reader, no mutex
+            // needed. Cost is ~50 ns of extra accessor calls per ~1 KB
+            // chunk: lost in the FTPS+TLS noise.
+            result.progress_bytes = (uint32_t)total;
+            result.running_grams  = analyzer.totalGrams();
+            result.running_mm     = analyzer.totalMm();
             return true;
         });
     } else if (data_method == 0) {
+        uint32_t consumed = 0;
         ok = ftp.retrieveRange(path, data_offset, data_length,
                                [&](const uint8_t* d, size_t n) {
             analyzer.feed(d, n);
+            consumed += n;
+            result.progress_bytes = consumed;
+            result.running_grams  = analyzer.totalGrams();
+            result.running_mm     = analyzer.totalMm();
             return true;
         });
     } else {
@@ -1339,10 +1411,18 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
         } st = { inflator, dict, 0, 0, data_length, &analyzer, true, "" };
 
         ok = ftp.retrieveRange(path, data_offset, data_length,
-                               [&st](const uint8_t* d, size_t n) {
+                               [&st, &result, &analyzer](const uint8_t* d, size_t n) {
             const uint8_t* in_ptr = d;
             size_t         in_remain = n;
             st.consumed_in += n;
+            // Live progress snapshot. progress_bytes tracks compressed-input
+            // bytes against progress_total_bytes (also compressed) so the
+            // ratio is meaningful for the bar, even if decompressed size
+            // is unknown until we hit DONE. running_grams/mm come from
+            // the analyzer's running totals so far.
+            result.progress_bytes = st.consumed_in;
+            result.running_grams  = analyzer.totalGrams();
+            result.running_mm     = analyzer.totalMm();
             // Inner loop: a single FTP chunk may contain bytes that
             // produce multiple output windows (e.g. when the
             // decompressed stream is much larger than the compressed
@@ -1665,6 +1745,7 @@ void BambuPrinter::_maybeRetryAnalysis() {
 //              to GET /api/ftp-download to save the file.
 #include <SD.h>
 #include "config.h"       // SD_MOUNT
+#include "serial_mirror.h"
 
 BambuPrinter::FtpStreamCtx::FtpStreamCtx() {
     // 64 KiB so the biggest line we'll ever emit (the `list` done event
@@ -1873,7 +1954,15 @@ void BambuPrinter::_handleGcodeStateTransition(const String& prev, const String&
                   prev.isEmpty() ? "<none>" : prev.c_str(),
                   now.c_str());
 
-    // Print started.
+    // Print started. Fires on both real IDLE/PREPARE→RUNNING transitions
+    // AND the first MQTT report after boot (prev=="") — the latter so a
+    // console reboot mid-print still picks up filament tracking on the
+    // job in progress instead of waiting for the next print to start.
+    // The earlier worry (auto-kick OOM'ing on H2S during boot) was a
+    // task-watchdog issue + internal-DRAM contention, both fixed: the
+    // FTPS read loops now yield per chunk so IDLE0 stays alive, and
+    // the analyzer's eocd/cd buffers + the MQTT JsonDocument both live
+    // in PSRAM now.
     if (!_isActiveGcodeState(prev) && _isActiveGcodeState(now)) {
         _analysisCommitted = false;
         _progressCommittedPct = 0;
@@ -1920,47 +2009,92 @@ static float _deltaGrams(const GcodeAnalysis& a, const GcodeAnalysisTool& t, int
     return (float)(to - from) / 100.f * t.grams;
 }
 
+// Idempotent per-spool commit. For each tool's mapped spool, looks up the
+// "grams already committed for this job" high-water mark stored on the
+// SpoolRecord and adds only the new delta — so reanalysing or rebooting
+// mid-print never double-bills. job_key is the printer's gcode_file path
+// (stable while a print runs, changes when a new print starts), which
+// the spool record carries alongside the high-water mark to detect a
+// new job and reset the mark.
+//
+// to_pct=100 closes out the print regardless of where the live commits
+// left off; mid-print calls pass the current progress_pct.
+void BambuPrinter::_commitConsumptionTo(int to_pct, const String& job_key,
+                                        const char* reason_tag) {
+    if (!_lastAnalysis.valid) return;
+    if (to_pct < 0)   to_pct = 0;
+    if (to_pct > 100) to_pct = 100;
+    int committed_count = 0;
+    for (int i = 0; i < _lastAnalysis.tool_count; ++i) {
+        const auto& t = _lastAnalysis.tools[i];
+        if (t.grams <= 0.f) continue;
+        if (t.spool_id.isEmpty()) continue;
+        SpoolRecord rec;
+        if (!g_store.findById(t.spool_id, rec)) continue;
+
+        // Reset the high-water mark on a real job change. Empty stored
+        // job = first time we've ever billed this spool, treat as new.
+        // Migration tolerance: if the stored value uses the legacy
+        // unprefixed format (set by an earlier firmware that keyed by
+        // raw gcode_file), adopt the new prefixed key WITHOUT resetting
+        // the mark. The print is the same — only our identifier scheme
+        // changed — so the grams already committed are still correct.
+        if (rec.last_committed_job != job_key) {
+            bool legacy_format = rec.last_committed_job.length() > 0
+                              && !rec.last_committed_job.startsWith("task=")
+                              && !rec.last_committed_job.startsWith("file=");
+            if (legacy_format) {
+                rec.last_committed_job = job_key;   // re-key, keep mark
+            } else {
+                rec.last_committed_job   = job_key;
+                rec.last_committed_grams = 0.f;
+            }
+        }
+        // Cumulative grams the analyzer says this tool has used by
+        // to_pct. has_pct_table → exact (M73), else linear.
+        float current_total = _deltaGrams(_lastAnalysis, t, 0, to_pct);
+        float add = current_total - rec.last_committed_grams;
+        if (add <= 0.f) continue;   // nothing new since last commit
+        rec.consumed_since_add    += add;
+        rec.consumed_since_weight += add;
+        rec.last_committed_grams   = current_total;
+        g_store.upsert(rec);
+        ++committed_count;
+        Serial.printf("[Bambu %s] +%.1fg consumed on spool %s (T%d, %s) "
+                      "[%s, mark %.1fg→%.1fg of %.1fg total at %d%%]\n",
+                      _cfg.serial.c_str(), add, rec.id.c_str(),
+                      t.tool_idx, t.material.c_str(), reason_tag,
+                      rec.last_committed_grams - add,
+                      rec.last_committed_grams, t.grams, to_pct);
+    }
+    if (committed_count > 0) {
+        Serial.printf("[Bambu %s] commit (%s): %d spool(s) updated at %d%%\n",
+                      _cfg.serial.c_str(), reason_tag, committed_count, to_pct);
+    }
+}
+
+String BambuPrinter::_jobKey() const {
+    // Prefer Bambu's monotonic task_id — non-empty and not "0" means a
+    // live print on every firmware variant we've seen (X1, H2D, H2S).
+    // Fallback to gcode_file when task_id is missing (older P1 firmware,
+    // certain LAN-only first-prints) so we still get SOME stable key.
+    if (_state.task_id.length() && _state.task_id != "0") {
+        return "task=" + _state.task_id;
+    }
+    if (_state.gcode_file.length()) {
+        return "file=" + _state.gcode_file;
+    }
+    return String();
+}
+
 void BambuPrinter::_commitPrintConsumption() {
     if (!_lastAnalysis.valid) {
         Serial.printf("[Bambu %s] print ended but no valid analysis — nothing to commit\n",
                       _cfg.serial.c_str());
         return;
     }
-    // Live commits in _commitIncrementalConsumption may have already pushed
-    // part of the total forecast. Only add the unclaimed tail so end-of-print
-    // totals match the analysis regardless of how many 5% steps fired.
-    int from = _progressCommittedPct;
-    int to   = 100;
-    if (to <= from) {
-        Serial.printf("[Bambu %s] print ended — all consumption already committed live\n",
-                      _cfg.serial.c_str());
-        return;
-    }
-    int committed = 0;
-    for (int i = 0; i < _lastAnalysis.tool_count; ++i) {
-        const auto& t = _lastAnalysis.tools[i];
-        if (t.grams <= 0.f) continue;
-        if (t.spool_id.isEmpty()) continue;   // no spool mapped to this tool
-
-        SpoolRecord rec;
-        if (!g_store.findById(t.spool_id, rec)) continue;
-        float add = _deltaGrams(_lastAnalysis, t, from, to);
-        if (add <= 0.f) continue;
-        // consumed_since_* are forecasts, not measurements, so we ADD grams
-        // rather than replace. weight_current stays untouched — it only
-        // changes on an actual scale reading via the "capture current weight"
-        // action.
-        rec.consumed_since_add    += add;
-        rec.consumed_since_weight += add;
-        g_store.upsert(rec);
-        ++committed;
-        Serial.printf("[Bambu %s] +%.1fg consumed on spool %s (T%d, %s) [tail %d%%→100%%]\n",
-                      _cfg.serial.c_str(), add, rec.id.c_str(),
-                      t.tool_idx, t.material.c_str(), from);
-    }
+    _commitConsumptionTo(100, _jobKey(), "print-end");
     _progressCommittedPct = 100;
-    Serial.printf("[Bambu %s] commitPrintConsumption: %d spool(s) updated\n",
-                  _cfg.serial.c_str(), committed);
 }
 
 void BambuPrinter::_commitIncrementalConsumption() {
@@ -1970,31 +2104,13 @@ void BambuPrinter::_commitIncrementalConsumption() {
     int pct = _state.progress_pct;
     if (pct < 0 || pct > 100) return;
     // Quantise to 5% steps so we flush the spool store at most 20× per
-    // print — LittleFS is wear-sensitive and each upsert rewrites the full
-    // record as an append. The final tail is closed by _commitPrintConsumption
-    // on the terminal state transition.
+    // print — LittleFS is wear-sensitive. The high-water-mark inside
+    // _commitConsumptionTo additionally guards against a no-op write
+    // when the analyzer hasn't caught up yet (e.g. a manual re-kick at
+    // the same pct produces add=0).
     int stepTarget = (pct / 5) * 5;
     if (stepTarget <= _progressCommittedPct) return;
-    int from = _progressCommittedPct;
-    int to   = stepTarget;
-    int committed = 0;
-    for (int i = 0; i < _lastAnalysis.tool_count; ++i) {
-        const auto& t = _lastAnalysis.tools[i];
-        if (t.grams <= 0.f) continue;
-        if (t.spool_id.isEmpty()) continue;
-        SpoolRecord rec;
-        if (!g_store.findById(t.spool_id, rec)) continue;
-        float add = _deltaGrams(_lastAnalysis, t, from, to);
-        if (add <= 0.f) continue;
-        rec.consumed_since_add    += add;
-        rec.consumed_since_weight += add;
-        g_store.upsert(rec);
-        ++committed;
-    }
+    _commitConsumptionTo(stepTarget, _jobKey(),
+                         _lastAnalysis.has_pct_table ? "live/M73" : "live/linear");
     _progressCommittedPct = stepTarget;
-    if (committed > 0) {
-        Serial.printf("[Bambu %s] live consume: %d%%→%d%% (%d spool(s), %s)\n",
-                      _cfg.serial.c_str(), from, to, committed,
-                      _lastAnalysis.has_pct_table ? "M73" : "linear");
-    }
 }

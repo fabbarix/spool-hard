@@ -1,10 +1,12 @@
 import { useMemo, useState } from 'react';
-import { Pin, Gauge, ExternalLink } from 'lucide-react';
+import { Pin, Gauge, ExternalLink, Sparkles, Loader2 } from 'lucide-react';
 import { Card } from '@spoolhard/ui/components/Card';
+import { Button } from '@spoolhard/ui/components/Button';
 import { StatusDot } from '@spoolhard/ui/components/StatusDot';
 import {
   usePrinters,
   usePrinterAnalysis,
+  useStartPrinterAnalysis,
   type AmsTray,
   type GcodeAnalysis,
   type Printer,
@@ -122,7 +124,7 @@ function PrinterRow({ p, spoolById }: { p: Printer; spoolById: Map<string, Spool
               )}
             </div>
           )}
-          <AnalysisBlock serial={p.serial} />
+          <AnalysisBlock serial={p.serial} gcodeState={gcode} />
         </>
       ) : (
         <div className="text-xs text-text-muted">{s.error ?? s.link}</div>
@@ -289,29 +291,81 @@ function pickReadableTextColor(hex: string): string {
   return luma > 160 ? '#111827' : '#f9fafb';
 }
 
-// The analysis runs automatically on every print start (firmware fetches the
-// 3mf over FTPS and streams the gcode through the on-device analyzer). This
-// block just surfaces the result + live per-tool consumption. No manual
-// trigger — if an analysis is missing it's because there hasn't been a
-// print this boot.
-function AnalysisBlock({ serial }: { serial: string }) {
+// The analysis runs automatically when a print transitions IDLE/PREPARE
+// → RUNNING (firmware fetches the 3MF over FTPS and streams the gcode
+// through the on-device analyzer) AND on the first MQTT report after
+// console boot when the printer is already RUNNING — so a reboot
+// mid-print picks tracking back up without user action.
+//
+// The manual button below is the fallback: re-run when the auto-kick
+// failed (network blip, transient FTPS error) or when the user wants
+// to refresh the analysis after a slicer-side change. Hidden while the
+// printer is idle.
+function AnalysisBlock({ serial, gcodeState }: { serial: string; gcodeState?: string }) {
   const { data: analysis } = usePrinterAnalysis(serial);
+  const start = useStartPrinterAnalysis();
+  const printing = gcodeState === 'RUNNING' || gcodeState === 'PAUSE' || gcodeState === 'PREPARE';
 
   if (!analysis) return null;
-  if (analysis.in_progress) {
+  if (analysis.in_progress || start.isPending) {
+    // Bytes-fetched progress (works for both stored and deflate ZIP
+    // entries — for deflate we count compressed input bytes, which is
+    // what we have a known total for). Indeterminate when total=0.
+    const total = analysis.progress_total_bytes;
+    const done  = analysis.progress_bytes;
+    const pct   = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : null;
     return (
-      <div className="pt-2 border-t border-surface-border text-xs text-text-muted font-mono">
-        Analysing current job…
+      <div className="pt-2 border-t border-surface-border text-xs">
+        <div className="flex items-center gap-2 text-text-muted font-mono mb-1">
+          <Loader2 size={12} className="animate-spin" />
+          <span>Analysing current job…</span>
+          {pct !== null && (
+            <span className="ml-auto tabular-nums">
+              {(done / 1024).toFixed(0)} / {(total / 1024).toFixed(0)} KB · {pct}%
+            </span>
+          )}
+          {pct === null && done > 0 && (
+            <span className="ml-auto tabular-nums">{(done / 1024).toFixed(0)} KB</span>
+          )}
+        </div>
+        <div className="h-1 bg-surface-input rounded overflow-hidden">
+          <div
+            className={pct === null ? 'h-full bg-brand-400/40 animate-pulse' : 'h-full bg-brand-400 transition-all'}
+            style={pct === null ? { width: '40%' } : { width: `${pct}%` }}
+          />
+        </div>
+        {analysis.running_mm > 0 && (
+          <div className="mt-1 text-[10px] text-text-muted font-mono tabular-nums">
+            so far: {analysis.running_grams.toFixed(1)} g · {(analysis.running_mm / 1000).toFixed(1)} m
+          </div>
+        )}
       </div>
     );
   }
   if (!analysis.valid) {
-    // Hide silently when there simply is no analysis yet (e.g. printer idle
-    // since boot). Only surface a visible row when we got an explicit error.
-    if (!analysis.error) return null;
+    // Three sub-states:
+    //   - printing && no error: console booted into an active print and
+    //     hasn't been asked to analyse yet — show the kick button.
+    //   - error: surface it (and offer retry if printing).
+    //   - idle and no error: hide (no print to analyse).
+    if (!printing && !analysis.error) return null;
     return (
-      <div className="pt-2 border-t border-surface-border text-xs text-red-400 font-mono">
-        analysis error: {analysis.error}
+      <div className="pt-2 border-t border-surface-border text-xs flex items-center gap-2 flex-wrap">
+        {analysis.error
+          ? <span className="text-red-400 font-mono">analysis error: {analysis.error}</span>
+          : <span className="text-text-muted font-mono">No analysis for the current print yet.</span>}
+        {printing && (
+          <Button
+            variant="secondary"
+            onClick={() => start.mutate({ serial })}
+            disabled={start.isPending}
+            className="!py-1 !px-2 ml-auto"
+            title="Fetch the printer's current 3MF over FTPS and run the on-device gcode analyzer"
+          >
+            <Sparkles size={12} className="mr-1 inline" />
+            {analysis.error ? 'Retry' : 'Analyse current print'}
+          </Button>
+        )}
       </div>
     );
   }

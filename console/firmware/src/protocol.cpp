@@ -1,5 +1,6 @@
 #include "protocol.h"
 #include <deque>
+#include "serial_mirror.h"
 
 // ── Scale → Console parse ────────────────────────────────────
 

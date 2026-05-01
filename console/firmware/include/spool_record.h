@@ -30,6 +30,24 @@ struct SpoolRecord {
     float   consumed_since_add    = 0.f;
     float   consumed_since_weight = 0.f;
 
+    // Idempotent-commit bookkeeping for the analyzer's incremental
+    // consumption commits. Without this, a console reboot mid-print or
+    // a manual re-analyse re-applies grams that were already committed
+    // (the analyzer always reports 0→current_pct, but the spool already
+    // has the earlier portion subtracted).
+    //
+    //   * last_committed_job: stable per-print identifier — currently
+    //     the printer's reported `gcode_file` path. Reset to "" outside
+    //     of an active job. When the analyzer commits and this differs
+    //     from the live job key, last_committed_grams is reset to 0
+    //     before computing the delta.
+    //   * last_committed_grams: high-water mark of grams the analyzer
+    //     has already applied to consumed_since_* for THIS job. Each
+    //     incremental commit adds (current_grams - this) and updates
+    //     this value, so re-running the analyzer is idempotent.
+    String last_committed_job;
+    float  last_committed_grams = 0.f;
+
     // Print settings, used by the Bambu AMS auto-assignment feature. `-1`
     // means "unset — fall back to a material-default lookup at push time".
     int32_t nozzle_temp_min = -1;

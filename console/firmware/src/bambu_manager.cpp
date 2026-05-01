@@ -1,6 +1,7 @@
 #include "bambu_manager.h"
 #include "printer_config.h"
 #include <WiFi.h>
+#include "serial_mirror.h"
 
 BambuManager g_bambu;
 

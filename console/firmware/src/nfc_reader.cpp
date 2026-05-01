@@ -2,6 +2,7 @@
 #include "config.h"
 #include <SPI.h>
 #include <Adafruit_PN532.h>
+#include "serial_mirror.h"
 
 void NfcReader::begin() {
     pinMode(PN532_IRQ_PIN, INPUT_PULLUP);

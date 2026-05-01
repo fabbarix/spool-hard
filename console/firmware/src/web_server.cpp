@@ -26,6 +26,7 @@
 #include <LittleFS.h>
 #include <SD.h>
 #include <Update.h>
+#include "serial_mirror.h"
 
 // ── Lifecycle ────────────────────────────────────────────────
 
@@ -389,6 +390,21 @@ void ConsoleWebServer::_setupRoutes() {
             _handleRestorePost(req, data, len, index, total);
         }
     );
+
+    // ── Spool storage backend (LittleFS vs SD) ───────────────
+    // Status + toggle for where the spool JSONL lives. Frequent rewrites
+    // during prints are the only meaningful flash-wear contributor on the
+    // userfs partition, so steering them to SD is worth the option.
+    _server.on("/api/storage/spools", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleStorageSpoolsStatus(req);
+    });
+    _server.on("/api/storage/spools", HTTP_POST,
+        [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!_requireAuth(req)) return;
+            _handleStorageSpoolsSet(req, data, len);
+        });
 
     // ── Spool CRUD ───────────────────────────────────────────
     _server.on("/api/spools", HTTP_GET, [this](AsyncWebServerRequest* req) {
@@ -1466,6 +1482,125 @@ void ConsoleWebServer::_handleSpoolDelete(AsyncWebServerRequest* req) {
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
+// ── Spool storage backend (LittleFS vs SD) ──────────────────────────
+// Surfaces:
+//   * Where the JSONL is right now (`backend`: "sd" | "internal" | "none")
+//   * The user's persisted preference (`configured`: "sd" | "internal")
+//   * SD presence (`sd_mounted`)
+//   * Live store readiness + any startup error to surface in the UI.
+void ConsoleWebServer::_handleStorageSpoolsStatus(AsyncWebServerRequest* req) {
+    Preferences sp;
+    sp.begin(NVS_NS_STORAGE, /*ro*/true);
+    bool configured_sd = sp.getBool(NVS_KEY_SPOOLS_ON_SD, false);
+    bool has_setting   = sp.isKey(NVS_KEY_SPOOLS_ON_SD);
+    sp.end();
+
+    JsonDocument doc;
+    doc["configured"] = !has_setting ? "auto" : (configured_sd ? "sd" : "internal");
+    doc["sd_mounted"] = g_sd.isMounted();
+    if (!_store) {
+        doc["backend"]    = "none";
+        doc["ready"]      = false;
+        doc["error"]      = "store handle missing";
+    } else {
+        doc["backend"]    = _store->ready()
+                            ? (_store->backendIsSd() ? "sd" : "internal")
+                            : "none";
+        doc["path"]       = _store->path();
+        doc["ready"]      = _store->ready();
+        doc["error"]      = _store->lastError();
+        doc["count"]      = (uint32_t)_store->count();
+    }
+    String out; serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+// POST /api/storage/spools  body = {"target": "sd"|"internal", "migrate": bool}
+//
+// Behaviour:
+//   * Always persists the target to NVS so the next boot honours the choice.
+//   * If `migrate` is true and the store is currently ready, copies the
+//     JSONL from the current backend to the target before re-binding.
+//   * If `migrate` is false the store keeps using its current backend
+//     until the next reboot — useful for "I'll move the SD card and
+//     reboot" workflows.
+//   * Refuses to migrate-to-sd when SD isn't mounted.
+void ConsoleWebServer::_handleStorageSpoolsSet(AsyncWebServerRequest* req,
+                                               uint8_t* data, size_t len) {
+    JsonDocument req_doc;
+    if (deserializeJson(req_doc, data, len)) {
+        req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+        return;
+    }
+    String target  = req_doc["target"]  | "";
+    bool   migrate = req_doc["migrate"] | false;
+    if (target != "sd" && target != "internal") {
+        req->send(400, "application/json",
+                  "{\"error\":\"target must be \\\"sd\\\" or \\\"internal\\\"\"}");
+        return;
+    }
+    bool want_sd = (target == "sd");
+    if (want_sd && !g_sd.isMounted()) {
+        req->send(409, "application/json",
+                  "{\"error\":\"SD card is not mounted — can't switch to SD\"}");
+        return;
+    }
+    // Persist the choice first so a crash mid-migration leaves the next
+    // boot in the user's intended state.
+    {
+        Preferences sw;
+        sw.begin(NVS_NS_STORAGE, /*ro*/false);
+        sw.putBool(NVS_KEY_SPOOLS_ON_SD, want_sd);
+        sw.end();
+    }
+
+    JsonDocument resp;
+    resp["ok"]         = true;
+    resp["configured"] = target;
+
+    if (migrate && _store && _store->ready()) {
+        bool already_on_target = (_store->backendIsSd() == want_sd);
+        if (already_on_target) {
+            resp["migrated"] = false;
+            resp["message"]  = "already on requested backend";
+        } else {
+            String dst_path;
+            fs::FS* dst_fs = nullptr;
+            if (want_sd) {
+                if (!SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                dst_fs   = &SD;
+                dst_path = SPOOLS_PATH_SD;
+            } else {
+                dst_fs   = &LittleFS;
+                dst_path = SPOOLS_PATH_INTERNAL;
+            }
+            // Snapshot the source path before migrate() rebinds the store
+            // so we can clean it up after a successful copy.
+            String src_path = _store->path();
+            bool   src_was_sd = _store->backendIsSd();
+            fs::FS& src_fs   = src_was_sd ? (fs::FS&)SD : (fs::FS&)LittleFS;
+
+            if (!_store->migrateTo(*dst_fs, dst_path)) {
+                resp["ok"]      = false;
+                resp["error"]   = "migration failed: " + _store->lastError();
+                String out; serializeJson(resp, out);
+                req->send(500, "application/json", out);
+                return;
+            }
+            _store->markBackendIsSd(want_sd);
+            // Drop the old copy now that the new one is live + indexed.
+            src_fs.remove(src_path.c_str());
+            resp["migrated"] = true;
+            resp["message"]  = "moved to " + target;
+        }
+    } else {
+        resp["migrated"] = false;
+        resp["message"]  = "preference saved; restart to apply";
+    }
+    String out; serializeJson(resp, out);
+    req->send(200, "application/json", out);
+}
+
 // ── User filament CRUD ────────────────────────────────────────
 //
 // Storage backed by g_user_filaments (JSONL on SD). The frontend merges
@@ -2476,6 +2611,14 @@ void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
     doc["has_pct_table"] = a.has_pct_table;
     doc["progress_pct"]  = pct;
     doc["gcode_state"]   = s.gcode_state;
+    // Live counters — meaningful while in_progress=true so the web UI can
+    // render a per-second progress bar instead of a mystery spinner. Stay
+    // populated post-completion (last snapshot) which is harmless since
+    // total_grams/total_mm are then the authoritative final values.
+    doc["progress_bytes"]       = (uint32_t)a.progress_bytes;
+    doc["progress_total_bytes"] = (uint32_t)a.progress_total_bytes;
+    doc["running_grams"]        = (float)a.running_grams;
+    doc["running_mm"]           = (float)a.running_mm;
     JsonArray tools = doc["tools"].to<JsonArray>();
     for (int i = 0; i < a.tool_count; ++i) {
         const auto& t = a.tools[i];

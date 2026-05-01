@@ -125,6 +125,13 @@ export interface GcodeAnalysis {
   progress_pct: number;    // 0..100, last value reported by the printer
   gcode_state: string;     // "IDLE" | "PREPARE" | "RUNNING" | "PAUSE" | "FINISH" | "FAILED"
   tools: AnalysisTool[];
+  // Live snapshot updated every ~1 KB of fetched gcode while in_progress
+  // is true; meaningful only during analysis. progress_total_bytes is 0
+  // when unknown (raw .gcode streams without SIZE).
+  progress_bytes: number;
+  progress_total_bytes: number;
+  running_grams: number;
+  running_mm: number;
 }
 
 export function usePrinterAnalysis(serial: string | undefined) {

@@ -1,5 +1,6 @@
 #include "ssdp_listener.h"
 #include "config.h"
+#include "serial_mirror.h"
 
 static IPAddress mcast() { return IPAddress(SSDP_MCAST_OCT_A, SSDP_MCAST_OCT_B,
                                              SSDP_MCAST_OCT_C, SSDP_MCAST_OCT_D); }

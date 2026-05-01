@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <SPIFFS.h>
+#include <SD.h>
 #include <WiFi.h>
 #include <Preferences.h>
 
@@ -29,6 +30,7 @@
 #include <lvgl.h>   // LV_SYMBOL_* FontAwesome glyphs baked into Montserrat
 #include "scale_discovery.h"
 #include "ssdp_hub.h"
+#include "serial_mirror.h"
 
 // ── Globals ──────────────────────────────────────────────────
 static ConsoleDisplay    g_display;
@@ -179,8 +181,78 @@ void setup() {
         ConsoleDisplay::setSleepTimeout(s);
     }
 
-    // Load spool DB.
-    g_store.begin();
+    // Load spool DB. Backend (SD or internal LittleFS) picked from NVS:
+    //   * spools_on_sd unset → first boot. Use SD if mounted, else internal.
+    //   * spools_on_sd = "1" → user wants SD. Refuse to start if SD missing
+    //                          (UI surfaces the error and offers an
+    //                          "override to internal" toggle).
+    //   * spools_on_sd = "0" → forced internal.
+    {
+        Preferences sp;
+        sp.begin(NVS_NS_STORAGE, /*ro*/true);
+        bool has_setting = sp.isKey(NVS_KEY_SPOOLS_ON_SD);
+        bool want_sd     = sp.getBool(NVS_KEY_SPOOLS_ON_SD, false);
+        sp.end();
+
+        if (!has_setting) {
+            // Auto-detect on first boot. Prefer SD when present so we don't
+            // wear internal flash by default. If LittleFS already has a
+            // spools.jsonl (= upgrade from older firmware), copy it to SD
+            // first so the user keeps their data without manual action.
+            want_sd = g_sd.isMounted();
+            if (want_sd) {
+                bool have_internal_data = LittleFS.exists(SPOOLS_PATH_INTERNAL);
+                bool have_sd_data       = SD.exists(SPOOLS_PATH_SD);
+                if (have_internal_data && !have_sd_data) {
+                    if (!SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                    File in  = LittleFS.open(SPOOLS_PATH_INTERNAL, "r");
+                    File out = SD.open(SPOOLS_PATH_SD, "w");
+                    if (in && out) {
+                        uint8_t buf[512];
+                        size_t total = 0;
+                        while (in.available()) {
+                            size_t n = in.read(buf, sizeof(buf));
+                            if (n == 0) break;
+                            out.write(buf, n);
+                            total += n;
+                        }
+                        in.close(); out.close();
+                        Serial.printf("[Store] First-boot migration: copied %u "
+                                      "bytes %s → %s. Original kept as backup.\n",
+                                      (unsigned)total,
+                                      SPOOLS_PATH_INTERNAL, SPOOLS_PATH_SD);
+                    } else {
+                        if (in)  in.close();
+                        if (out) out.close();
+                        Serial.println("[Store] First-boot migration failed — "
+                                       "falling back to internal flash");
+                        want_sd = false;
+                    }
+                }
+            }
+            Preferences sw;
+            sw.begin(NVS_NS_STORAGE, /*ro*/false);
+            sw.putBool(NVS_KEY_SPOOLS_ON_SD, want_sd);
+            sw.end();
+            Serial.printf("[Store] First boot — selected backend: %s\n",
+                          want_sd ? "SD" : "internal");
+        }
+
+        if (want_sd) {
+            if (!g_sd.isMounted()) {
+                g_store.beginUnavailable(
+                    "Spool store is set to SD but no SD card is mounted. "
+                    "Insert the card or override to internal flash.");
+            } else {
+                if (!SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                g_store.begin(SD, SPOOLS_PATH_SD);
+                g_store.markBackendIsSd(true);
+            }
+        } else {
+            g_store.begin(LittleFS, SPOOLS_PATH_INTERNAL);
+            g_store.markBackendIsSd(false);
+        }
+    }
     // User-managed filament presets (SD-backed; no-op if SD didn't mount).
     g_user_filaments.begin();
     // Stock filament library — read-only JSONL on SD, RAM-cached.

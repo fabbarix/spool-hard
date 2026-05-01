@@ -6,13 +6,19 @@
 
 namespace RingLog {
 
-// Cap at 200 entries × ~256 bytes ≈ 50 KB max. The deque drops oldest
-// when full so the buffer is bounded regardless of how chatty
-// dlog-using subsystems get. Increase only if you find you're losing
-// logs faster than callers poll — with /api/logs polled every 2 s,
-// 200 lines is several seconds of headroom.
-static constexpr size_t kMaxEntries = 200;
-static constexpr size_t kMaxLineLen = 256;
+// Cap at 80 entries × ~160 bytes ≈ 13 KB max steady-state. The deque
+// drops oldest when full so the buffer is bounded regardless of how
+// chatty dlog-using subsystems get. We DRASTICALLY reduced from
+// 200×256 in 0.6.x once the analyzer started OOM'ing during
+// gcode-body parse: with the H2S 32 KB MQTT buffer + 30 KB transient
+// JSON parse per 1.2 s + 30 KB TLS handshake for FTPS RETR, every
+// kilobyte of internal DRAM matters.
+static constexpr size_t kMaxEntries = 80;
+static constexpr size_t kMaxLineLen = 160;
+// Drop log pushes when internal free heap dips this low. Logging itself
+// must never starve a real allocation — the analyzer's gcode buffer or
+// MQTT's JsonDocument matters more than the ring's exhaustiveness.
+static constexpr size_t kMinFreeHeapForLog = 24 * 1024;
 
 static std::deque<Entry> s_buf;
 static uint32_t          s_seq = 0;
@@ -27,6 +33,9 @@ static void _ensureMutex() {
 }
 
 void push(const String& line) {
+    // Self-throttle on heap pressure so logging never tips a marginal
+    // allocation (analyzer / MQTT JSON parse) into OOM panic.
+    if (ESP.getFreeHeap() < kMinFreeHeapForLog) return;
     _ensureMutex();
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
 

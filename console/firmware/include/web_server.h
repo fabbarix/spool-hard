@@ -84,6 +84,9 @@ private:
     void _handleSpoolGet(AsyncWebServerRequest* req);
     void _handleSpoolPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handleSpoolDelete(AsyncWebServerRequest* req);
+    // Spool-storage backend: GET status, POST {target,migrate} to switch.
+    void _handleStorageSpoolsStatus(AsyncWebServerRequest* req);
+    void _handleStorageSpoolsSet(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     // User filament CRUD (locally-managed presets stored on SD).
     void _handleUserFilamentsList(AsyncWebServerRequest* req);
     void _handleUserFilamentGet(AsyncWebServerRequest* req);

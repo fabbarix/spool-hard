@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cmath>      // fabsf — used by the calibration wizard's delta-vs-target colour cue
 #include <lvgl.h>
+#include "serial_mirror.h"
 
 // ── Theme tokens (mirror shared/frontend/src/app.css) ────────
 #define COL_BODY        lv_color_hex(0x0f1117)
