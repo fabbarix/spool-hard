@@ -4,15 +4,79 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 #define CONNECT_TIMEOUT_MS  45000
 #define AP_PREFIX           "SpoolHardConsole-"
+
+// See scale/firmware/src/wifi_provisioning.cpp for the table of
+// WIFI_REASON_* codes and what they mean for pinning diagnostics.
+static const char* _wifiReasonTag(uint8_t r) {
+    switch (r) {
+        case 2:   return "AUTH_EXPIRE";
+        case 4:   return "ASSOC_EXPIRE";
+        case 8:   return "ASSOC_LEAVE";
+        case 200: return "BEACON_TIMEOUT";
+        case 201: return "NO_AP_FOUND";
+        case 202: return "AUTH_FAIL";
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        case 205: return "CONNECTION_FAIL";
+        default:  return "OTHER";
+    }
+}
 
 void WifiProvisioning::begin(AsyncWebServer& server) {
     _server = &server;
     _loadDeviceName();
     _loadSecurityKey();
+    _loadPinnedBssid();
+
+    // WiFi event logger — captures every CONNECTED / DISCONNECTED with
+    // BSSID + reason code so /api/logs surfaces what the driver and AP
+    // are actually negotiating. Critical for diagnosing pinned-BSSID
+    // refusals via mesh band-steering (reason=ASSOC_FAIL).
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        switch (event) {
+            case ARDUINO_EVENT_WIFI_STA_CONNECTED: {
+                char bssid[18];
+                snprintf(bssid, sizeof(bssid),
+                         "%02X:%02X:%02X:%02X:%02X:%02X",
+                         info.wifi_sta_connected.bssid[0],
+                         info.wifi_sta_connected.bssid[1],
+                         info.wifi_sta_connected.bssid[2],
+                         info.wifi_sta_connected.bssid[3],
+                         info.wifi_sta_connected.bssid[4],
+                         info.wifi_sta_connected.bssid[5]);
+                Serial.printf("[WiFi-ev] STA_CONNECTED bssid=%s ch=%u\n",
+                              bssid, (unsigned)info.wifi_sta_connected.channel);
+                break;
+            }
+            case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+                char bssid[18];
+                snprintf(bssid, sizeof(bssid),
+                         "%02X:%02X:%02X:%02X:%02X:%02X",
+                         info.wifi_sta_disconnected.bssid[0],
+                         info.wifi_sta_disconnected.bssid[1],
+                         info.wifi_sta_disconnected.bssid[2],
+                         info.wifi_sta_disconnected.bssid[3],
+                         info.wifi_sta_disconnected.bssid[4],
+                         info.wifi_sta_disconnected.bssid[5]);
+                Serial.printf("[WiFi-ev] STA_DISCONNECTED bssid=%s reason=%u(%s)\n",
+                              bssid,
+                              (unsigned)info.wifi_sta_disconnected.reason,
+                              _wifiReasonTag(info.wifi_sta_disconnected.reason));
+                break;
+            }
+            case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+                Serial.printf("[WiFi-ev] GOT_IP ip=%s\n",
+                              IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+                break;
+            default:
+                break;
+        }
+    });
+
     _setupCaptiveRoutes();
 
     Preferences prefs;
@@ -35,9 +99,47 @@ void WifiProvisioning::update() {
         if (WiFi.status() == WL_CONNECTED) {
             _stopAP();
             _state = WifiState::Connected;
-            Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
+            String actualBssid = WiFi.BSSIDstr();
+            Serial.printf("[WiFi] Connected: %s (BSSID %s, ch %d, %d dBm)\n",
+                          WiFi.localIP().toString().c_str(),
+                          actualBssid.c_str(),
+                          WiFi.channel(),
+                          (int)WiFi.RSSI());
+            // Driver-side fallback detection — see scale's mirror.
+            if (_pinnedActive && !_pinnedBssid.isEmpty() &&
+                !actualBssid.equalsIgnoreCase(_pinnedBssid)) {
+                Serial.printf("[WiFi] Pin %s rejected by AP — driver "
+                              "auto-selected %s instead. AP is "
+                              "band-steering or refusing admission to "
+                              "the pinned node.\n",
+                              _pinnedBssid.c_str(), actualBssid.c_str());
+                _pinnedActive = false;
+            }
             _startMdns();
-        } else if (millis() - _connectStarted > CONNECT_TIMEOUT_MS) {
+        } else if (_pinnedActive && millis() - _connectStarted > PINNED_FALLBACK_MS) {
+            // Pinned BSSID didn't come up in 60 s — most likely the
+            // mesh node is offline. Drop pin in RAM (NVS preserves
+            // user intent) and re-begin() against plain SSID.
+            Serial.printf("[WiFi] Pinned BSSID %s not reachable in %lus — "
+                          "falling back to plain SSID for this session\n",
+                          _pinnedBssid.c_str(),
+                          PINNED_FALLBACK_MS / 1000UL);
+            _pinnedActive = false;
+            Preferences prefs;
+            prefs.begin(NVS_NS_WIFI, true);
+            String ssid = prefs.getString(NVS_KEY_SSID, "");
+            String pass = prefs.getString(NVS_KEY_PASS, "");
+            prefs.end();
+            if (!ssid.isEmpty()) {
+                WiFi.disconnect();
+                delay(50);
+                WiFi.begin(ssid.c_str(), pass.c_str());
+                _connectStarted = millis();
+            }
+        } else if (!_pinnedActive && millis() - _connectStarted > CONNECT_TIMEOUT_MS) {
+            // Plain-SSID connect timed out — back to provisioning.
+            // Pinned-fallback is gated separately so its 60 s window
+            // runs before this kicks in.
             Serial.println("[WiFi] Connection timed out — starting provisioning AP");
             _state = WifiState::Failed;
             _startAP();
@@ -68,15 +170,23 @@ void WifiProvisioning::_stopAP() {
 }
 
 void WifiProvisioning::_startConnect(const String& ssid, const String& pass) {
-    Serial.printf("[WiFi] Connecting to '%s'...\n", ssid.c_str());
     WiFi.mode(WIFI_STA);
     // Disable modem sleep — default WIFI_PS_MIN_MODEM causes multi-second
-    // TCP stalls on long-lived connections (e.g. the WS link to the scale),
-    // which show up as the scale's traffic going silent for ~10 s at a
-    // time until the heartbeat times the link out.
+    // TCP stalls on long-lived connections (e.g. the WS link to the scale).
     WiFi.setSleep(false);
-    WiFi.begin(ssid.c_str(), pass.c_str());
-    _state = WifiState::Connecting;
+
+    uint8_t bssid_bytes[6];
+    if (!_pinnedBssid.isEmpty() && _parseBssid(_pinnedBssid, bssid_bytes)) {
+        Serial.printf("[WiFi] Connecting to '%s' pinned to BSSID %s\n",
+                      ssid.c_str(), _pinnedBssid.c_str());
+        WiFi.begin(ssid.c_str(), pass.c_str(), 0, bssid_bytes, true);
+        _pinnedActive = true;
+    } else {
+        Serial.printf("[WiFi] Connecting to '%s' (no pin)\n", ssid.c_str());
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        _pinnedActive = false;
+    }
+    _state          = WifiState::Connecting;
     _connectStarted = millis();
 }
 
@@ -106,7 +216,19 @@ void WifiProvisioning::_loadSecurityKey() {
     prefs.end();
 }
 
-void WifiProvisioning::_saveCredentials(const String& ssid, const String& pass, const String& name) {
+void WifiProvisioning::_loadPinnedBssid() {
+    Preferences prefs;
+    prefs.begin(NVS_NS_WIFI, true);
+    _pinnedBssid = prefs.getString(NVS_KEY_PINNED_BSSID, "");
+    prefs.end();
+    if (!_pinnedBssid.isEmpty()) {
+        Serial.printf("[WiFi] Pinned BSSID configured: %s\n", _pinnedBssid.c_str());
+    }
+}
+
+void WifiProvisioning::_saveCredentials(const String& ssid, const String& pass,
+                                        const String& name,
+                                        const String* pinnedBssid) {
     Preferences prefs;
     prefs.begin(NVS_NS_WIFI, false);
     prefs.putString(NVS_KEY_SSID, ssid);
@@ -115,7 +237,34 @@ void WifiProvisioning::_saveCredentials(const String& ssid, const String& pass, 
         prefs.putString(NVS_KEY_DEVICE_NAME, name);
         _deviceName = name;
     }
+    if (pinnedBssid) {
+        prefs.putString(NVS_KEY_PINNED_BSSID, *pinnedBssid);
+        _pinnedBssid = *pinnedBssid;
+    }
     prefs.end();
+}
+
+bool WifiProvisioning::_parseBssid(const String& s, uint8_t out[6]) {
+    if (s.length() != 17) return false;
+    // Colons at positions 2, 5, 8, 11, 14 = `i*3 + 2` for byte i in 0..4.
+    // Earlier `i*3 + 1` was off by one (matched the second hex digit
+    // instead), causing every parse to fail silently — pin was loaded
+    // from NVS and stored, but WiFi.begin always took the "no pin" path.
+    for (int i = 0; i < 6; ++i) {
+        if (i < 5 && s.charAt(i*3 + 2) != ':') return false;
+        char hi = s.charAt(i*3);
+        char lo = s.charAt(i*3 + 1);
+        auto val = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+            return -1;
+        };
+        int h = val(hi), l = val(lo);
+        if (h < 0 || l < 0) return false;
+        out[i] = (uint8_t)((h << 4) | l);
+    }
+    return true;
 }
 
 String WifiProvisioning::_buildScanJson() {
@@ -125,9 +274,11 @@ String WifiProvisioning::_buildScanJson() {
     if (n > 0) {
         for (int i = 0; i < n; i++) {
             JsonObject net = arr.add<JsonObject>();
-            net["ssid"]   = WiFi.SSID(i);
-            net["rssi"]   = WiFi.RSSI(i);
-            net["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+            net["ssid"]    = WiFi.SSID(i);
+            net["bssid"]   = WiFi.BSSIDstr(i);
+            net["channel"] = WiFi.channel(i);
+            net["rssi"]    = WiFi.RSSI(i);
+            net["secure"]  = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
         }
     }
     String out;
@@ -214,13 +365,48 @@ void WifiProvisioning::_setupCaptiveRoutes() {
                 return;
             }
             String ssid = doc["ssid"] | "";
-            String pass = doc["pass"] | "";
             String name = doc["name"] | "";
             if (ssid.isEmpty()) {
                 req->send(400, "application/json", "{\"ok\":false,\"error\":\"ssid required\"}");
                 return;
             }
-            _saveCredentials(ssid, pass, name);
+            // Password handling: omitted `pass` key → preserve NVS.
+            // Empty string → explicit clear (open network). Same
+            // three-state contract as pinned_bssid. Prevents
+            // accidental credential clobbering from a partial POST.
+            String pass;
+            bool passSpecified = doc["pass"].is<const char*>();
+            if (passSpecified) {
+                pass = doc["pass"].as<const char*>();
+            } else {
+                Preferences prefs;
+                prefs.begin(NVS_NS_WIFI, true);
+                pass = prefs.getString(NVS_KEY_PASS, "");
+                prefs.end();
+            }
+            // pinned_bssid handling — see scale's mirror for the contract.
+            const String* pinnedPtr = nullptr;
+            String pinnedVal;
+            if (doc["pinned_bssid"].is<const char*>()) {
+                pinnedVal = doc["pinned_bssid"].as<const char*>();
+                pinnedPtr = &pinnedVal;
+            }
+            if (passSpecified) {
+                _saveCredentials(ssid, pass, name, pinnedPtr);
+            } else {
+                Preferences prefs;
+                prefs.begin(NVS_NS_WIFI, false);
+                prefs.putString(NVS_KEY_SSID, ssid);
+                if (!name.isEmpty()) {
+                    prefs.putString(NVS_KEY_DEVICE_NAME, name);
+                    _deviceName = name;
+                }
+                if (pinnedPtr) {
+                    prefs.putString(NVS_KEY_PINNED_BSSID, *pinnedPtr);
+                    _pinnedBssid = *pinnedPtr;
+                }
+                prefs.end();
+            }
             req->send(200, "application/json", "{\"ok\":true}");
             delay(300);
             _startConnect(ssid, pass);

@@ -10,7 +10,7 @@
 // can stash in _lastError. mbedtls_strerror needs MBEDTLS_ERROR_C in the
 // build; arduino-esp32's mbedtls config has it, so we use the real one.
 #include <mbedtls/error.h>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 // NVS keys are capped at 15 chars; Bambu serials are exactly 15 chars
 // (e.g. "0938AJ622700835"). Use the serial directly as the key.
@@ -135,10 +135,15 @@ int PrinterFtp::_readResponse(String* body, uint32_t timeout_ms) {
     // terminating line. We read from the TLS stream until that
     // terminator appears, accumulating partial lines across reads.
     uint32_t start = millis();
-    String line;
-    int code = -1;
-    bool multi = false;
-    String multi_code;
+    // Stack-buffered line accumulator — replaces the previous `String
+    // line; line += c` per-byte loop that fragmented internal DRAM
+    // (every realloc as the line grew past String's small-buffer was a
+    // separate alloc/free pair). 320 chars covers any FTP response
+    // line we've ever seen; over-long lines are tail-truncated.
+    char     line_buf[320];
+    size_t   line_len = 0;
+    bool     multi = false;
+    char     multi_code[4] = { 0 };
 
     while (millis() - start < timeout_ms) {
         unsigned char tbuf[256];
@@ -154,25 +159,36 @@ int PrinterFtp::_readResponse(String* body, uint32_t timeout_ms) {
         for (int i = 0; i < n; ++i) {
             char c = (char)tbuf[i];
             if (c == '\n') {
-                // Strip trailing CR.
-                if (line.length() && line[line.length() - 1] == '\r') line.remove(line.length() - 1);
-                if (body) { if (body->length()) *body += '\n'; *body += line; }
-                if (line.length() >= 4 && isdigit((unsigned char)line[0]) &&
-                    isdigit((unsigned char)line[1]) && isdigit((unsigned char)line[2])) {
-                    int thisCode = atoi(line.substring(0, 3).c_str());
-                    if (line[3] == '-' && !multi) {
+                line_buf[line_len] = '\0';
+                if (body) {
+                    if (body->length()) *body += '\n';
+                    body->concat(line_buf, line_len);
+                }
+                if (line_len >= 4 && isdigit((unsigned char)line_buf[0]) &&
+                    isdigit((unsigned char)line_buf[1]) && isdigit((unsigned char)line_buf[2])) {
+                    int thisCode = (line_buf[0] - '0') * 100
+                                 + (line_buf[1] - '0') * 10
+                                 + (line_buf[2] - '0');
+                    if (line_buf[3] == '-' && !multi) {
                         multi = true;
-                        multi_code = line.substring(0, 3);
-                        code = thisCode;
-                    } else if (line[3] == ' ') {
-                        if (!multi || line.substring(0, 3) == multi_code) {
+                        multi_code[0] = line_buf[0];
+                        multi_code[1] = line_buf[1];
+                        multi_code[2] = line_buf[2];
+                        multi_code[3] = '\0';
+                    } else if (line_buf[3] == ' ') {
+                        if (!multi || (line_buf[0] == multi_code[0] &&
+                                       line_buf[1] == multi_code[1] &&
+                                       line_buf[2] == multi_code[2])) {
                             return thisCode;
                         }
                     }
                 }
-                line = "";
+                line_len = 0;
             } else if (c != '\r') {
-                line += c;
+                if (line_len + 1 < sizeof(line_buf)) {
+                    line_buf[line_len++] = c;
+                }
+                // tail-truncate over-long lines
             }
         }
     }
@@ -506,6 +522,13 @@ bool PrinterFtp::_openDataAndRetrieve(const String& path, uint32_t offset,
 
     // Phase 2: now do the TLS handshake on the data port.
     if (!_doDataHandshake(&data_net, &data_ssl)) {
+        // _doDataHandshake's retry path leaves data_ssl in a setup-but-
+        // failed state on the second failure; without freeing here it
+        // would leak the mbedtls ssl context (~3-5 KB of PSRAM, plus
+        // any session state) on every analyse-retry tick. The 30 s
+        // analyse retry cadence used to compound this until the next
+        // FTPS open finally OOM'd.
+        mbedtls_ssl_free(&data_ssl);
         mbedtls_net_free(&data_net);
         // Drain whatever the server sends on control after data abort.
         _readResponse();
@@ -661,15 +684,32 @@ bool PrinterFtp::listDir(const String& path, std::vector<String>& out) {
     // Phase 2: TLS handshake on the data port AFTER server has accepted
     // LIST — H2S's vsftpd drives the handshake only after this point.
     if (!_doDataHandshake(&data_net, &data_ssl)) {
+        // Free data_ssl too — see matching note in _openDataAndRetrieve.
+        mbedtls_ssl_free(&data_ssl);
         mbedtls_net_free(&data_net);
         _readResponse();   // drain whatever the server says on control
         return false;
     }
 
     // Drain the data channel — server closes it (PEER_CLOSE_NOTIFY)
-    // when the listing is done.
-    String line;
+    // when the listing is done. Accumulator is built into a small
+    // fixed-stack buffer (every directory entry we'll ever see fits in
+    // 256 chars) and only flushed into a real String at end-of-line —
+    // avoids the realloc-per-character storm the previous `line += c`
+    // loop caused on internal DRAM, which over a 200-entry listing
+    // fragments the heap badly enough to OOM the next FTPS handshake.
+    char     line_buf[256];
+    size_t   line_len = 0;
     uint32_t start = millis();
+    auto pushLine = [&]() {
+        if (line_len == 0) return;
+        if (line_buf[line_len - 1] == '\r') --line_len;
+        if (line_len > 0) {
+            line_buf[line_len] = '\0';
+            out.emplace_back(line_buf);
+        }
+        line_len = 0;
+    };
     while (millis() - start < 15000) {
         unsigned char tbuf[512];
         int n = mbedtls_ssl_read(&data_ssl, tbuf, sizeof(tbuf));
@@ -679,16 +719,17 @@ bool PrinterFtp::listDir(const String& path, std::vector<String>& out) {
         for (int i = 0; i < n; ++i) {
             char c = (char)tbuf[i];
             if (c == '\n') {
-                if (line.length() && line[line.length() - 1] == '\r') line.remove(line.length() - 1);
-                if (line.length()) out.push_back(line);
-                line = "";
-            } else {
-                line += c;
+                pushLine();
+            } else if (line_len + 1 < sizeof(line_buf)) {
+                line_buf[line_len++] = c;
             }
+            // Lines longer than the buffer get tail-truncated to whatever
+            // arrived first — directory listings aren't security-critical
+            // and a truncated entry is preferable to a heap-thrashing one.
         }
         start = millis();
     }
-    if (line.length()) out.push_back(line);
+    pushLine();
     _closeData(&data_net, &data_ssl);
 
     // 226 on control to confirm transfer complete.

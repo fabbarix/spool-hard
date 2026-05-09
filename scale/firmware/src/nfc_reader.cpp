@@ -2,6 +2,7 @@
 #include "config.h"
 #include <Preferences.h>
 #include <SPI.h>
+#include "spoolhard/serial_mirror.h"
 
 NfcReader::NfcReader()
     : _pn532(PN532_SCK_PIN, PN532_MISO_PIN, PN532_MOSI_PIN, PN532_SS_PIN) {}
@@ -29,7 +30,15 @@ void NfcReader::update() {
     uint8_t uid[7];
     uint8_t uid_len = 0;
 
-    bool found = _pn532.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uid_len, 100);
+    // Poll timeout: 30 ms per tick. Was 100 ms (too long, blocked the
+    // main loop) then 10 ms (too short, the PN532 needs ~25-30 ms to
+    // power its RF field, broadcast the InListPassiveTarget command,
+    // wait for the card response, and report — at 10 ms it would
+    // routinely return "no card" even when a tag was held against the
+    // antenna). 30 ms is the documented minimum for reliable
+    // ISO14443A detection with this chip; loop budget cost is fine
+    // since other per-tick work is well under 100 ms total.
+    bool found = _pn532.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uid_len, 30);
 
     if (!found) {
         if (_tagPresent) {

@@ -1,6 +1,11 @@
 #include "protocol.h"
 #include "console_channel.h"
+#include "console_tx.h"
+#include "spoolhard/psram_json_alloc.h"
 #include <deque>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include "spoolhard/serial_mirror.h"
 
 // ── helpers ─────────────────────────────────────────────────
 
@@ -21,6 +26,7 @@ static const char* s2cName(ScaleToConsole::Type t) {
         case T::Term:                return "Term";
         case T::CurrentWeight:       return "CurrentWeight";
         case T::CalibrationStatus:   return "CalibrationStatus";
+        case T::Heartbeat:           return "Heartbeat";
     }
     return "?";
 }
@@ -32,25 +38,51 @@ const char* typeToString(ScaleToConsole::Type t) { return s2cName(t); }
 namespace ScaleToConsole {
 
 static std::function<void(const String&)> g_txTap;
-void setTxTap(std::function<void(const String&)> cb) { g_txTap = cb; }
+static SemaphoreHandle_t g_tx_tap_mtx = nullptr;
+
+static void _ensureTxTapMutex() {
+    if (!g_tx_tap_mtx) g_tx_tap_mtx = xSemaphoreCreateMutex();
+}
+
+void setTxTap(std::function<void(const String&)> cb) {
+    _ensureTxTapMutex();
+    if (xSemaphoreTake(g_tx_tap_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+        g_txTap = std::move(cb);
+        xSemaphoreGive(g_tx_tap_mtx);
+    }
+}
+
+// Snapshot the tx tap under brief lock — emit helpers call this once
+// per send so a concurrent setTxTap() can't replace the std::function
+// mid-deref. The snapshot is a copy of the std::function (cheap; uses
+// the small-buffer-optimization typical std::function carries).
+static std::function<void(const String&)> _txTapSnap() {
+    _ensureTxTapMutex();
+    std::function<void(const String&)> snap;
+    if (xSemaphoreTake(g_tx_tap_mtx, pdMS_TO_TICKS(10)) == pdTRUE) {
+        snap = g_txTap;
+        xSemaphoreGive(g_tx_tap_mtx);
+    }
+    return snap;
+}
 
 // Emit a unit variant: naked JSON string, e.g. "Uncalibrated".
 static void emitUnit(const char* name) {
     String out;
     out.reserve(strlen(name) + 2);
     out += '"'; out += name; out += '"';
-    g_console.sendText(out);
-    if (g_txTap) g_txTap(out);
+    ConsoleTx::send(out);
+    { auto __t = _txTapSnap(); if (__t) __t(out); }
 }
 
 // Emit a single-i32 tuple variant: {"NewLoad": 1234}.
 static void emitTupleI32(const char* name, int32_t value) {
-    JsonDocument env;
+    JsonDocument env(&g_psramJsonAlloc);
     env[name] = value;
     String out;
     serializeJson(env, out);
-    g_console.sendText(out);
-    if (g_txTap) g_txTap(out);
+    ConsoleTx::send(out);
+    { auto __t = _txTapSnap(); if (__t) __t(out); }
 }
 
 // Emit a single-float tuple variant: {"NewLoad": 1234.5}.
@@ -58,22 +90,22 @@ static void emitTupleI32(const char* name, int32_t value) {
 // decimal point is serialized — so clients that still ask for `.as<int32>()`
 // degrade to truncated integers. The console firmware reads this as float.
 static void emitTupleFloat(const char* name, float value) {
-    JsonDocument env;
+    JsonDocument env(&g_psramJsonAlloc);
     env[name] = value;
     String out;
     serializeJson(env, out);
-    g_console.sendText(out);
-    if (g_txTap) g_txTap(out);
+    ConsoleTx::send(out);
+    { auto __t = _txTapSnap(); if (__t) __t(out); }
 }
 
 // Emit a struct variant, copying fields from `inner` under the tag.
 static void emitStruct(const char* name, const JsonDocument& inner) {
-    JsonDocument env;
+    JsonDocument env(&g_psramJsonAlloc);
     env[name] = inner;
     String out;
     serializeJson(env, out);
-    g_console.sendText(out);
-    if (g_txTap) g_txTap(out);
+    ConsoleTx::send(out);
+    { auto __t = _txTapSnap(); if (__t) __t(out); }
 }
 
 void sendSimple(Type type) {
@@ -110,17 +142,17 @@ void send(Type type, JsonDocument& doc) {
 
         // tuple variant with bool
         case Type::PN532Status: {
-            JsonDocument env;
+            JsonDocument env(&g_psramJsonAlloc);
             env["PN532Status"] = doc["status"].as<bool>();
             String out; serializeJson(env, out);
-            g_console.sendText(out);
-            if (g_txTap) g_txTap(out);
+            ConsoleTx::send(out);
+            { auto __t = _txTapSnap(); if (__t) __t(out); }
             break;
         }
 
         // struct variants — pass the whole doc as the inner object
         case Type::ScaleVersion: {
-            JsonDocument inner;
+            JsonDocument inner(&g_psramJsonAlloc);
             inner["version"] = doc["version"].as<const char*>();
             // Display precision (0–4 decimals) travels alongside the
             // version so the console knows how many decimal places to
@@ -151,8 +183,8 @@ void send(Type type, JsonDocument& doc) {
             // updating screen on the LCD); newer builds also read
             // `percent` and `kind` to drive the web UI's per-product
             // progress bars.
-            JsonDocument inner;
-            JsonDocument status;
+            JsonDocument inner(&g_psramJsonAlloc);
+            JsonDocument status(&g_psramJsonAlloc);
             const char* kind = doc["kind"]    | "";   // "" | "firmware" | "frontend"
             int         pct  = doc["percent"] | -1;
             if (doc["text"].is<const char*>()) {
@@ -166,7 +198,7 @@ void send(Type type, JsonDocument& doc) {
                 status["text"] = t;
             } else {
                 // Nothing useful — emit Start as a fallback
-                emitStruct("OtaProgressUpdate", JsonDocument{});
+                emitStruct("OtaProgressUpdate", JsonDocument(&g_psramJsonAlloc));
                 return;
             }
             if (pct >= 0)        status["percent"] = pct;
@@ -176,11 +208,11 @@ void send(Type type, JsonDocument& doc) {
             break;
         }
         case Type::Term: {
-            JsonDocument env;
+            JsonDocument env(&g_psramJsonAlloc);
             env["Term"] = doc["text"].as<const char*>();
             String out; serializeJson(env, out);
-            g_console.sendText(out);
-            if (g_txTap) g_txTap(out);
+            ConsoleTx::send(out);
+            { auto __t = _txTapSnap(); if (__t) __t(out); }
             break;
         }
         case Type::CurrentWeight: {
@@ -191,7 +223,7 @@ void send(Type type, JsonDocument& doc) {
             // precision the scale's own screen would use; precision is the
             // scale's stored decimal-places setting so the console knows
             // how many digits to render.
-            JsonDocument inner;
+            JsonDocument inner(&g_psramJsonAlloc);
             inner["weight_g"]  = doc["weight_g"].as<float>();
             inner["state"]     = doc["state"].as<const char*>();
             if (doc["precision"].is<int>()) inner["precision"] = doc["precision"].as<int>();
@@ -203,10 +235,23 @@ void send(Type type, JsonDocument& doc) {
             // LCD's scale-settings screen renders "Calibration: N points"
             // straight from this — it never has to poll the calibration
             // state otherwise.
-            JsonDocument inner;
+            JsonDocument inner(&g_psramJsonAlloc);
             inner["num_points"] = doc["num_points"].as<int>();
             inner["tare_raw"]   = doc["tare_raw"].as<int32_t>();
             emitStruct("CalibrationStatus", inner);
+            break;
+        }
+        case Type::Heartbeat: {
+            // Periodic liveness + lightweight telemetry. The console
+            // caches uptime_s and renders "scale up for 3d 4h" beside
+            // the connection-state badge. free_heap / min_free_heap let
+            // the user see the scale's memory health from the console
+            // without having to open the scale's own web UI.
+            JsonDocument inner(&g_psramJsonAlloc);
+            inner["uptime_s"]      = doc["uptime_s"].as<uint32_t>();
+            inner["free_heap"]     = doc["free_heap"].as<uint32_t>();
+            inner["min_free_heap"] = doc["min_free_heap"].as<uint32_t>();
+            emitStruct("Heartbeat", inner);
             break;
         }
     }
@@ -220,8 +265,43 @@ namespace ConsoleToScale {
 
 static std::function<void(const String&)> g_rxTap;
 static std::deque<Message> g_queue;
+// Bound the inbound message queue so a misbehaving / runaway console
+// (or a hostile peer that knows the auth key) can't grow this deque
+// without limit. 64 entries × ~256 B per Message is ~16 KB worst case.
+// On overflow we drop the OLDEST — newer messages are usually the more
+// actionable ones (e.g. ButtonResponse needs to land before its
+// timeout sweeps it).
+static constexpr size_t kMaxQueueDepth = 64;
 
-void setRxTap(std::function<void(const String&)> cb) { g_rxTap = cb; }
+// Concurrency guard for g_queue.
+//
+// `deliver()` runs on the AsyncTCP task (port-81 WS_EVT_DATA fires on
+// that task's stack). `receive()` runs on the main `loopTask`. Without
+// a lock, simultaneous push_back / pop_front would corrupt the deque's
+// internal node list and crash the firmware — historically observed
+// as a panic during reconnect storms when CheckOtaUpdates spam
+// briefly raised inbound-frame rate.
+//
+// The mutex hold time per call is microseconds (one alloc + one
+// `std::move` of a Message). Both ends drop on a 50 ms timeout: the
+// AsyncTCP path discards the inbound frame (better than blocking the
+// network task), the main path returns "no message" (next loop tick
+// will retry).
+static SemaphoreHandle_t g_queue_mtx = nullptr;
+static SemaphoreHandle_t g_tap_mtx   = nullptr;
+
+static void _ensureMutex() {
+    if (!g_queue_mtx) g_queue_mtx = xSemaphoreCreateMutex();
+    if (!g_tap_mtx)   g_tap_mtx   = xSemaphoreCreateMutex();
+}
+
+void setRxTap(std::function<void(const String&)> cb) {
+    _ensureMutex();
+    if (xSemaphoreTake(g_tap_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+        g_rxTap = std::move(cb);
+        xSemaphoreGive(g_tap_mtx);
+    }
+}
 
 static Type nameToType(const char* name) {
     if (strcmp(name, "Calibrate")            == 0) return Type::Calibrate;
@@ -243,9 +323,18 @@ static Type nameToType(const char* name) {
 }
 
 void deliver(const String& frame) {
-    if (g_rxTap) g_rxTap(frame);
+    _ensureMutex();
 
-    JsonDocument doc;
+    // Snapshot the tap pointer under its own brief mutex so another task
+    // calling setRxTap() can't race the deref below.
+    std::function<void(const String&)> tap;
+    if (xSemaphoreTake(g_tap_mtx, pdMS_TO_TICKS(10)) == pdTRUE) {
+        tap = g_rxTap;
+        xSemaphoreGive(g_tap_mtx);
+    }
+    if (tap) tap(frame);
+
+    JsonDocument doc(&g_psramJsonAlloc);
     DeserializationError err = deserializeJson(doc, frame);
     if (err) {
         Serial.printf("[Protocol] JSON parse error: %s (frame=%s)\n",
@@ -279,14 +368,29 @@ void deliver(const String& frame) {
         return;
     }
 
+    if (xSemaphoreTake(g_queue_mtx, pdMS_TO_TICKS(50)) != pdTRUE) {
+        Serial.println("[Protocol] queue mutex timeout — dropping inbound frame");
+        return;
+    }
     g_queue.push_back(std::move(out));
+    while (g_queue.size() > kMaxQueueDepth) {
+        Serial.println("[Protocol] inbound queue overflow — dropping oldest");
+        g_queue.pop_front();
+    }
+    xSemaphoreGive(g_queue_mtx);
 }
 
 bool receive(Message& out) {
-    if (g_queue.empty()) return false;
-    out = std::move(g_queue.front());
-    g_queue.pop_front();
-    return true;
+    _ensureMutex();
+    if (xSemaphoreTake(g_queue_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+    bool got = false;
+    if (!g_queue.empty()) {
+        out = std::move(g_queue.front());
+        g_queue.pop_front();
+        got = true;
+    }
+    xSemaphoreGive(g_queue_mtx);
+    return got;
 }
 
 } // namespace ConsoleToScale

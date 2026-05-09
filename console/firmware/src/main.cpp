@@ -25,12 +25,14 @@
 #include "mbedtls_psram_alloc.h"
 #include "core_weights.h"
 #include "calibration_presets.h"
-#include "ring_log.h"
+#include "spoolhard/ring_log.h"
+#include "crash_logger.h"
+#include "spoolhard/ws_buffer_pool.h"
 #include "pending_ams.h"
 #include <lvgl.h>   // LV_SYMBOL_* FontAwesome glyphs baked into Montserrat
 #include "scale_discovery.h"
 #include "ssdp_hub.h"
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 // ── Globals ──────────────────────────────────────────────────
 static ConsoleDisplay    g_display;
@@ -59,6 +61,13 @@ static uint32_t g_activeSpoolOpenedMs  = 0;
 static uint32_t g_activeSpoolExpiresAt = 0;  // millis: AMS-load timeout deadline
 static uint32_t g_spoolAutoCloseAt     = 0;  // millis: loop() should ui_show_home() when crossed
 static constexpr uint32_t SPOOL_AUTOCLOSE_MS = 2500;  // confirmation dwell after AMS assign
+
+// Last (printer, slot) opened on the slot-detail LCD screen. Captured by
+// the slot-tap callback so the separate "Import from printer" callback
+// can resolve which AmsTray to read without UI plumbing the context
+// pointer through. Empty serial = nothing currently shown.
+static String g_lastSlotPrinterSerial;
+static int    g_lastSlotIdx = -1;
 
 // Render the spool-detail LCD screen from a SpoolRecord. Pure UI — doesn't
 // touch PendingAms or the active-spool context trackers, so callers can use
@@ -137,6 +146,42 @@ static bool captureCurrentWeightForSpool(const String& spool_id) {
 // the helper is defined further down (next to _refreshOtaBanner).
 static void _onOtaBannerTap();
 
+// ── Filament-weight capture flow (LCD path) ─────────────────────
+//
+// The old flow on the LCD was: tap "Capture weight" → record the new
+// value → return to home. Two problems:
+//   1. When no empty-spool weight was on file, the persisted value was
+//      the raw scale reading (spool + core + filament), not filament-
+//      only as the spool record's weight_current is supposed to be.
+//      The dashboard then showed the gross weight, throwing off
+//      consume tracking forever.
+//   2. The user wanted to keep the spool screen open after capture so
+//      the AMS-waiting latch could finish its dance — bouncing back
+//      to home cleared the context.
+//
+// The new flow inserts a confirmation step (ui_show_weight_confirm)
+// that displays the existing filament-only weight side-by-side with
+// the freshly-computed one, and only commits on Accept. After either
+// outcome the spool screen is restored — never home — so the user
+// can finish loading the spool into the AMS.
+
+// Snapshot of the proposed capture. Set when the user taps "Capture
+// weight" on the spool screen; cleared on the confirm screen's Accept
+// or Cancel callback. Stable across the brief window between the two
+// screens regardless of whether the scale reading shifts.
+static int g_pendingNewFilamentG = -1;
+
+// Resolve a spool's empty-core weight in grams, falling back to the
+// learned per-(brand,material,advertised) value if the record itself
+// has no explicit core. Returns 0 when neither is known — caller is
+// expected to surface the no-core warning to the user.
+static int _resolveCoreWeight(const SpoolRecord& rec) {
+    if (rec.weight_core > 0) return rec.weight_core;
+    int learned = CoreWeights::get(rec.brand, rec.material_type,
+                                   rec.weight_advertised);
+    return learned > 0 ? learned : 0;
+}
+
 // ── Setup ────────────────────────────────────────────────────
 void setup() {
     Serial.begin(DEBUG_BAUD);
@@ -158,6 +203,10 @@ void setup() {
         Serial.println("[Main] LittleFS (userfs) mount failed");
     }
     g_sd.begin();
+    // Crash-log persistence depends on SD being mounted; if a card is
+    // present and the previous boot ended in a panic / watchdog reset,
+    // begin() also archives the prior session's log under crashes/.
+    CrashLogger::begin();
     g_bambu.begin();
     g_bambu_cloud.begin();
     // SNTP — gives the OTA checker a real wall-clock for "last
@@ -264,6 +313,22 @@ void setup() {
     g_user_filaments.begin();
     // Stock filament library — read-only JSONL on SD, RAM-cached.
     g_stock_filaments.begin();
+
+    // Pre-allocate the WS broadcast buffer pool BEFORE g_web.begin()
+    // so any push helper firing during route-registration order
+    // (unlikely but defensive) finds the pool ready. 4 slots × 8 KB =
+    // 32 KB pinned in internal DRAM forever — replaces ~5–10 ad-hoc
+    // make_shared<vector<uint8_t>> per second under load. The
+    // capacity is sized to fit every state.* envelope we send today
+    // (state.printers tops out around 1.5 KB, state.printer_analysis
+    // around 4 KB during analyse) so the per-broadcast vector::insert
+    // never grows past the pre-reserved buffer.
+    // 8 slots: enough that a fast client cycling broadcasts at 5-10 Hz
+    // never starves on its own, and that a brief multi-client burst
+    // (e.g. 2 tabs both refreshing) doesn't even momentarily block.
+    // 8 × 8 KB = 64 KB pinned forever; we have 80 K typical free heap
+    // headroom so the cost is acceptable.
+    g_wsBufPool.begin(/*count*/ 8, /*initial_capacity*/ 8192);
 
     // Bring up HTTP server + WiFi provisioning.
     g_web.setStore(&g_store);
@@ -560,11 +625,54 @@ void setup() {
         handleTagRead(tag, "NFC");
     });
 
-    // Button callback from the spool screen. CAPTURE_CURRENT stores the
-    // filament-only weight (scale reading minus the empty-core weight) into
-    // weight_current and resets consumed_since_weight; CAPTURE_EMPTY stamps
-    // weight_core; CLOSE just returns to home. All three leave the spool
-    // record id intact.
+    // Confirm-screen callback. Fires from the weight-confirm screen
+    // (ui_show_weight_confirm) after the user taps Accept or Cancel.
+    // Common pattern in both branches: rehydrate the spool record and
+    // re-show the spool detail screen so the AMS-waiting latch keeps
+    // running — leaving the staging context intact is the entire
+    // point of routing through a confirmation rather than going home.
+    ui_set_weight_confirm_callback([](weight_confirm_action_t action) {
+        SpoolRecord rec;
+        bool found = !g_activeSpoolId.isEmpty() &&
+                     g_store.findById(g_activeSpoolId, rec);
+        if (action == WEIGHT_CONFIRM_ACCEPT && found &&
+            g_pendingNewFilamentG >= 0) {
+            rec.weight_current        = g_pendingNewFilamentG;
+            rec.consumed_since_weight = 0;
+            g_store.upsert(rec);
+            Serial.printf("[Spool] accepted weight_current=%dg for %s\n",
+                          g_pendingNewFilamentG, rec.id.c_str());
+            g_store.findById(g_activeSpoolId, rec);   // refresh after upsert
+        }
+        g_pendingNewFilamentG = -1;
+        if (found) {
+            // Stay on the spool screen and re-arm the AMS-waiting hint
+            // so the user knows the latch is still active. The original
+            // active-spool deadline (g_activeSpoolExpiresAt) is
+            // unchanged — the confirm flow doesn't extend nor
+            // shrink the load window.
+            showSpoolDetail(rec);
+            ui_set_spool_ams_status(LV_SYMBOL_REFRESH "  AMS: waiting for load…");
+        } else {
+            g_activeSpoolId = "";
+            g_spoolAutoCloseAt = 0;
+            ui_show_home();
+        }
+    });
+
+    // Button callback from the spool screen.
+    //   CAPTURE_CURRENT — opens the weight-confirm screen with the
+    //                     existing filament-only weight vs the
+    //                     proposed (scale - core) one. Persistence
+    //                     happens on Accept inside the confirm
+    //                     callback above. The spool screen stays in
+    //                     context throughout (g_activeSpoolId / AMS
+    //                     latch unchanged).
+    //   CAPTURE_EMPTY   — stamps weight_core (no confirm, no go-home;
+    //                     the value just lands and the spool screen
+    //                     refreshes so the next CAPTURE_CURRENT has
+    //                     a real core to subtract).
+    //   CLOSE           — explicit user dismiss → home.
     ui_set_spool_callback([](spool_btn_t action, const char* spool_id) {
         if (action == SPOOL_BTN_CLOSE) {
             g_activeSpoolId = "";
@@ -572,27 +680,41 @@ void setup() {
             ui_show_home();
             return;
         }
+
+        SpoolRecord rec;
+        if (!g_store.findById(String(spool_id), rec)) {
+            // Spool deleted out from under us (web UI race) — nothing
+            // sensible to do, return to home.
+            g_activeSpoolId = "";
+            g_spoolAutoCloseAt = 0;
+            ui_show_home();
+            return;
+        }
+
         if (action == SPOOL_BTN_CAPTURE_CURRENT) {
-            if (!captureCurrentWeightForSpool(String(spool_id))) {
-                // Helper already logged the reason; if it was
-                // "no stable reading" stay on screen so the live
-                // readout keeps updating. For missing-record go home.
-                SpoolRecord rec;
-                if (!g_store.findById(String(spool_id), rec)) {
-                    g_activeSpoolId = "";
-                    g_spoolAutoCloseAt = 0;
-                    ui_show_home();
-                }
+            if (!g_scale.hasStableWeight()) {
+                Serial.println("[Spool] capture: no stable reading — stay on screen");
                 return;
             }
-        } else if (action == SPOOL_BTN_CAPTURE_EMPTY) {
-            SpoolRecord rec;
-            if (!g_store.findById(String(spool_id), rec)) {
-                g_activeSpoolId = "";
-                g_spoolAutoCloseAt = 0;
-                ui_show_home();
-                return;
+            int g = (int)g_scale.lastWeightG();
+            int core = _resolveCoreWeight(rec);
+            int proposed = -1;
+            if (core > 0 && g > 0) {
+                proposed = g - core;
+                if (proposed < 0) proposed = 0;
             }
+            // Build a friendly title for the confirm header.
+            String title = rec.brand.length() ? rec.brand : String("Spool");
+            if (rec.material_type.length()) title += " " + rec.material_type;
+            // Stash for the accept handler.
+            g_pendingNewFilamentG = proposed;
+            ui_show_weight_confirm(title.c_str(),
+                                   rec.weight_current,
+                                   proposed);
+            return;
+        }
+
+        if (action == SPOOL_BTN_CAPTURE_EMPTY) {
             if (!g_scale.hasStableWeight()) {
                 Serial.println("[Spool] capture-empty aborted: no stable reading");
                 return;
@@ -605,10 +727,13 @@ void setup() {
             }
             g_store.upsert(rec);
             Serial.printf("[Spool] captured weight_core=%dg for %s\n", g, rec.id.c_str());
+            // Refresh the spool screen so the user sees the new core
+            // value immediately. AMS latch stays armed.
+            g_store.findById(String(spool_id), rec);
+            showSpoolDetail(rec);
+            ui_set_spool_ams_status(LV_SYMBOL_REFRESH "  AMS: waiting for load…");
+            ui_flash_spool_current();
         }
-        g_activeSpoolId = "";
-        g_spoolAutoCloseAt = 0;
-        ui_show_home();
     });
 
     // Initial screen
@@ -710,6 +835,11 @@ void setup() {
             // Nothing to show — stay on home.
             return;
         }
+        // Stash the (printer, slot) the user is currently viewing so the
+        // separate "Import from printer" callback below can resolve it
+        // without needing UI plumbing to round-trip a context pointer.
+        g_lastSlotPrinterSerial = bp->config().serial;
+        g_lastSlotIdx = slot_idx;
         const PrinterState& s = bp->state();
         const char* name = bp->config().name.length() ? bp->config().name.c_str()
                                                       : bp->config().serial.c_str();
@@ -785,6 +915,72 @@ void setup() {
 
         ui_show_slot_detail(&d);
     });
+
+    // "Import from printer" tap on the slot-detail screen. Mirrors the web
+    // POST /api/printers/<serial>/import-ams-spool flow: resolves the
+    // tray the user is looking at, runs applyAmsTrayToSpool(), persists,
+    // and surfaces the outcome in the on-screen notice line.
+    ui_set_slot_import_callback([]() {
+        if (g_lastSlotPrinterSerial.isEmpty() || g_lastSlotIdx < 0) {
+            ui_slot_detail_set_import_notice("No slot in context.");
+            return;
+        }
+        BambuPrinter* bp = g_bambu.find(g_lastSlotPrinterSerial);
+        if (!bp) {
+            ui_slot_detail_set_import_notice("Printer disconnected.");
+            return;
+        }
+        const PrinterState& s = bp->state();
+        const AmsTray* tr = nullptr;
+        if (g_lastSlotIdx >= 0 && g_lastSlotIdx < 4 && s.ams_count > 0) {
+            tr = &s.ams[0].trays[g_lastSlotIdx];
+        } else if (g_lastSlotIdx == 4 && s.has_vt_tray) {
+            tr = &s.vt_tray;
+        }
+        if (!tr || tr->id < 0) {
+            ui_slot_detail_set_import_notice("Slot empty.");
+            return;
+        }
+        if (tr->mapped_spool_id.isEmpty()) {
+            ui_slot_detail_set_import_notice("No spool mapped.");
+            return;
+        }
+        SpoolRecord rec;
+        if (!g_store.findById(tr->mapped_spool_id, rec)) {
+            ui_slot_detail_set_import_notice("Spool not found.");
+            return;
+        }
+        std::vector<String> changed = applyAmsTrayToSpool(*tr, rec);
+        if (changed.empty()) {
+            ui_slot_detail_set_import_notice("Already in sync.");
+            return;
+        }
+        if (!g_store.upsert(rec)) {
+            ui_slot_detail_set_import_notice("Save failed.");
+            return;
+        }
+        // Build a compact summary — the slot-detail screen only has ~2
+        // lines of room for it, so prefer "N fields: a, b, c" over the
+        // dump-everything format. Truncated by the label's wrap mode.
+        String msg = "Imported ";
+        msg += changed.size();
+        msg += changed.size() == 1 ? " field: " : " fields: ";
+        for (size_t i = 0; i < changed.size(); ++i) {
+            if (i) msg += ", ";
+            msg += changed[i];
+        }
+        ui_slot_detail_set_import_notice(msg.c_str());
+    });
+
+    // Spawn the scale_link task so _ws.loop() runs independently of the
+    // main loop's bambu/FTPS/MQTT work. Pre-task split the WS link
+    // would silent-flap every ~17-19 s on this build because main loop
+    // blocked the lib's heartbeat servicing. Must happen AFTER
+    // g_scale.begin() (which loads NVS state + registers callbacks)
+    // and AFTER WiFi is up enough that the first connect attempt has
+    // a chance — but begin()/connect() are gated on WiFi.status()
+    // anyway, so spawning here is safe.
+    g_scale.beginTask();
 
     Serial.println("[Main] Init complete");
 }
@@ -1016,7 +1212,7 @@ static void _onOtaBannerTap() {
     uint32_t __t0 = millis();                                            \
     expr;                                                                \
     uint32_t __dt = millis() - __t0;                                     \
-    if (__dt > 50) Serial.printf("[LoopLat] %s=%lums\n", name,           \
+    if (__dt > 200) Serial.printf("[LoopLat] %s=%lums\n", name,          \
                                  (unsigned long)__dt);                   \
 } while (0)
 void loop() {
@@ -1025,6 +1221,7 @@ void loop() {
     LAT_STEP("scale",           g_scale.update());
     LAT_STEP("nfc",             g_nfc.update());
     LAT_STEP("sd",              g_sd.update());
+    LAT_STEP("crash_log",       CrashLogger::update());
     LAT_STEP("bambu",           g_bambu.update());
     LAT_STEP("bambu_discovery", g_bambu_discovery.update());
     LAT_STEP("scale_discovery", g_scale_discovery.update());
@@ -1054,9 +1251,27 @@ void loop() {
         g_web.pushDiscoveryScales();
         g_web.pushWifiStatus();
         g_web.pushFirmwareInfo();
+        // Heartbeat the scale-link snapshot too. The cached weight only
+        // changes when the scale emits a NewLoad / LoadChanged event,
+        // and a stable load on the platform produces no events at all —
+        // which left the dashboard's live-weight indicator looking
+        // frozen even when the link was healthy. broadcastState short-
+        // circuits on _ws.count()==0 so this is free when nothing's
+        // watching, and the scale_link key has no rate gate so it goes
+        // out every second when a tab IS open. The "ago_ms" alone
+        // updating every second tells the user the link is alive.
+        g_web.pushScaleLink();
+        // ESPAsyncWebServer holds AsyncWebSocketClient instances even
+        // after the underlying TCP connection drops abruptly (page
+        // navigated away, network change, browser killed). Without a
+        // periodic cleanupClients() those zombie entries keep their
+        // queued frames pinned in heap until the next handshake from
+        // the same id reuses the slot. Calling once per second is the
+        // canonical workaround documented in the library's README.
+        g_web.cleanupWsClients();
     }
     uint32_t __loop_dt = millis() - __loop_t0;
-    if (__loop_dt > 100) Serial.printf("[LoopLat] total=%lums\n",
+    if (__loop_dt > 500) Serial.printf("[LoopLat] total=%lums\n",
                                        (unsigned long)__loop_dt);
 
     // Keep the scale-weight cache fresh while the spool-detail screen is
@@ -1068,8 +1283,17 @@ void loop() {
     // recent value. Idle-cheap when no spool screen is up — the whole block
     // skips.
     static uint32_t _lastWeightPollMs = 0;
-    if (!g_activeSpoolId.isEmpty() && g_scale.isConnected() &&
+    bool wantWeightPoll = (!g_activeSpoolId.isEmpty()) ||
+                          (g_web.wsClientCount() > 0);
+    if (wantWeightPoll && g_scale.isConnected() &&
         (millis() - _lastWeightPollMs) > 1000) {
+        // Pulls the scale's current reading even when no
+        // LoadChanged* event would otherwise fire (steady load on the
+        // platform, or the load was already stable before the console
+        // booted). The CurrentWeight reply lands in scale_link's
+        // _dispatch which fires _recordEvent, which triggers a
+        // pushScaleLink — so the dashboard's live weight tile keeps
+        // refreshing as long as any browser is watching.
         g_scale.requestCurrentWeight();
         _lastWeightPollMs = millis();
     }

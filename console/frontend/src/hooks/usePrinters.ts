@@ -16,9 +16,18 @@ export interface AmsTray {
   cali_idx: number;         // Bambu calibration index; -1 when direct-set
 }
 
+export interface AmsDrying {
+  duration_h?: number;
+  temperature_c?: number;
+  filament?: string;
+}
+
 export interface AmsUnit {
   id: number;
-  humidity: number;
+  humidity: number;          // Bambu's 1..5 scaled humidity (-1 if unknown)
+  humidity_raw?: number;     // raw % RH; absent when the printer doesn't report it
+  temp_c?: number;           // chamber temp in °C; absent when not reported
+  drying?: AmsDrying;        // present only while a dry cycle is active
   trays: AmsTray[];
 }
 
@@ -164,6 +173,38 @@ export function useSetAmsMapping() {
         return r.json();
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['printers'] }),
+  });
+}
+
+// Pull the AMS-reported filament info (material, sub-brand, color,
+// slicer_filament, nozzle temps, brand) onto the spool currently mapped
+// to a slot. Returns the list of spool fields that actually changed; an
+// empty list means the record was already in sync. Invalidates `spools`
+// so the dashboard / list / detail panel pick up the new fields, and
+// `printers` so any AMS-derived display in the slot card refreshes.
+export interface ImportAmsSpoolResult {
+  ok: true;
+  spool_id: string;
+  imported: string[];
+  unchanged?: boolean;
+}
+
+export function useImportAmsSpool() {
+  const qc = useQueryClient();
+  return useMutation<ImportAmsSpoolResult, Error, { serial: string; ams_unit: number; slot_id: number }>({
+    mutationFn: ({ serial, ams_unit, slot_id }) =>
+      fetch(`/api/printers/${encodeURIComponent(serial)}/import-ams-spool`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ams_unit, slot_id }),
+      }).then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? 'import failed');
+        return r.json();
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['spools'] });
+      qc.invalidateQueries({ queryKey: ['printers'] });
+    },
   });
 }
 

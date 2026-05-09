@@ -1,6 +1,12 @@
 import { useQuery } from '@tanstack/react-query';
 
-export interface WifiNetwork { ssid: string; rssi: number; secure: boolean; }
+export interface WifiNetwork {
+  ssid: string;
+  bssid: string;
+  channel: number;
+  rssi: number;
+  secure: boolean;
+}
 
 export function useWifiScan() {
   return useQuery<WifiNetwork[]>({

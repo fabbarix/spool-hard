@@ -43,3 +43,5 @@ private:
     bool _tombstone(size_t offset);
     void _rebuildIndex();
 };
+
+extern UserFilamentsStore g_user_filaments;

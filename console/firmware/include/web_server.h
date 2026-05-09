@@ -17,6 +17,18 @@ public:
 
     AsyncWebServer& server() { return _server; }
 
+    // Live count of currently-attached `/ws` clients. Exposed so the
+    // main loop can skip work (e.g. polling the scale for a fresh
+    // weight) when nobody is watching the dashboard.
+    size_t wsClientCount() { return _ws.count(); }
+
+    // Drop AsyncWebSocketClient slots whose underlying TCP connection
+    // is dead. ESPAsyncWebServer doesn't auto-prune on RST / abrupt
+    // socket loss, so without this every navigated-away tab leaves a
+    // zombie client that holds queued frames in heap. Call once a
+    // second from the main loop.
+    void cleanupWsClients() { _ws.cleanupClients(); }
+
     void broadcastDebug(const String& type, const JsonDocument& payload);
     // Push-model state update — wraps `payload` in the
     // `{type:"state.<resource>", data:…}` envelope that the frontend's
@@ -114,18 +126,10 @@ private:
     /// returns false — the caller must simply `return;`.
     bool _requireAuth(AsyncWebServerRequest* req);
 
-    /// /api/auth-status — always 200, never 401. Reports whether the device
-    /// has a non-default key set and whether the request's credentials pass.
-    void _handleAuthStatus(AsyncWebServerRequest* req);
-
     // Config endpoints (ported from scale)
-    void _handleDeviceName(AsyncWebServerRequest* req);
     void _handleOtaConfigGet(AsyncWebServerRequest* req);
     void _handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handleOtaStatus(AsyncWebServerRequest* req);
-    void _handleReset(AsyncWebServerRequest* req);
-    void _handleTestKey(AsyncWebServerRequest* req);
-    void _handleFixedKeyConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handleWifiStatus(AsyncWebServerRequest* req);
     void _handleFirmwareInfo(AsyncWebServerRequest* req);
 
@@ -211,6 +215,11 @@ private:
     void _handleDisplayConfigGet(AsyncWebServerRequest* req);
     void _handleDisplayConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handlePrinterAmsMappingPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    // POST /api/printers/<serial>/import-ams-spool — copies AMS-reported
+    // tray fields (material, color, slicer_filament, nozzle temps, brand)
+    // onto the spool currently mapped to that slot. Lets the user "set up
+    // a filament from the printer panel and adopt it locally."
+    void _handlePrinterImportAmsSpool(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handlePrinterFtpDebug(AsyncWebServerRequest* req, uint8_t* data, size_t len);
 
     // Bambu Lab cloud authentication. The login flow is multi-step
@@ -254,6 +263,18 @@ private:
     void _handleBackupGet(AsyncWebServerRequest* req);
     void _handleRestorePost(AsyncWebServerRequest* req,
                             uint8_t* data, size_t len, size_t index, size_t total);
+
+    // Crash logs persisted to SD by CrashLogger. List + download + delete.
+    // Surfaces what the firmware was doing in the seconds before a panic
+    // / watchdog reset so the user can diagnose instability remotely.
+    void _handleCrashesList(AsyncWebServerRequest* req);
+    void _handleCrashGet(AsyncWebServerRequest* req);
+    void _handleCrashDelete(AsyncWebServerRequest* req);
+    void _handleCrashesDeleteAll(AsyncWebServerRequest* req);
+    // Live tail of the on-disk current.log — separate from /api/logs which
+    // serves the in-memory ring. Useful when the ring has rolled past the
+    // moment of interest but the SD copy still has it.
+    void _handleCurrentLog(AsyncWebServerRequest* req);
     // Restore is delivered in chunks (the file can be ~hundreds of KB);
     // accumulate into PSRAM until the final chunk lands, then parse +
     // apply in the response handler. Reset on every new upload.

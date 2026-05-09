@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Wifi } from 'lucide-react';
 import { useWifiStatus } from '../../hooks/useWifiStatus';
 import { useWifiScan } from '../../hooks/useWifiScan';
@@ -15,12 +15,49 @@ export function WifiSection() {
   const saveMutation = useSaveWifi();
   const [ssid, setSsid] = useState('');
   const [password, setPassword] = useState('');
+  // Pin state. `pinEnabled` toggles the dropdown's visibility AND tells
+  // the save mutation to send `pinned_bssid` (so the firmware knows
+  // explicitly to clear vs. preserve).
+  const [pinEnabled, setPinEnabled] = useState(false);
+  const [pinnedBssid, setPinnedBssid] = useState('');
+
+  // Hydrate the pin form fields from the current wifi-status snapshot.
+  // Runs once when the snapshot first arrives so the user lands on
+  // the same state they last saved.
+  useEffect(() => {
+    if (wifi?.pinned_bssid) {
+      setPinEnabled(true);
+      setPinnedBssid(wifi.pinned_bssid);
+    }
+  }, [wifi?.pinned_bssid]);
 
   const wifiStatus: 'connected' | 'connecting' | 'disconnected' = wifi?.connected
     ? 'connected'
     : wifi?.configured
       ? 'connecting'
       : 'disconnected';
+
+  // Sort scan results by RSSI desc, but only the matching SSID — pin
+  // dropdown should never let the user select an AP from another SSID.
+  const matchingBssids = useMemo(() => {
+    const list = networks ?? [];
+    const targetSsid = ssid || wifi?.ssid || '';
+    return [...list]
+      .filter((n) => n.ssid === targetSsid && n.bssid)
+      .sort((a, b) => b.rssi - a.rssi);
+  }, [networks, ssid, wifi?.ssid]);
+
+  // Distinct SSIDs for the network dropdown — collapse mesh BSSIDs to one row.
+  const distinctSsids = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { ssid: string; rssi: number; secure: boolean }[] = [];
+    for (const n of networks ?? []) {
+      if (seen.has(n.ssid)) continue;
+      seen.add(n.ssid);
+      out.push({ ssid: n.ssid, rssi: n.rssi, secure: n.secure });
+    }
+    return out.sort((a, b) => b.rssi - a.rssi);
+  }, [networks]);
 
   return (
     <SectionCard title="WiFi" icon={<Wifi size={16} />}>
@@ -34,6 +71,15 @@ export function WifiSection() {
               : 'Not configured'}
         </span>
       </div>
+      {wifi?.connected && wifi.bssid && (
+        <div className="text-xs text-text-secondary pl-5">
+          AP {wifi.bssid} · channel {wifi.channel}
+          {wifi.pinned_bssid &&
+            (wifi.pinned_bssid.toLowerCase() === wifi.bssid.toLowerCase()
+              ? ' · pinned'
+              : ` · pin set to ${wifi.pinned_bssid} (fallback active)`)}
+        </div>
+      )}
 
       <div className="flex items-end gap-2">
         <div className="flex-1">
@@ -45,7 +91,7 @@ export function WifiSection() {
               onChange={(e) => setSsid(e.target.value)}
             >
               <option value="">-- Select --</option>
-              {networks?.map((n) => (
+              {distinctSsids.map((n) => (
                 <option key={n.ssid} value={n.ssid}>
                   {n.ssid} ({n.rssi} dBm){n.secure ? ' *' : ''}
                 </option>
@@ -60,9 +106,62 @@ export function WifiSection() {
 
       <InputField label="SSID" value={ssid} onChange={(e) => setSsid(e.target.value)} />
       <PasswordField label="Password" value={password} onChange={(e) => setPassword(e.target.value)} />
+
+      <label className="flex items-center gap-2 text-sm cursor-pointer">
+        <input
+          type="checkbox"
+          checked={pinEnabled}
+          onChange={(e) => {
+            setPinEnabled(e.target.checked);
+            if (!e.target.checked) setPinnedBssid('');
+          }}
+        />
+        <span className="text-text-secondary">
+          Pin to specific access point (mesh node)
+        </span>
+      </label>
+      {pinEnabled && (
+        <label className="block text-sm">
+          <span className="mb-1 block text-sm text-text-secondary">
+            BSSID — pick the same node on each device
+          </span>
+          <select
+            className="w-full bg-surface-input border border-surface-border rounded-button px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-brand-500/50 focus:ring-1 focus:ring-brand-500/20 transition-colors"
+            value={pinnedBssid}
+            onChange={(e) => setPinnedBssid(e.target.value)}
+          >
+            <option value="">-- Select BSSID --</option>
+            {matchingBssids.map((n) => (
+              <option key={n.bssid} value={n.bssid}>
+                {n.bssid} (ch {n.channel}, {n.rssi} dBm)
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-xs text-text-secondary">
+            If the pinned node is unreachable for 60 s, the device falls back to
+            auto-select for this session. The pin is preserved in NVS.
+          </p>
+        </label>
+      )}
+
       <Button
-        onClick={() => saveMutation.mutate({ ssid, pass: password })}
-        disabled={saveMutation.isPending || !ssid}
+        onClick={() => {
+          // Always send pinned_bssid when the user has interacted with
+          // the toggle — empty clears, non-empty stores. If the user
+          // didn't touch the toggle and there's no prior pin, omit the
+          // field entirely so we don't churn NVS.
+          const body: { ssid: string; pass: string; pinned_bssid?: string } = {
+            ssid,
+            pass: password,
+          };
+          if (pinEnabled || wifi?.pinned_bssid) {
+            body.pinned_bssid = pinEnabled ? pinnedBssid : '';
+          }
+          saveMutation.mutate(body);
+        }}
+        disabled={
+          saveMutation.isPending || !ssid || (pinEnabled && !pinnedBssid)
+        }
       >
         {saveMutation.isPending ? 'Connecting...' : 'Save & Connect'}
       </Button>

@@ -1,6 +1,6 @@
 #include "store.h"
 #include "config.h"
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 void SpoolStore::begin(fs::FS& fs, const String& path) {
     _fs        = &fs;

@@ -42,6 +42,13 @@ namespace ScaleToConsole {
         // tare_raw is the persisted zero reading; nonzero means the
         // scale has been tared at least once.
         CalibrationStatus,
+        // Periodic 5 s tick from the scale carrying uptime + heap. We
+        // cache the values on ScaleLink and surface them through
+        // /api/scale-link so the dashboard can show "scale up for 3d
+        // 4h" beside the connection badge. Receiving this also acts as
+        // a soft-liveness signal — if heartbeats stop arriving while we
+        // believe the link is up, the WS itself is probably dead.
+        Heartbeat,
     };
 
     struct Message {

@@ -1,6 +1,8 @@
 #pragma once
 #include <Arduino.h>
 #include <functional>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // Per-product compile-time identity. These come in as -D flags from
 // the consumer's platformio.ini build_flags so the shared lib can be
@@ -163,3 +165,28 @@ struct OtaInFlight {
     uint32_t    started_ms = 0;
 };
 extern OtaInFlight g_ota_in_flight;
+
+// Spawn `otaRun()` on a dedicated FreeRTOS task and return immediately.
+// The task self-deletes when otaRun returns (success path: the device
+// reboots before that). Use this instead of calling otaRun() inline
+// from `loop()` — a multi-minute synchronous fetch starves the WS link,
+// the LED animator, the load-cell sampler, etc.
+//
+// The `cfg` is captured by value into a heap-allocated arg block so
+// the caller can return immediately. `onProgress` is std::move'd into
+// the same block; it runs from the OTA task's context, so callers
+// should keep it short (post to a queue, don't do WS sends inline).
+//
+// Returns the task handle (or nullptr if spawn failed) so the caller
+// can detect a stuck OTA via xTaskGetTaskState if it wants to. Most
+// callers ignore the handle.
+//
+// Stack 12 KB: enough for HTTPClient + mbedtls handshake + sha256 ctx.
+TaskHandle_t otaTaskSpawn(const OtaConfig& cfg,
+                          std::function<void(OtaProgress)> onProgress = nullptr);
+
+// True between `otaTaskSpawn()` and the task's exit. Useful so callers
+// can refuse a second spawn while the first is in flight (Update.cpp's
+// flash partition is a singleton — concurrent runs would clobber each
+// other).
+bool otaTaskInFlight();

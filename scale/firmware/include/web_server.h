@@ -11,6 +11,16 @@ public:
     void start();        // call server.begin() — call after all routes registered
     AsyncWebServer& server() { return _server; }
 
+    // Drop AsyncWebSocketClient slots whose underlying TCP died abruptly.
+    // Without this, zombie tabs accumulate after page reloads or network
+    // changes — each pinning up to 32 queued message buffers in heap.
+    // Same pattern as ConsoleChannel; called once a second from main.
+    void cleanupClients() { _ws.cleanupClients(); }
+
+    // Live count of /ws clients — exposed so the main loop can skip the
+    // 2 Hz raw_sample JsonDocument allocation when nobody is watching.
+    size_t wsClientCount() { return _ws.count(); }
+
     void broadcastDebug(const String& type, const JsonDocument& payload);
     void broadcastConsoleFrame(const char* dir, const String& frame);
     // Push-model state update — wraps `payload` in
@@ -55,28 +65,18 @@ private:
 
     void _setupRoutes();
 
-    /// Check Authorization: Bearer header against the stored fixed key.
-    /// Returns true (and lets the caller continue) if auth isn't required
-    /// (no key set, or key == DEFAULT_FIXED_KEY). Otherwise sends 401 and
-    /// returns false — caller must simply `return;`.
+    /// Thin wrapper around SpoolhardAuth::requireAuth so the rest of
+    /// this file can keep its short name. New code should call
+    /// SpoolhardAuth::requireAuth directly.
     bool _requireAuth(AsyncWebServerRequest* req);
 
-    /// /api/auth-status — always 200, never 401. Frontend probes this to
-    /// decide whether to show the Login page; a subsequent request with the
-    /// Authorization header doubles as the login-verify endpoint.
-    void _handleAuthStatus(AsyncWebServerRequest* req);
-
     void _handleNfcConfig(AsyncWebServerRequest* req);
-    void _handleDeviceName(AsyncWebServerRequest* req);
     void _handleOtaConfigGet(AsyncWebServerRequest* req);
     void _handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     // GET /api/ota-status — pending state + last-check telemetry from the
     // shared OtaChecker. Same shape as the console's, minus the `console`/
     // `scale` split (the scale only knows about itself).
     void _handleOtaStatus(AsyncWebServerRequest* req);
-    void _handleReset(AsyncWebServerRequest* req);
-    void _handleTestKey(AsyncWebServerRequest* req);
-    void _handleFixedKeyConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handleWifiStatus(AsyncWebServerRequest* req);
     void _handleFirmwareInfo(AsyncWebServerRequest* req);
     void _handleScaleConfigGet(AsyncWebServerRequest* req);

@@ -1,4 +1,5 @@
 #include "bambu_printer.h"
+#include "user_filaments_store.h"
 #include "store.h"
 #include "printer_ftp.h"
 #include "zip_reader.h"
@@ -8,7 +9,8 @@
 #include "printer_config.h"
 #include "web_server.h"
 #include "ui/ui.h"
-#include "ring_log.h"
+#include "spoolhard/ring_log.h"
+#include "spoolhard/psram_json_alloc.h"
 #include <WiFiClientSecure.h>
 // Raw-deflate inflater bundled in ROM. Bambu's slicer started shipping
 // some 3MFs with the gcode entry deflate-compressed (method=8) instead
@@ -120,38 +122,9 @@ bool spawnPSRAMFallbackTask(TaskFunction_t fn, void* arg, const char* name,
     return true;
 }
 
-// PSRAM-preferring allocator for ArduinoJson 7. The H2S sends ~17 KB
-// pushall reports every ~1.2 s and ArduinoJson internally allocates
-// nodes that, for a deeply-nested 17 KB JSON, can occupy 30-40 KB of
-// transient heap. Routing those to PSRAM frees internal DRAM for the
-// FTPS analyzer's mbedTLS handshake context (~30 KB) which has to be
-// internal and would otherwise collide with the JsonDocument every
-// time MQTT processes a message during analysis. PSRAM has ~1.7 MB
-// free; the throughput hit on AES/JSON parsing is ~3-4× but only on
-// the parse pass — we never copy the doc again.
-class PsramJsonAllocator : public ArduinoJson::Allocator {
-public:
-    void* allocate(size_t n) override {
-        void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!p) p = heap_caps_malloc(n, MALLOC_CAP_DEFAULT);  // DRAM fallback
-        return p;
-    }
-    void deallocate(void* p) override { heap_caps_free(p); }
-    void* reallocate(void* p, size_t n) override {
-        // No PSRAM realloc API; do alloc+memcpy+free. Fine for JSON node
-        // growth — the doc grows monotonically during deserialization.
-        if (!p) return allocate(n);
-        size_t old = heap_caps_get_allocated_size(p);
-        void* np = allocate(n);
-        if (!np) return nullptr;
-        memcpy(np, p, old < n ? old : n);
-        heap_caps_free(p);
-        return np;
-    }
-};
-static PsramJsonAllocator s_psramJsonAlloc;
-
 }  // namespace
+// PsramJsonAllocator moved to psram_json_alloc.{h,cpp} so the WS
+// broadcast path on the web_server side can share the same instance.
 
 namespace {
 // Fallback nozzle temps per material. Used when a SpoolRecord has no
@@ -182,9 +155,28 @@ void resolveTemps(const String& material, int32_t user_min, int32_t user_max,
     tmin = (user_min > 0) ? (uint32_t)user_min : d_min;
     tmax = (user_max > 0) ? (uint32_t)user_max : d_max;
 }
+
+// Bambu serial → canonical short model code. The serial's first three
+// characters identify the model. Drawn from publicly observed prefixes
+// across LAN-mode pushall reports; falls back to "" when unknown so
+// variant resolution treats the printer as a wildcard.
+String modelFromSerial(const String& serial) {
+    if (serial.length() < 3) return "";
+    String p = serial.substring(0, 3);
+    if (p == "00W") return "X1";
+    if (p == "00M") return "X1C";
+    if (p == "01S") return "P1S";
+    if (p == "01P") return "P1P";
+    if (p == "030") return "A1mini";
+    if (p == "039") return "A1";
+    if (p == "094") return "H2D";
+    if (p == "09C") return "H2S";
+    return "";
+}
 }  // namespace
 
 BambuPrinter::BambuPrinter(const PrinterConfig& cfg) : _cfg(cfg) {
+    _state.model_code = modelFromSerial(cfg.serial);
     _wifi = new WiFiClientSecure();
     _wifi->setInsecure();   // Bambu printers use self-signed certs in LAN mode.
     _mqtt = new PubSubClient(*_wifi);
@@ -226,7 +218,12 @@ void BambuPrinter::updateConfig(const PrinterConfig& cfg) {
 void BambuPrinter::forceReconnect() {
     // Don't fight a pending background connect — it owns _mqtt. Just reset
     // the gate so the next harvest tick promptly retries on failure.
+    // Clearing the failure counter alongside the gate ensures the
+    // user-driven "Reconnect" tap (or an SSDP rediscovery from
+    // BambuManager::onAnnounce) cuts through any in-flight backoff —
+    // the user just told us the printer's reachable, don't wait 5 min.
     _lastConnectAttemptMs = 0;
+    _connectFailureCount  = 0;
     if (_connectTaskState == ConnectTaskState::Pending) return;
     if (_mqtt && _mqtt->connected()) {
         _mqtt->disconnect();
@@ -264,6 +261,7 @@ void BambuPrinter::_ensureConnected() {
                  _cfg.serial.c_str(), (unsigned)ESP.getFreeHeap());
             _state.link = BambuLinkState::Connected;
             _state.error_message = "";
+            _connectFailureCount = 0;   // success → reset backoff
             String topic = "device/" + _cfg.serial + "/report";
             _mqtt->subscribe(topic.c_str());
             requestFullStatus();
@@ -272,8 +270,10 @@ void BambuPrinter::_ensureConnected() {
             char err[32];
             snprintf(err, sizeof(err), "mqtt rc=%d", _mqtt->state());
             _state.error_message = err;
-            dlog("Bambu", "%s connect failed: %s (heap=%u)",
-                 _cfg.serial.c_str(), err, (unsigned)ESP.getFreeHeap());
+            if (_connectFailureCount < 0xFFFF) ++_connectFailureCount;
+            dlog("Bambu", "%s connect failed: %s heap=%u (fail=%u)",
+                 _cfg.serial.c_str(), err, (unsigned)ESP.getFreeHeap(),
+                 (unsigned)_connectFailureCount);
         }
         return;
     }
@@ -290,8 +290,28 @@ void BambuPrinter::_ensureConnected() {
              (unsigned)ESP.getFreeHeap());
     }
 
+    // Exponential backoff so a long-offline printer doesn't churn
+    // lwIP / mbedtls heap on a tight 5 s cycle. Schedule:
+    //   fail #0 → 5 s     (first retry, normal pace)
+    //   fail #1 → 10 s
+    //   fail #2 → 20 s
+    //   fail #3 → 40 s
+    //   fail #4 → 80 s
+    //   fail #5 → 160 s
+    //   fail #6+ → 300 s  (capped at 5 min)
+    // Reset on success (in the harvest path above) OR on SSDP
+    // rediscovery (`onAnnounce` zeroes _lastConnectAttemptMs +
+    // _connectFailureCount), so a printer that just came back online
+    // gets a prompt reconnect rather than waiting out the backoff.
     uint32_t now = millis();
-    if (now - _lastConnectAttemptMs < 5000) return;
+    uint32_t backoff = 5000UL;
+    if (_connectFailureCount > 0) {
+        uint8_t shift = _connectFailureCount;
+        if (shift > 6) shift = 6;
+        backoff <<= shift;   // 5 s × 2^shift
+        if (backoff > 300000UL) backoff = 300000UL;
+    }
+    if (now - _lastConnectAttemptMs < backoff) return;
     _lastConnectAttemptMs = now;
 
     if (_cfg.ip.isEmpty() || _cfg.serial.isEmpty() || _cfg.access_code.isEmpty()) {
@@ -351,12 +371,46 @@ void BambuPrinter::loop() {
     // body lives near the task trampoline further down in this file so
     // it can reach the static types.
     _maybeRetryAnalysis();
+
+    // Drive the in-progress analysis push from the main loop instead of
+    // from inside the FTPS chunk callbacks. The analyzer task on core 0
+    // gets pegged by TLS + inflate + gcode parsing, and queueing WS
+    // frames from there showed up as visibly stale dashboards. Here the
+    // 250 ms gate inside broadcastState pins the actual send rate to
+    // 4 Hz; the analyzer task keeps freshening _lastAnalysis fields,
+    // and we just read the latest snapshot. Final completion still
+    // forces an unconditional push (pushPrinterAnalysisForce in
+    // analyseRemote).
+    // Push printer_analysis whenever there's something live to show:
+    //   * in-flight FTPS fetch — running_grams + running_mm tick up per
+    //     chunk, frontend draws the indeterminate progress.
+    //   * completed analysis on a still-running print — progress_pct
+    //     keeps climbing, and grams_consumed in serializeAnalysis() is
+    //     recomputed against the M73 percent table on every read, so
+    //     the per-tool consumption tiles need to refresh too.
+    // 250 ms rate gate inside broadcastState dedupes either way.
+    //
+    // Crucially gated on the print actually being active. _lastAnalysis
+    // .valid is sticky once the analyzer succeeds and stays true for the
+    // life of the firmware — without the gcode_state check below, this
+    // call would fire at 4 Hz forever after the first print completes,
+    // burning the JsonDocument + String alloc/free cycle in
+    // broadcastState() on into idle. Manifested as a visibly creeping
+    // free_heap because each cycle fragments the internal DRAM allocator.
+    // Active print = RUNNING or PAUSE — same predicate as
+    // _isActiveGcodeState() further down. Inlined here because that
+    // helper is defined below this method.
+    bool print_active = (_state.gcode_state == "RUNNING" ||
+                         _state.gcode_state == "PAUSE");
+    if (_analysisInProgress || (_lastAnalysis.valid && print_active)) {
+        g_web.pushPrinterAnalysis(*this);
+    }
 }
 
 void BambuPrinter::_onMessage(const char* /*topic*/, uint8_t* payload, unsigned int length) {
     // PSRAM-backed JsonDocument so a 17 KB H2S pushall doesn't fight
     // the FTPS analyzer for internal DRAM during a print analysis.
-    JsonDocument doc(&s_psramJsonAlloc);
+    JsonDocument doc(&g_psramJsonAlloc);
     DeserializationError err = deserializeJson(doc, payload, length);
     if (err) {
         Serial.printf("[Bambu %s] parse error: %s (len=%u)\n",
@@ -448,11 +502,12 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
     JsonObjectConst vt = print["vt_tray"];
     if (vt) {
         AmsTray& tr = _state.vt_tray;
-        tr.id            = 254;                    // yanshay's convention for external
-        tr.tray_type     = vt["tray_type"]     | "";
-        tr.tray_color    = vt["tray_color"]    | "";
-        tr.tray_info_idx = vt["tray_info_idx"] | "";
-        tr.tag_uid       = vt["tag_uid"]       | "";
+        tr.id               = 254;                    // yanshay's convention for external
+        tr.tray_type        = vt["tray_type"]        | "";
+        tr.tray_sub_brands  = vt["tray_sub_brands"]  | "";
+        tr.tray_color       = vt["tray_color"]       | "";
+        tr.tray_info_idx    = vt["tray_info_idx"]    | "";
+        tr.tag_uid          = vt["tag_uid"]          | "";
         if (vt["nozzle_temp_min"].is<const char*>()) tr.nozzle_min_c = atoi(vt["nozzle_temp_min"].as<const char*>());
         if (vt["nozzle_temp_max"].is<const char*>()) tr.nozzle_max_c = atoi(vt["nozzle_temp_max"].as<const char*>());
         if (vt["remain"].is<int>())   tr.remain_pct = vt["remain"];
@@ -584,6 +639,56 @@ void BambuPrinter::_pushKRestore(int ams_id, int slot_id, const AmsTray& tr, flo
                   _cfg.serial.c_str(), k, ams_id, slot_id, nozzle);
 }
 
+std::vector<String> applyAmsTrayToSpool(const AmsTray& tr, SpoolRecord& rec) {
+    std::vector<String> imported;
+    // material_type — direct copy when reported.
+    if (tr.tray_type.length() && rec.material_type != tr.tray_type) {
+        rec.material_type = tr.tray_type;
+        imported.push_back("material_type");
+    }
+    // material_subtype — only when distinct from material_type. Bambu often
+    // echoes the family back into tray_sub_brands ("ABS" for ABS), which
+    // would just be noise; the interesting case is "Y2", "Silk", etc.
+    if (tr.tray_sub_brands.length() &&
+        tr.tray_sub_brands != tr.tray_type &&
+        rec.material_subtype != tr.tray_sub_brands) {
+        rec.material_subtype = tr.tray_sub_brands;
+        imported.push_back("material_subtype");
+    }
+    // color_code — strip the alpha and uppercase to match the rest of the
+    // codebase. Skip the all-zero placeholder Bambu emits for empty trays.
+    if (tr.tray_color.length() >= 6) {
+        String c = tr.tray_color.substring(0, 6);
+        c.toUpperCase();
+        if (c != "000000" && rec.color_code != c) {
+            rec.color_code = c;
+            imported.push_back("color_code");
+        }
+    }
+    // slicer_filament — Bambu's tray_info_idx (e.g. "GFB00").
+    if (tr.tray_info_idx.length() && rec.slicer_filament != tr.tray_info_idx) {
+        rec.slicer_filament = tr.tray_info_idx;
+        imported.push_back("slicer_filament");
+    }
+    // Nozzle temps. 0 / negative means "not set on the printer yet".
+    if (tr.nozzle_min_c > 0 && rec.nozzle_temp_min != tr.nozzle_min_c) {
+        rec.nozzle_temp_min = tr.nozzle_min_c;
+        imported.push_back("nozzle_temp_min");
+    }
+    if (tr.nozzle_max_c > 0 && rec.nozzle_temp_max != tr.nozzle_max_c) {
+        rec.nozzle_temp_max = tr.nozzle_max_c;
+        imported.push_back("nozzle_temp_max");
+    }
+    // Brand — "GF*" tray_info_idx is uniformly Bambu Lab catalog. Only
+    // set when the spool's brand is currently empty so a user-curated
+    // brand isn't overwritten with our heuristic.
+    if (tr.tray_info_idx.startsWith("GF") && rec.brand.isEmpty()) {
+        rec.brand = "Bambu Lab";
+        imported.push_back("brand");
+    }
+    return imported;
+}
+
 void BambuPrinter::_persistTrayInfoIdx() {
     // For every AMS slot mapped to a spool, if Bambu reports a non-empty
     // tray_info_idx that differs from the spool's stored slicer_filament,
@@ -651,8 +756,21 @@ void BambuPrinter::_parseAms(const JsonObjectConst& amsObj, PrinterState& out) {
     for (JsonVariantConst unit : units) {
         if (u >= 4) break;
         AmsUnit& dst = out.ams[u];
-        dst.id       = atoi(unit["id"] | "-1");
-        dst.humidity = atoi(unit["humidity"] | "-1");
+        dst.id           = atoi(unit["id"] | "-1");
+        dst.humidity     = atoi(unit["humidity"] | "-1");
+        dst.humidity_raw = atoi(unit["humidity_raw"] | "-1");
+        // `temp` is published as a string ("29.9"); atof on missing -> 0.0,
+        // which would falsely look like a real reading, so gate on presence.
+        if (unit["temp"].is<const char*>()) {
+            const char* t = unit["temp"].as<const char*>();
+            if (t && *t) dst.temp_c = (float)atof(t);
+        }
+        JsonObjectConst dry = unit["dry_setting"];
+        if (dry) {
+            if (dry["dry_duration"].is<int>())    dst.dry_duration_h    = dry["dry_duration"];
+            if (dry["dry_temperature"].is<int>()) dst.dry_temperature_c = dry["dry_temperature"];
+            dst.dry_filament = dry["dry_filament"] | "";
+        }
 
         JsonArrayConst trays = unit["tray"];
         int t = 0;
@@ -660,10 +778,11 @@ void BambuPrinter::_parseAms(const JsonObjectConst& amsObj, PrinterState& out) {
             if (t >= 4) break;
             AmsTray& tr = dst.trays[t];
             tr.id            = atoi(tray["id"] | "-1");
-            tr.tray_type     = tray["tray_type"]     | "";
-            tr.tray_color    = tray["tray_color"]    | "";
-            tr.tray_info_idx = tray["tray_info_idx"] | "";
-            tr.tag_uid       = tray["tag_uid"]       | "";
+            tr.tray_type        = tray["tray_type"]        | "";
+            tr.tray_sub_brands  = tray["tray_sub_brands"]  | "";
+            tr.tray_color       = tray["tray_color"]       | "";
+            tr.tray_info_idx    = tray["tray_info_idx"]    | "";
+            tr.tag_uid          = tray["tag_uid"]          | "";
             if (tray["nozzle_temp_min"].is<const char*>()) tr.nozzle_min_c = atoi(tray["nozzle_temp_min"].as<const char*>());
             if (tray["nozzle_temp_max"].is<const char*>()) tr.nozzle_max_c = atoi(tray["nozzle_temp_max"].as<const char*>());
             if (tray["remain"].is<int>())   tr.remain_pct = tray["remain"];
@@ -875,6 +994,38 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
 
     uint32_t tmin = 0, tmax = 0;
     resolveTemps(rec.material_type, rec.nozzle_temp_min, rec.nozzle_temp_max, tmin, tmax);
+
+    // Variant lookup: SpoolRecord -> FilamentRecord -> variant for
+    // (this printer's model, this printer's nozzle). The AMS payload's
+    // nozzle_temp_min/max are the operational range (shared across
+    // variants), so we don't override them here — but we log the match
+    // so the user can confirm the right per-(printer,nozzle) profile is
+    // being used. Pressure-advance / max-volumetric-speed payloads will
+    // hook in here once we plumb their MQTT commands.
+    if (rec.setting_id.length()) {
+        FilamentRecord fr;
+        if (g_user_filaments.findById(rec.setting_id, fr)) {
+            float n = _state.nozzle_count > 0 ? _state.nozzle_diameters[0] : 0.f;
+            FilamentVariant fv;
+            if (fr.resolveVariant(_state.model_code, n, fv)) {
+                float k0 = fv.pressure_advance.empty()    ? 0.f : fv.pressure_advance[0];
+                float v0 = fv.max_volumetric_speed.empty() ? 0.f : fv.max_volumetric_speed[0];
+                dlog("Bambu", "%s spool %s -> filament '%s' variant %s/%.1fmm "
+                              "(K=%.3f, V=%.1f, T=%d/%d, %u extruder slots)",
+                     _cfg.serial.c_str(), rec.id.c_str(), fr.name.c_str(),
+                     fv.printer_model.length() ? fv.printer_model.c_str() : "*",
+                     fv.nozzle_diameter,
+                     k0, v0,
+                     (int)fv.nozzle_temp_initial_layer, (int)fv.nozzle_temp_print,
+                     (unsigned)fv.extruder_variants.size());
+            } else {
+                dlog("Bambu", "%s spool %s -> filament '%s' (no variant for %s/%.1fmm)",
+                     _cfg.serial.c_str(), rec.id.c_str(), fr.name.c_str(),
+                     _state.model_code.length() ? _state.model_code.c_str() : "?",
+                     n);
+            }
+        }
+    }
 
     // Bambu expects RGBA. Pad RRGGBB → RRGGBBFF (fully opaque) if the
     // record only stored six hex chars, which is the SpoolHard
@@ -1373,14 +1524,13 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             // Per-chunk live snapshot. Floats are aligned 32-bit writes
             // — ESP32-S3 makes those atomic for the web reader, no mutex
             // needed. Cost is ~50 ns of extra accessor calls per ~1 KB
-            // chunk: lost in the FTPS+TLS noise.
+            // chunk: lost in the FTPS+TLS noise. WS dispatch is driven
+            // from BambuPrinter::loop() at the gate's 4 Hz rate so the
+            // analyzer task isn't burning CPU on serializeAnalysis()
+            // calls that broadcastState() would just gate-discard.
             result.progress_bytes = (uint32_t)total;
             result.running_grams  = analyzer.totalGrams();
             result.running_mm     = analyzer.totalMm();
-            // Push to WS clients — rate-gated to ≤ 4 Hz inside
-            // broadcastState so this fires per-chunk but the actual
-            // serialize+send only happens 4× per second at most.
-            g_web.pushPrinterAnalysis(*this);
             return true;
         });
     } else if (data_method == 0) {
@@ -1392,7 +1542,6 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             result.progress_bytes = consumed;
             result.running_grams  = analyzer.totalGrams();
             result.running_mm     = analyzer.totalMm();
-            g_web.pushPrinterAnalysis(*this);
             return true;
         });
     } else {
@@ -1433,7 +1582,6 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             result.progress_bytes = st.consumed_in;
             result.running_grams  = analyzer.totalGrams();
             result.running_mm     = analyzer.totalMm();
-            g_web.pushPrinterAnalysis(*this);
             // Inner loop: a single FTP chunk may contain bytes that
             // produce multiple output windows (e.g. when the
             // decompressed stream is much larger than the compressed
@@ -1760,7 +1908,7 @@ void BambuPrinter::_maybeRetryAnalysis() {
 //              to GET /api/ftp-download to save the file.
 #include <SD.h>
 #include "config.h"       // SD_MOUNT
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 BambuPrinter::FtpStreamCtx::FtpStreamCtx() {
     // 64 KiB so the biggest line we'll ever emit (the `list` done event

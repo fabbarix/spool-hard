@@ -1,7 +1,7 @@
 // Don't redirect Serial in this TU — we need the real USB-CDC.
 #define SERIAL_MIRROR_NO_OVERRIDE
-#include "serial_mirror.h"
-#include "ring_log.h"
+#include "spoolhard/serial_mirror.h"
+#include "spoolhard/ring_log.h"
 
 LineBufferingPrint g_serial;
 

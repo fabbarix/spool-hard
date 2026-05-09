@@ -1,5 +1,6 @@
 #include "ssdp_notify.h"
 #include <WiFi.h>
+#include "spoolhard/serial_mirror.h"
 
 static const IPAddress SPOOLHARD_MCAST(239, 255, 255, 250);
 static constexpr uint16_t SPOOLHARD_PORT = 1990;

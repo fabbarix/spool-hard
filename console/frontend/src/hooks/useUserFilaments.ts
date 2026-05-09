@@ -1,11 +1,31 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import type { FilamentEntry } from './useFilamentsDb';
 
-// Mirrors the firmware's FilamentRecord (console/firmware/include/filament_record.h).
-// Keep field names in sync — server dumps these verbatim from the JSONL on disk.
-export interface PaByNozzleEntry {
-  nozzle: number;            // mm, e.g. 0.4
-  k: number;                 // pressure-advance K
+// Mirrors the firmware's FilamentRecord
+// (console/firmware/include/filament_record.h). Keep field names in
+// sync — server dumps these verbatim from the JSONL on disk.
+//
+// **Variants model.** A logical filament has identity (vendor / material
+// / chemistry-level fields) at the top level and an array of per-
+// (printer, nozzle) variants underneath. Bambu's cloud catalog stores
+// per-(printer, nozzle) presets under names like "<filament> @<printer>
+// <nozzle> nozzle"; on sync we group siblings into one record with N
+// variants. At spool-load time the firmware picks the variant matching
+// the active printer's model code + nozzle diameter.
+// One per-(printer, nozzle) variant. Mirrors Bambu's preset shape:
+// `extruder_variants` is the list of extruder types this preset
+// characterises (e.g. ["Direct Drive Standard", "Direct Drive High
+// Flow"]); `max_volumetric_speed` and `pressure_advance` are arrays
+// indexed parallel to it. Print temperatures are scalar — Bambu doesn't
+// vary them by extruder.
+export interface UserFilamentVariant {
+  printer_model:    string;    // canonical short: "X1C", "P1S", "H2S", … (empty = wildcard)
+  nozzle_diameter:  number;    // mm; 0 = wildcard
+  nozzle_temp_print?:         number;
+  nozzle_temp_initial_layer?: number;
+  extruder_variants?:    string[]; // labels per slot
+  max_volumetric_speed?: number[]; // mm³/s per slot
+  pressure_advance?:     number[]; // K per slot
 }
 
 export interface UserFilament {
@@ -15,33 +35,27 @@ export interface UserFilament {
   base_id: string;           // Bambu's parent preset id, e.g. "GFSA00"
   // Local-stock linkage: when the user picks a stock filament as the
   // base via the form's "Base on a stock filament" picker, this holds
-  // that stock entry's setting_id (e.g. "Bambu PETG Basic @base").
-  // Empty fields on the custom inherit from this parent at display
-  // time. Empty for cloud-synced customs (their `base_id` is in
-  // Bambu's GFXX00 namespace, which doesn't map to a local entry).
+  // that stock entry's setting_id. Empty fields on the custom inherit
+  // from this parent at display time.
   parent_setting_id?: string;
   // Cloud-side parent — the human name of the preset this one
-  // delta-overrides (Bambu's `setting.inherits`). Captured during
-  // cloud sync. Lets the edit form fetch the parent's full settings
-  // via the public-catalog cache and surface them as placeholders for
-  // any field the user hasn't customised.
+  // delta-overrides (Bambu's `setting.inherits`).
   cloud_inherits?: string;
-  filament_type: string;     // PLA / PETG / TPU / ...
-  filament_subtype?: string; // basic / matte / translucent / ...
+  filament_type: string;     // PLA / PETG / TPU / …
+  filament_subtype?: string; // basic / matte / translucent / …
   filament_vendor: string;
   filament_id?: string;      // Bambu's tray_info_idx, e.g. "GFL99"
-  nozzle_temp_min: number;   // -1 = unset
+  nozzle_temp_min: number;   // operational range — common; -1 = unset
   nozzle_temp_max: number;
-  density: number;           // 0 = unset
-  // Pressure-advance: a default scalar (cloud-roundtripped) plus an
-  // optional per-nozzle list. PA depends on (filament, nozzle) so the
-  // list is the preferred source; the scalar is the fallback for any
-  // nozzle without an explicit entry.
-  pressure_advance: number;
-  pa_by_nozzle?: PaByNozzleEntry[];
-  cloud_setting_id: string;  // "" until pushed; PFUS<hash> after sync
-  cloud_synced_at: number;   // epoch s
-  updated_at: number;        // epoch s — drives "out of sync" badge
+  density: number;           // g/cm³; 0 = unset
+  // Per-(printer, nozzle) variants. Empty array == this filament hasn't
+  // been characterised for any specific printer yet (form lets the user
+  // add one).
+  variants: UserFilamentVariant[];
+  cloud_setting_id: string;          // anchor cloud preset id (first sibling)
+  cloud_variant_ids?: string[];      // every cloud preset id we own under this filament
+  cloud_synced_at: number;           // epoch s
+  updated_at: number;                // epoch s — drives "out of sync" badge
 }
 
 export interface UserFilamentsList {
@@ -52,9 +66,9 @@ export interface UserFilamentsList {
 }
 
 // What each field on a custom filament resolves to after merging the
-// parent's values for any field the custom hasn't explicitly set. The
-// `*Inherited` flags tell the UI which fields came from the parent vs.
-// were typed by the user — so the form can label overrides clearly.
+// parent's values for any field the custom hasn't explicitly set. Only
+// identity + the operational range live at this level — per-(printer,
+// nozzle) settings are on UserFilament.variants.
 export interface ResolvedUserFilament {
   filament_type:    string;
   filament_subtype: string;
@@ -63,8 +77,6 @@ export interface ResolvedUserFilament {
   nozzle_temp_min:  number;          // -1 = parent had no value either
   nozzle_temp_max:  number;
   density:          number;          // 0 = unset everywhere
-  pressure_advance: number;
-  pa_by_nozzle:     PaByNozzleEntry[];
   parent_name:      string | null;   // for "(inherits from <name>)" copy
   inherited: {
     filament_type:    boolean;
@@ -74,8 +86,6 @@ export interface ResolvedUserFilament {
     nozzle_temp_min:  boolean;
     nozzle_temp_max:  boolean;
     density:          boolean;
-    pressure_advance: boolean;
-    pa_by_nozzle:     boolean;
   };
 }
 
@@ -112,6 +122,14 @@ export function cloudBodyToFilamentEntry(
     const n = parseFloat(t);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   };
+  // Operational range. Range fields are the source of truth; the
+  // initial-layer / print-temp fields are slicer setpoints, not the
+  // allowed window. Fall back to print temps only when range fields
+  // are absent (older / partial presets).
+  const nozzleMin = firstInt('nozzle_temperature_range_low')
+                 ?? firstInt('nozzle_temperature_initial_layer');
+  const nozzleMax = firstInt('nozzle_temperature_range_high')
+                 ?? firstInt('nozzle_temperature');
   // Strip the surrounding quotes that BambuStudio profiles sometimes
   // emit (`"\"Bambu Lab\""` → `Bambu Lab`).
   const unq = (v: string): string => v.replace(/^"+|"+$/g, '');
@@ -121,10 +139,9 @@ export function cloudBodyToFilamentEntry(
     brand:       unq(first('filament_vendor')),
     material:    unq(first('filament_type')),
     subtype:     unq(first('filament_subtype')),
-    nozzle_temp_min:  firstInt('nozzle_temperature_initial_layer'),
-    nozzle_temp_max:  firstInt('nozzle_temperature'),
+    nozzle_temp_min:  nozzleMin,
+    nozzle_temp_max:  nozzleMax,
     density:          firstFloat('filament_density'),
-    pressure_advance: firstFloat('pressure_advance'),
     base_id:          cloudBody.base_id || undefined,
     setting_id:       cloudBody.name || '',
     source:           'stock',
@@ -132,18 +149,14 @@ export function cloudBodyToFilamentEntry(
 }
 
 // Sentinel detection — the firmware encodes "unset" as -1 for ints,
-// 0 for floats, "" for strings, [] for the PA-per-nozzle list. Centralised
-// here so the form and the display rows agree on what counts as "not set".
+// 0 for floats, "" for strings.
 const isUnsetInt   = (v: number | undefined) => v === undefined || v < 0;
 const isUnsetFloat = (v: number | undefined) => v === undefined || v <= 0;
 const isUnsetStr   = (v: string | undefined) => !v || v.length === 0;
-const isUnsetPaList = (v: PaByNozzleEntry[] | undefined) => !v || v.length === 0;
 
-// Walk the parent chain (one level today — local stock is flat) and
-// return a fully-merged view. `parent` is looked up by the caller from
-// useFilamentsDb (the stock library); we keep this function pure so it
-// can be called from anywhere without grabbing the React Query cache
-// directly.
+// Resolve identity + operational range fields against a stock parent.
+// Variant-level fields (PA, max-vol-speed, print setpoint) are not
+// inherited here — they live on each UserFilamentVariant.
 export function resolveUserFilament(
   custom: UserFilament,
   parent: FilamentEntry | null,
@@ -156,8 +169,6 @@ export function resolveUserFilament(
     nozzle_temp_min:  isUnsetInt(custom.nozzle_temp_min)  && typeof parent?.nozzle_temp_min === 'number',
     nozzle_temp_max:  isUnsetInt(custom.nozzle_temp_max)  && typeof parent?.nozzle_temp_max === 'number',
     density:          isUnsetFloat(custom.density)        && typeof parent?.density === 'number',
-    pressure_advance: isUnsetFloat(custom.pressure_advance) && typeof parent?.pressure_advance === 'number',
-    pa_by_nozzle:     isUnsetPaList(custom.pa_by_nozzle), // parents don't carry pa_by_nozzle today
   };
   return {
     filament_type:    inh.filament_type    ? (parent!.material ?? '')   : custom.filament_type,
@@ -167,11 +178,27 @@ export function resolveUserFilament(
     nozzle_temp_min:  inh.nozzle_temp_min  ? (parent!.nozzle_temp_min ?? -1) : custom.nozzle_temp_min,
     nozzle_temp_max:  inh.nozzle_temp_max  ? (parent!.nozzle_temp_max ?? -1) : custom.nozzle_temp_max,
     density:          inh.density          ? (parent!.density ?? 0)     : custom.density,
-    pressure_advance: inh.pressure_advance ? (parent!.pressure_advance ?? 0) : custom.pressure_advance,
-    pa_by_nozzle:     custom.pa_by_nozzle ?? [],
     parent_name:      parent?.name ?? null,
     inherited:        inh,
   };
+}
+
+// Resolve the right variant for a given (printer, nozzle). Mirrors
+// FilamentRecord::resolveVariant on the firmware. Returns null if no
+// variant matches even at wildcard level.
+export function resolveVariant(
+  variants: UserFilamentVariant[],
+  printerModel: string,
+  nozzleDiameter: number,
+): UserFilamentVariant | null {
+  if (!variants.length) return null;
+  const find = (needModel: boolean, needNozzle: boolean) =>
+    variants.find((v) => {
+      const modelOk  = needModel  ? v.printer_model === printerModel : !v.printer_model;
+      const nozzleOk = needNozzle ? Math.abs(v.nozzle_diameter - nozzleDiameter) < 0.01 : v.nozzle_diameter <= 0;
+      return modelOk && nozzleOk;
+    });
+  return find(true, true) ?? find(true, false) ?? find(false, true) ?? find(false, false) ?? null;
 }
 
 const LIST_KEY = ['user-filaments'];
@@ -208,17 +235,31 @@ export function useUpsertUserFilament() {
   });
 }
 
+export interface DeleteUserFilamentVars {
+  id:        string;
+  // When the record is cloud-synced, the firmware cascades the local
+  // delete to every cloud sibling preset by default. Passing
+  // `keepCloud: true` keeps them up there (e.g. user wants to drop a
+  // local copy without losing the cloud original).
+  keepCloud?: boolean;
+}
+export interface DeleteUserFilamentResult {
+  ok:             true;
+  cloud_deleted?: number;
+  cloud_failed?:  number;
+  diagnostics?:   CloudDiagnostics;
+}
 export function useDeleteUserFilament() {
   const qc = useQueryClient();
-  return useMutation<void, Error, string>({
-    mutationFn: async (id) => {
-      const r = await fetch(`/api/user-filaments/${encodeURIComponent(id)}`, {
+  return useMutation<DeleteUserFilamentResult, Error, DeleteUserFilamentVars>({
+    mutationFn: async ({ id, keepCloud }) => {
+      const qs = keepCloud ? '?keep_cloud=1' : '';
+      const r = await fetch(`/api/user-filaments/${encodeURIComponent(id)}${qs}`, {
         method: 'DELETE',
       });
-      if (!r.ok) {
-        const j = await r.json().catch(() => ({}));
-        throw new Error(j?.error || `HTTP ${r.status}`);
-      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+      return j as DeleteUserFilamentResult;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: LIST_KEY }),
   });
@@ -251,6 +292,7 @@ export interface CloudSyncResult {
   status?:      'ok' | 'rejected' | 'unreachable';
   added?:       number;
   updated?:     number;
+  removed?:     number;     // local records dropped because their cloud siblings disappeared
   diagnostics?: CloudDiagnostics;
 }
 export function useCloudSyncFilaments() {

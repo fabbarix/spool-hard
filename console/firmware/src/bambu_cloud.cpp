@@ -5,7 +5,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <mbedtls/base64.h>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 BambuCloudAuth g_bambu_cloud;
 

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bug, Pause, Play, Trash2, Copy, Zap, CheckCircle2, XCircle, Loader2, FolderOpen, Download, Eraser, HardDrive, Database, AlertTriangle } from 'lucide-react';
+import { Bug, Pause, Play, Trash2, Copy, Zap, CheckCircle2, XCircle, Loader2, FolderOpen, Download, Eraser, HardDrive, Database, AlertTriangle, FileWarning, RefreshCw } from 'lucide-react';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { Button } from '@spoolhard/ui/components/Button';
 import { useWebSocket, type DebugEntry } from '@spoolhard/ui/providers/WebSocketProvider';
 import { useDebugConfig, useUpdateDebugConfig } from '../../hooks/useDebugConfig';
+import { useCrashes, useDeleteCrash, useDeleteAllCrashes, fetchCrashText, type CrashEntry } from '../../hooks/useCrashLogs';
 import { usePrinters, type Printer } from '../../hooks/usePrinters';
 
 // NDJSON events the firmware emits on the FTP debug chunked response.
@@ -74,6 +75,8 @@ export function DebugSection() {
       icon={<Bug size={16} />}
       description="Firmware-side debug toggles. Sessions are not persisted — everything defaults off on boot. Leave disabled during normal use; each AMS report is 1–5 KB of WebSocket traffic."
     >
+      <CrashLogsSection />
+
       <FtpAnalysisProbe />
 
       <SpoolStorageBackend />
@@ -154,6 +157,281 @@ function LogRow({ entry }: { entry: DebugEntry }) {
 {pretty}
         </pre>
       )}
+    </div>
+  );
+}
+
+// Crash logs preserved to SD by the firmware. The console snapshots its
+// in-memory ring log to /spoolease/logs/current.log every ~3 s; on every
+// boot, if the reset reason indicates a panic / watchdog / brownout, the
+// previous session's log is preserved under /spoolease/crashes/ so the
+// user can review what was happening immediately before the crash.
+function CrashLogsSection() {
+  const { data, isLoading, isError, refetch, isFetching } = useCrashes();
+  const del   = useDeleteCrash();
+  const clear = useDeleteAllCrashes();
+
+  const [viewing, setViewing] = useState<CrashEntry | null>(null);
+  const [text, setText]       = useState<string>('');
+  const [textErr, setTextErr] = useState<string | null>(null);
+  const [textLoad, setTextLoad] = useState(false);
+
+  const open = useCallback(async (e: CrashEntry) => {
+    setViewing(e);
+    setText('');
+    setTextErr(null);
+    setTextLoad(true);
+    try {
+      const t = await fetchCrashText(e.seq);
+      setText(t);
+    } catch (err) {
+      setTextErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTextLoad(false);
+    }
+  }, []);
+
+  const close = useCallback(() => {
+    setViewing(null);
+    setText('');
+    setTextErr(null);
+  }, []);
+
+  const downloadCurrent = async (seq: number) => {
+    // Use a transient anchor so the browser saves with a friendly name.
+    const r = await fetch(`/api/crashes/${seq}`);
+    if (!r.ok) return;
+    const blob = await r.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = `spoolease-crash-${seq}.log`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const list = data?.crashes ?? [];
+
+  return (
+    <div className="py-2 border-b border-surface-border space-y-2">
+      <div className="flex items-center gap-2">
+        <FileWarning size={14} className="text-text-muted" />
+        <div className="text-sm text-text-primary">Crash logs</div>
+        <Button
+          variant="secondary"
+          onClick={() => refetch()}
+          disabled={isFetching}
+          className="!py-0.5 !px-1.5 ml-auto"
+          title="Refresh list"
+        >
+          <RefreshCw size={11} className={isFetching ? 'animate-spin' : ''} />
+        </Button>
+      </div>
+      <div className="text-xs text-text-muted">
+        The firmware spills its in-memory log to the SD card every few
+        seconds. After a panic / watchdog / brownout reset, the
+        previous session's log is preserved here so you can review what
+        was running just before the crash.
+      </div>
+
+      {isLoading && (
+        <div className="text-xs text-text-muted italic">loading…</div>
+      )}
+      {isError && (
+        <div className="text-xs text-red-400">
+          Failed to load crash log list.
+        </div>
+      )}
+      {!isLoading && data && !data.available && (
+        <div className="rounded bg-surface-input border border-surface-border px-2 py-1.5 text-xs text-text-muted">
+          Crash log persistence is unavailable — no SD card is mounted.
+        </div>
+      )}
+      {data?.available && list.length === 0 && (
+        <div className="rounded border border-dashed border-surface-border px-2 py-3 text-center text-xs text-text-muted italic">
+          No crashes recorded. The console hasn't reset uncleanly since the
+          card was last cleared.
+        </div>
+      )}
+      {data?.available && list.length > 0 && (
+        <>
+          <div className="rounded border border-surface-border overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="bg-surface-input text-text-muted">
+                <tr>
+                  <th className="px-2 py-1 text-left font-normal">#</th>
+                  <th className="px-2 py-1 text-left font-normal">Reason</th>
+                  <th className="px-2 py-1 text-right font-normal">Size</th>
+                  <th className="px-2 py-1 text-left font-normal">When</th>
+                  <th className="px-2 py-1 text-right font-normal" />
+                </tr>
+              </thead>
+              <tbody>
+                {[...list].reverse().map((c) => (
+                  <tr key={c.seq} className="border-t border-surface-border/60">
+                    <td className="px-2 py-1 font-mono text-text-primary">{c.seq}</td>
+                    <td className="px-2 py-1 font-mono">
+                      <ReasonBadge reason={c.reason} />
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-text-muted">
+                      {(c.bytes / 1024).toFixed(1)} KB
+                    </td>
+                    <td className="px-2 py-1 text-text-muted">
+                      {c.mtime > 0
+                        ? new Date(c.mtime * 1000).toLocaleString()
+                        : <span className="italic">unknown</span>}
+                    </td>
+                    <td className="px-2 py-1 text-right">
+                      <div className="inline-flex gap-1">
+                        <Button
+                          variant="secondary"
+                          onClick={() => open(c)}
+                          className="!py-0.5 !px-1.5"
+                          title="View"
+                        >
+                          <FolderOpen size={11} />
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          onClick={() => downloadCurrent(c.seq)}
+                          className="!py-0.5 !px-1.5"
+                          title="Download"
+                        >
+                          <Download size={11} />
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          onClick={() => del.mutate(c.seq)}
+                          disabled={del.isPending}
+                          className="!py-0.5 !px-1.5"
+                          title="Delete"
+                        >
+                          <Trash2 size={11} />
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex justify-end">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                if (window.confirm(`Delete all ${list.length} crash log(s)?`)) {
+                  clear.mutate();
+                }
+              }}
+              disabled={clear.isPending}
+              className="!py-0.5 !px-1.5"
+            >
+              <Trash2 size={11} className="mr-1 inline" />
+              Clear all
+            </Button>
+          </div>
+        </>
+      )}
+
+      {viewing && (
+        <CrashLogModal
+          entry={viewing}
+          text={text}
+          loading={textLoad}
+          error={textErr}
+          onClose={close}
+        />
+      )}
+    </div>
+  );
+}
+
+function ReasonBadge({ reason }: { reason: string }) {
+  const tone =
+    reason === 'panic'      ? 'bg-red-500/10 text-red-300 border-red-500/30' :
+    reason === 'task_wdt'   ? 'bg-orange-500/10 text-orange-300 border-orange-500/30' :
+    reason === 'int_wdt'    ? 'bg-orange-500/10 text-orange-300 border-orange-500/30' :
+    reason === 'wdt'        ? 'bg-orange-500/10 text-orange-300 border-orange-500/30' :
+    reason === 'brownout'   ? 'bg-yellow-500/10 text-yellow-300 border-yellow-500/30' :
+                              'bg-surface-input text-text-muted border-surface-border';
+  return (
+    <span className={`inline-block px-1.5 py-0.5 rounded border text-[10px] ${tone}`}>
+      {reason}
+    </span>
+  );
+}
+
+function CrashLogModal({
+  entry, text, loading, error, onClose,
+}: {
+  entry:   CrashEntry;
+  text:    string;
+  loading: boolean;
+  error:   string | null;
+  onClose: () => void;
+}) {
+  const copy = useCallback(() => {
+    navigator.clipboard?.writeText(text).catch(() => { /* clipboard blocked */ });
+  }, [text]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-surface-card border border-surface-border rounded-md w-full max-w-4xl max-h-[80vh] flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-surface-border">
+          <FileWarning size={14} className="text-text-muted" />
+          <div className="text-sm text-text-primary">
+            Crash <span className="font-mono">#{entry.seq}</span>
+          </div>
+          <ReasonBadge reason={entry.reason} />
+          <span className="text-xs text-text-muted">
+            {(entry.bytes / 1024).toFixed(1)} KB
+          </span>
+          <div className="ml-auto flex items-center gap-1.5">
+            <Button
+              variant="secondary"
+              onClick={copy}
+              disabled={loading || !!error}
+              className="!py-0.5 !px-1.5"
+            >
+              <Copy size={11} className="mr-1 inline" />
+              Copy
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={onClose}
+              className="!py-0.5 !px-1.5"
+            >
+              Close
+            </Button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-auto p-3 bg-surface-input">
+          {loading && (
+            <div className="text-xs text-text-muted italic">
+              <Loader2 size={12} className="inline animate-spin mr-1" />
+              loading…
+            </div>
+          )}
+          {error && (
+            <div className="text-xs text-red-400">
+              Failed to load crash text: {error}
+            </div>
+          )}
+          {!loading && !error && (
+            <pre className="font-mono text-[11px] text-text-primary whitespace-pre-wrap break-all">
+              {text || <span className="text-text-muted italic">(empty)</span>}
+            </pre>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

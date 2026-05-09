@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Cpu, Scale, Shield, Wrench } from 'lucide-react';
+import { Cpu, Scale, Shield, Wrench, Bug } from 'lucide-react';
 import { DeviceNameSection } from '../components/config/DeviceNameSection';
 import { WifiSection } from '../components/config/WifiSection';
 import { SecurityKeySection } from '../components/config/SecurityKeySection';
@@ -8,14 +8,16 @@ import { OtaSection } from '../components/config/OtaSection';
 import { DirectUploadSection } from '../components/config/DirectUploadSection';
 import { BackupRestoreSection } from '../components/config/BackupRestoreSection';
 import { DeviceControlSection } from '../components/config/DeviceControlSection';
+import { DebugSection } from '../components/config/DebugSection';
 
-type ConfigTab = 'setup' | 'scale' | 'security' | 'device';
+type ConfigTab = 'setup' | 'scale' | 'security' | 'device' | 'debug';
 
 const tabs: { id: ConfigTab; label: string; icon: React.ReactNode }[] = [
   { id: 'setup',    label: 'Setup',    icon: <Cpu size={14} /> },
   { id: 'scale',    label: 'Scale',    icon: <Scale size={14} /> },
   { id: 'security', label: 'Security', icon: <Shield size={14} /> },
   { id: 'device',   label: 'Device',   icon: <Wrench size={14} /> },
+  { id: 'debug',    label: 'Debug',    icon: <Bug size={14} /> },
 ];
 
 function getInitialTab(): ConfigTab {
@@ -83,6 +85,8 @@ export function ConfigPage() {
             <DeviceControlSection />
           </div>
         )}
+
+        {activeTab === 'debug' && <DebugSection />}
       </div>
     </div>
   );

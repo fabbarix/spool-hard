@@ -8,6 +8,66 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.11.0] - 2026-05-09
+
+Catch-up release rolling up everything since v0.7.0. Headline fix:
+the scale↔console WebSocket link no longer cycles every 17–19 s.
+
+- fix(ws): upgrade both products from `mathieucarbou/ESPAsyncWebServer`
+  3.0.6 + `AsyncTCP-esphome` 2.1.4 to `esp32async/ESPAsyncWebServer`
+  3.11.0 + `esp32async/AsyncTCP` 3.4.10. The old pairing had a
+  send-queue drain stall (lib's `_messageQueue` accumulated frames
+  that never reached TCP — `tcp_sndbuf` stayed at full-of-free-space
+  the whole cycle); once the queue hit `WS_MAX_QUEUED_MESSAGES=32`,
+  `closeWhenFull=true` slammed the connection and the console
+  reconnected. ESP32Async v3.10.0 refactored the WS send/queue path
+  (PR #383/#387/#388) and v3.11.0 flipped `closeWhenFull` default to
+  `false` (PR #434), eliminating both halves of the failure mode.
+  Validated on hardware: 7+ minutes of continuous link, qlen never
+  above 1, `sndbuf` actively cycles.
+- feat(scale): WebSocket queue/state diagnostics surface at
+  `/api/logs` — `ws-stats` per-second tick (qlen / peak / cansend /
+  sndbuf / status / txA / txF / rxF / age), `ws-tx` snapshot when
+  outbound queue gets unhealthy, `DISCONN` summary on every
+  WS_EVT_DISCONNECT.
+- chore(scale): add `-DASYNCWEBSERVER_REGEX=1` to scale's build_flags
+  (console always had it). The new lib hard-errors at compile time
+  when `pathArg()` is used without it; the old lib silently treated
+  the regex as a literal string, which is why the
+  `/api/crashes/<seq>` route fell through to the listing endpoint.
+- feat(scale): 0.8.0+ task-model split — sensor_task (HX711, 100 Hz),
+  nfc_task (PN532 SPI, 50 Hz), console_tx_task (single writer to
+  `/ws/console`), AsyncTCP_task (mathieucarbou's lib + lwIP + WiFi);
+  the coordinator `loopTask` no longer blocks on hardware I/O.
+  Single-port web server (port 80) with `/ws` (browser dashboard)
+  and `/ws/console` (paired console).
+- feat(infra): new shared firmware library `spoolhard_core` carrying
+  OTA, product-signature + version markers, NVS-namespace backup /
+  restore, ring log + `dlog`, panic-persist, PSRAM JSON allocator,
+  WS buffer pool, auth, and common routes. Both products consume
+  it as a PlatformIO local library; identity comes in via build_flags
+  (`-DPRODUCT_ID`, `-DPRODUCT_NAME`, `-DOTA_DEFAULT_URL`).
+- feat(console+scale): panic-persist crash logger — boot-time
+  promotion of pending ring-log tail to `/crash_<seq>.txt` when the
+  previous reset reason was crashy; surfaced via `/api/crashes` +
+  `/api/crashes/<seq>` for retrieval over HTTP.
+- feat(console): H2S (Bambu model O1S) printer support — bigger
+  MQTT packet buffer (32 KB; H2S pushall is ~17 KB), no SSDP fallback,
+  FTPS data-port LIST-then-handshake ordering quirk, self-healing
+  per-printer NVS cache + manual reset endpoint.
+- fix(console): Bambu AMS sync — uppercase RGBA before publishing
+  `ams_filament_setting`. Bambu's printer silently drops mixed/lower-
+  case `tray_color` and reverts to black.
+- fix(console): Bambu FTPS — raw-mbedtls FTPS with TLS session reuse,
+  PSRAM allocator override, analyzer reset() restoration.
+- feat(console): print-analysis improvements — G2/G3 arc parsing,
+  `; filament_ids/colour/density` slicer-header parsing, `.bbl`
+  companion JSON for AMS mapping, 4-tier slicer-tool → physical-AMS-
+  slot resolver, streaming inflate for ZIP method=8.
+- feat(infra): release artifacts now include bootloader / partition
+  table / boot_app0 alongside firmware / frontend, plus an
+  `flasher-manifest.json` for esp-web-tools browser flashing.
+
 ## [0.5.9] - 2026-04-27
 
 Print-analysis accuracy + AMS-slot resolution overhaul, plus

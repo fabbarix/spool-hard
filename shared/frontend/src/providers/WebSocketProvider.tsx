@@ -33,15 +33,35 @@ const STATE_TO_QUERY: Record<string, readonly unknown[]> = {
 };
 
 // Query keys to invalidate on a fresh WS connect (or reconnect after a
-// drop) — these are the live resources where stale data is misleading
-// (a stuck progress bar, an offline-but-shown-online printer). The HTTP
-// `queryFn` re-runs once and the next state push from the firmware
-// corrects course. Other resources ride on whatever change-event happens
-// next; their staleness is bounded by the `30_000` fallback poll.
+// drop). On the first connect this is just a light resync; after a
+// reconnect-from-reboot it's the load-bearing path that pulls every
+// firmware-resident resource back to truth. The matching query keys
+// must stay in sync with STATE_TO_QUERY above + the per-printer
+// printer-analysis (handled separately via removeQueries).
 const RECONNECT_INVALIDATE: readonly (readonly unknown[])[] = [
   ['printers'],
   ['scale-link'],
+  ['ota-status'],
+  ['firmware-info'],
+  ['wifi-status'],
+  ['discovery-printers'],
+  ['discovery-scales'],
+  ['core-weights'],
+  ['filaments-db-info'],
+  ['bambu-cloud-public-cache'],
+  // ['spools', 0, 200, ''] is the canonical key the dashboard reads;
+  // narrower views keyed by other params will refresh on their own
+  // remount or via subsequent state.spools pushes.
+  ['spools', 0, 200, ''],
 ];
+
+// If we receive zero frames for this long, assume the device is gone
+// (rebooting, TCP black-holed, network change) and force-close the WS
+// to trigger the reconnect path. The firmware heart-beats state.scale_link
+// once a second whenever a /ws client is attached, so any silence past
+// a couple of seconds is real. 5 s is enough margin to absorb a brief
+// network blip without misfiring.
+const SILENCE_TIMEOUT_MS = 5000;
 
 // Opaque structured debug payload. AMS-raw is the first consumer but
 // keeping this generic lets us plumb additional debug streams later
@@ -105,6 +125,39 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let unmounted = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // Reset the no-traffic watchdog on every received frame. If the
+    // watchdog fires, we treat the connection as dead and force a
+    // close — the onclose handler then schedules the reconnect with
+    // exponential backoff, which is exactly what we want for "device
+    // rebooted, come back when it's up again".
+    function bumpSilenceTimer() {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        const ws = wsRef.current;
+        if (ws && (ws.readyState === WebSocket.OPEN ||
+                   ws.readyState === WebSocket.CONNECTING)) {
+          // Closing here triggers ws.onclose → reconnect schedule.
+          ws.close();
+        }
+      }, SILENCE_TIMEOUT_MS);
+    }
+
+    // Used by both the initial connect and the reconnect path to
+    // pull stale React Query data back to truth + clear per-key
+    // caches that have no fixed query key (printer-analysis is
+    // ['printer-analysis', serial] — we don't know the serials here,
+    // but invalidating on prefix removes them all).
+    function resyncCaches() {
+      for (const key of RECONNECT_INVALIDATE) {
+        queryClient.invalidateQueries({ queryKey: key });
+      }
+      // Per-printer analysis caches: drop them all so any open
+      // PrinterRow refetches fresh after a reboot. Matches keys that
+      // start with 'printer-analysis'.
+      queryClient.invalidateQueries({ queryKey: ['printer-analysis'] });
+    }
 
     function connect() {
       if (unmounted) return;
@@ -122,17 +175,17 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
       ws.onopen = () => {
         setIsConnected(true);
         retryDelay.current = 1000;
+        bumpSilenceTimer();
         // After a fresh connect (including reconnect), invalidate the
         // live resources so React Query refetches once via HTTP and
         // resyncs against the device's current truth. Subsequent
         // updates flow over the WS via state.* pushes.
-        for (const key of RECONNECT_INVALIDATE) {
-          queryClient.invalidateQueries({ queryKey: key });
-        }
+        resyncCaches();
       };
 
       ws.onclose = () => {
         setIsConnected(false);
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
         if (!unmounted) {
           timer = setTimeout(() => {
             retryDelay.current = Math.min(retryDelay.current * 2, 10000);
@@ -146,6 +199,7 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
       };
 
       ws.onmessage = (ev) => {
+        bumpSilenceTimer();
         let msg: WsMessage;
         try {
           msg = JSON.parse(ev.data);
@@ -218,9 +272,32 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
 
     connect();
 
+    // When the tab is hidden, browsers throttle / pause timers and the
+    // WS itself stays half-alive in a way that can mask a dead device.
+    // On visibility-change to visible, kick the watchdog: if no frame
+    // has arrived recently, force-close to trigger an immediate
+    // reconnect+resync. The user expects "switch back to the tab,
+    // see fresh data" with no extra interaction.
+    function onVisibility() {
+      if (document.visibilityState !== 'visible') return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      // Force a one-shot probe by retiming the watchdog to a much
+      // shorter window. If the device is alive, the next 1 Hz heartbeat
+      // beats this and the timer is reset normally; otherwise we close
+      // and reconnect.
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.close();
+      }, 2000);
+    }
+    document.addEventListener('visibilitychange', onVisibility);
+
     return () => {
       unmounted = true;
       if (timer) clearTimeout(timer);
+      if (silenceTimer) clearTimeout(silenceTimer);
+      document.removeEventListener('visibilitychange', onVisibility);
       wsRef.current?.close();
     };
   }, []);

@@ -1,11 +1,18 @@
 import { useWebSocket } from '@spoolhard/ui/providers/WebSocketProvider';
 import { StatusDot } from '@spoolhard/ui/components/StatusDot';
+import { formatUptime } from '@spoolhard/ui/utils/formatUptime';
+import { useLiveUptime } from '@spoolhard/ui/utils/useLiveUptime';
 import { StatCard } from './StatCard';
 import { useScaleConfig } from '../../hooks/useScaleConfig';
+import { useFirmwareInfo } from '../../hooks/useFirmwareInfo';
 
 export function StatsRow() {
   const { rawSample, weightState, nfcEvent, consoleConn } = useWebSocket();
   const { data: cfg } = useScaleConfig();
+  const { data: fw, dataUpdatedAt: fwAt } = useFirmwareInfo();
+  // Tick the displayed uptime locally between WS pushes (every 30 s)
+  // so the user sees seconds advance instead of jumping in 30 s steps.
+  const liveUptime = useLiveUptime(fw?.uptime_s, fwAt);
 
   const precision = Math.max(0, Math.min(4, cfg?.precision ?? 1));
   const grams = rawSample?.weight_g;
@@ -38,7 +45,7 @@ export function StatsRow() {
         className="shadow-[0_0_30px_rgba(240,180,41,0.03)] overflow-hidden"
         style={{ animationDelay: '0ms' }}
       />
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
         <StatCard
           label="Raw"
           dataColor={false}
@@ -83,6 +90,17 @@ export function StatsRow() {
           }
           className="overflow-hidden"
           style={{ animationDelay: '200ms' }}
+        />
+        <StatCard
+          label="Uptime"
+          dataColor={false}
+          value={
+            <span className="block text-sm text-text-primary truncate">
+              {formatUptime(liveUptime)}
+            </span>
+          }
+          className="overflow-hidden"
+          style={{ animationDelay: '250ms' }}
         />
       </div>
     </div>

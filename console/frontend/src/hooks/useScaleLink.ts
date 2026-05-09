@@ -14,6 +14,17 @@ export interface ScaleLastWeight {
   precision?: number;   // scale's configured decimal places (0..4); falls back to 0
 }
 
+export interface ScaleTelemetry {
+  uptime_s: number;
+  free_heap: number;
+  min_free_heap: number;
+  fw_version: string;
+  // -1 when no heartbeat has been received yet (e.g. fresh boot, scale
+  // offline since console came up). Otherwise milliseconds since the
+  // last Heartbeat frame — UI can fade the panel if too stale.
+  heartbeat_ago_ms: number;
+}
+
 export interface ScaleLinkStatus {
   connected: boolean;
   handshake?: 'encrypted' | 'unencrypted' | 'failed' | 'disconnected';
@@ -21,6 +32,10 @@ export interface ScaleLinkStatus {
   name?: string;
   last_event?: ScaleLastEvent;
   weight?: ScaleLastWeight;
+  // Live telemetry from the scale's periodic Heartbeat message.
+  // Present whenever we've received at least one heartbeat; cached
+  // values persist across short WS flaps.
+  telemetry?: ScaleTelemetry;
 }
 
 export function useScaleLink() {

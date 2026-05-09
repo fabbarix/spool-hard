@@ -6,6 +6,12 @@ export interface WifiStatus {
   ssid: string;
   ip: string;
   rssi: number;
+  bssid: string;
+  channel: number;
+  // Persisted user pin: target BSSID for WiFi.begin, or "" for auto.
+  // Survives reboot. Cleared in RAM after a 60 s fallback if the
+  // pinned node is unreachable, but NVS keeps the user's intent.
+  pinned_bssid: string;
 }
 
 export function useWifiStatus() {

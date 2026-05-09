@@ -4,12 +4,15 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/stream_buffer.h>
 #include <memory>
+#include <vector>
 #include "printer_config.h"
+#include "spool_record.h"
 
 // Snapshot of one AMS tray slot (mirrors yanshay/SpoolEase PrintTray).
 struct AmsTray {
     int     id          = -1;       // 0..3 within its AMS
     String  tray_type;              // e.g. "PLA"
+    String  tray_sub_brands;        // Bambu sub-brand string (e.g. "Y2"); "" when not reported
     String  tray_color;             // "RRGGBBAA" hex
     String  tray_info_idx;          // Bambu material code e.g. "GFL99"
     String  tag_uid;                // RFID tag if Bambu-tagged spool
@@ -25,9 +28,26 @@ struct AmsTray {
     int     cali_idx     = -1;      // K calibration index reported by Bambu
 };
 
+// Copy the AMS-reported fields on `tr` onto `rec`, touching only fields
+// that differ from the current record. Used by both the web "import
+// from printer" endpoint and the LCD slot-detail Import button so they
+// stay in lockstep on which fields are adopted and how. Returns the
+// names of SpoolRecord fields that actually changed; caller is
+// responsible for persisting via SpoolStore::upsert when non-empty.
+std::vector<String> applyAmsTrayToSpool(const AmsTray& tr, SpoolRecord& rec);
+
 struct AmsUnit {
     int     id = -1;                // 0..3 if multi-AMS
-    int     humidity = -1;          // 1..5 (5=best)
+    int     humidity = -1;          // 1..5 scaled (Bambu)
+    int     humidity_raw = -1;      // raw % RH; -1 when not reported
+    float   temp_c = -1000.f;       // chamber temp in °C; -1000 = not reported
+    // Drying status (mirrors `dry_setting`). All sentinels mean "inactive";
+    // serializeState only emits the drying block when duration_h > 0.
+    // Bambu reports duration in hours (matches the per-tray `drying_time`
+    // recommendation, e.g. ABS = 8h @ 80°C).
+    int     dry_duration_h    = -1;
+    int     dry_temperature_c = -1;
+    String  dry_filament;
     AmsTray trays[4];
 };
 
@@ -129,6 +149,11 @@ struct PrinterState {
     // correctly since Bambu's pressure-advance is per-nozzle-diameter.
     float   nozzle_diameters[2] = {0.f, 0.f};
     int     nozzle_count = 0;
+    // Canonical short model code derived from the printer's serial
+    // prefix (X1C / X1 / P1S / P1P / A1 / A1mini / H2D / H2S, …). Used
+    // to resolve per-(printer,nozzle) variants on user filaments at
+    // spool-load time. "" until the first MQTT report parses.
+    String  model_code;
     uint32_t last_report_ms = 0;
     String  error_message;          // last connection/parse error, for dashboards
 };
@@ -229,6 +254,13 @@ private:
     PubSubClient*      _mqtt    = nullptr;
     uint32_t           _lastConnectAttemptMs = 0;
     uint32_t           _lastPollMs           = 0;
+    // Consecutive connect failures since last success. Drives an
+    // exponential backoff on the retry interval so a printer that's
+    // been off for hours doesn't keep churning lwIP / mbedtls heap
+    // on a 5 s cycle (the alloc/free pattern that fragments internal
+    // DRAM and panics the firmware overnight). Reset to 0 on success
+    // OR on an SSDP rediscovery (printer just came back online).
+    uint16_t           _connectFailureCount = 0;
 
     // Background connect machinery. PubSubClient::connect() is synchronous
     // and against an unreachable printer takes ~30 s (TLS handshake on top

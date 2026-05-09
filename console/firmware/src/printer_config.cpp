@@ -1,6 +1,6 @@
 #include "printer_config.h"
 #include <Preferences.h>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 PrintersConfig g_printers_cfg;
 

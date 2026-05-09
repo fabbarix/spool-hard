@@ -208,7 +208,24 @@ void OtaChecker::update() {
     bool dueByInterval  = _lastCheckSessionMs > 0 &&
                           (now - _lastCheckSessionMs >
                            cfg.check_interval_h * 60UL * 60UL * 1000UL);
-    if (!_forceNext && !firstAfterBoot && !dueByInterval) return;
+    // Hard floor on _forceNext to break feedback loops. The console
+    // used to send CheckOtaUpdates on every reconnect, and a flapping
+    // link could fire several reconnects per minute. Each forced
+    // check spawns a TLS handshake task that grabs ~60 KB of heap and
+    // hogs core 0 for 3-4 s — directly worsening the link stability
+    // and triggering more reconnects. With this floor, even a buggy
+    // caller can only force one check per 5 min. The console-side
+    // throttle is the primary fix; this is defense-in-depth.
+    constexpr uint32_t kMinForceIntervalMs = 5UL * 60UL * 1000UL;
+    bool forceAllowed = _forceNext &&
+                        (_lastCheckSessionMs == 0 ||
+                         (now - _lastCheckSessionMs) > kMinForceIntervalMs);
+    if (_forceNext && !forceAllowed) {
+        Serial.printf("[OTA] forced check throttled (last %lus ago)\n",
+                      (unsigned long)((now - _lastCheckSessionMs) / 1000));
+        _forceNext = false;
+    }
+    if (!forceAllowed && !firstAfterBoot && !dueByInterval) return;
 
     _forceNext = false;
     _lastCheckSessionMs = now;
@@ -478,4 +495,51 @@ bool otaRun(const OtaConfig& cfg, std::function<void(int)> percentCb) {
             percentCb(p.percent);
         }
     });
+}
+
+// ── Task wrapper ─────────────────────────────────────────────
+// Lifts otaRun() off the caller's stack so the main loop / HTTP
+// handler can return immediately. Stack budget: 12 KB covers
+// HTTPClient + mbedtls + sha256 + WiFiClientSecure + 4 KB stream
+// buffer with reasonable margin. Pinned to core 0 (system + lwIP)
+// so the load-cell sampler / LED animator on core 1 stay smooth.
+
+namespace {
+struct OtaTaskArgs {
+    OtaConfig cfg;
+    std::function<void(OtaProgress)> cb;
+};
+volatile bool s_ota_task_in_flight = false;
+
+void _otaTaskBody(void* arg) {
+    auto* args = static_cast<OtaTaskArgs*>(arg);
+    s_ota_task_in_flight = true;
+    Serial.println("[OTA] task starting");
+    otaRun(args->cfg, args->cb);
+    // otaRun() reboots on success; if we get here the run failed.
+    Serial.println("[OTA] task exiting (run failed)");
+    s_ota_task_in_flight = false;
+    delete args;
+    vTaskDelete(nullptr);
+}
+}  // namespace
+
+bool otaTaskInFlight() { return s_ota_task_in_flight; }
+
+TaskHandle_t otaTaskSpawn(const OtaConfig& cfg,
+                          std::function<void(OtaProgress)> onProgress) {
+    if (s_ota_task_in_flight) {
+        Serial.println("[OTA] spawn refused — task already in flight");
+        return nullptr;
+    }
+    auto* args = new OtaTaskArgs{cfg, std::move(onProgress)};
+    TaskHandle_t h = nullptr;
+    BaseType_t r = xTaskCreatePinnedToCore(_otaTaskBody, "ota_run",
+                                           12 * 1024, args, 2, &h, 0);
+    if (r != pdPASS) {
+        Serial.println("[OTA] xTaskCreate failed");
+        delete args;
+        return nullptr;
+    }
+    return h;
 }

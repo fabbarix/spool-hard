@@ -24,7 +24,6 @@ export interface FilamentEntry {
   nozzle_temp_max?: number;
   density?: number;        // g/cm³
   advertised?: number;     // grams
-  pressure_advance?: number; // K; only useful when prefilling a custom filament
   base_id?: string;        // Bambu base preset id (e.g. "GFSA00")
   setting_id?: string;     // matches FilamentRecord::setting_id firmware-side
   source?: 'stock' | 'user';
@@ -44,7 +43,6 @@ interface FilamentJsonRow {
   nozzle_temp_min: number;     // -1 = unset
   nozzle_temp_max: number;
   density: number;             // 0 = unset
-  pressure_advance?: number;
 }
 
 function entryFromJsonRow(row: FilamentJsonRow): FilamentEntry {
@@ -57,8 +55,6 @@ function entryFromJsonRow(row: FilamentJsonRow): FilamentEntry {
     nozzle_temp_min: row.nozzle_temp_min > 0 ? row.nozzle_temp_min : undefined,
     nozzle_temp_max: row.nozzle_temp_max > 0 ? row.nozzle_temp_max : undefined,
     density:         row.density         > 0 ? row.density         : undefined,
-    pressure_advance: row.pressure_advance && row.pressure_advance > 0
-      ? row.pressure_advance : undefined,
     base_id:     row.base_id,
     setting_id:  row.setting_id,
     source:      'stock',

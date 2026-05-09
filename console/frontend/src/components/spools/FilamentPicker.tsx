@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { X, Thermometer, Search, BookOpen, User as UserIcon } from 'lucide-react';
 import { Button } from '@spoolhard/ui/components/Button';
 import { useFilamentsDb, type FilamentEntry } from '../../hooks/useFilamentsDb';
@@ -48,7 +49,6 @@ export function FilamentPicker({ onPick, onClose, stockOnly, title, description 
         nozzle_temp_min: u.nozzle_temp_min > 0 ? u.nozzle_temp_min : undefined,
         nozzle_temp_max: u.nozzle_temp_max > 0 ? u.nozzle_temp_max : undefined,
         density:     u.density > 0 ? u.density : undefined,
-        pressure_advance: u.pressure_advance > 0 ? u.pressure_advance : undefined,
         setting_id:  u.setting_id,
         source:      'user',
       }));
@@ -79,9 +79,9 @@ export function FilamentPicker({ onPick, onClose, stockOnly, title, description 
     });
   }, [entries, q, fam]);
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-[90] flex items-center justify-center bg-surface-body/80 backdrop-blur-sm animate-in fade-in"
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-surface-body/80 backdrop-blur-sm animate-in fade-in"
       onClick={onClose}
     >
       <div
@@ -178,7 +178,8 @@ export function FilamentPicker({ onPick, onClose, stockOnly, title, description 
           <Button variant="secondary" onClick={onClose}>Cancel</Button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

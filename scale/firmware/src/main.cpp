@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include "spoolhard/psram_json_alloc.h"
 // Force PlatformIO's library-dependency-finder to pull in HTTPClient.
 // The shared spoolhard_core/src/ota.cpp uses it; LDF only walks
 // #includes from the project's own src/ tree (chain+ default), not
@@ -12,30 +13,49 @@
 #include "config.h"
 #include "load_cell.h"
 #include "nfc_reader.h"
+#include "sensor_task.h"
+#include "nfc_task.h"
+#include "console_tx.h"
 #include "rgb_led.h"
 #include "protocol.h"
 #include "console_channel.h"
 #include "web_server.h"
 #include "wifi_provisioning.h"
 #include "spoolhard/ota.h"
+#include "spoolhard/ws_buffer_pool.h"
+#include "spoolhard/panic_persist.h"
 #include <SPIFFS.h>
+#include <atomic>
+
+// Mirror everything printed to Serial into the in-RAM ring log so
+// /api/logs surfaces the LAT_STEP / dlog output remotely. Must come
+// after all framework + project headers since it macro-rewrites
+// `Serial` for the rest of this translation unit.
+#include "spoolhard/serial_mirror.h"
+#include "spoolhard/ring_log.h"   // dlog()
 
 // ── Globals ──────────────────────────────────────────────────
-static LoadCell        g_scale;
-static NfcReader       g_nfc;
-static RgbLed          g_led;
-static ScaleWebServer  g_web;
+// g_scale and g_nfc have external linkage so the dedicated tasks
+// (sensor_task, nfc_task) can declare them `extern` and own their
+// update loops. The other singletons stay file-scoped — only the
+// coordinator code in this TU touches them.
+LoadCell                g_scale;
+NfcReader               g_nfc;
+static RgbLed           g_led;
+static ScaleWebServer   g_web;
 static WifiProvisioning g_wifi;
 
 static WeightState   g_lastWeightState = WeightState::Uncalibrated;
 static unsigned long g_lastRawSent      = 0;
-static bool          g_pendingOta       = false;
-// Deadline (millis) up to which an HTTP upload is considered "in flight".
-// Refreshed on every chunk via web_server's onUploadProgress callback so the
-// LED can stay on the amber pulse for the duration of the upload — without
-// this, updateLed() would overwrite the pulse the moment the next loop tick
-// runs after onUploadStarted fired its single one-shot.
-static unsigned long g_uploadActiveUntil = 0;
+
+// Atomics — these flags are set from AsyncTCP/HTTP handlers (a different
+// task than `loop()`) and consumed by the main loop. Without atomics the
+// compiler may reorder or cache the load/store and the loop sees stale
+// values; we've observed this empirically as missed handshakes after
+// reconnect on `-O2`. `memory_order_relaxed` is fine because each flag
+// stands alone — there's no ordering dependency between them.
+static std::atomic<bool>     g_pendingOta{false};
+static std::atomic<uint32_t> g_uploadActiveUntil{0};
 static constexpr unsigned long UPLOAD_LIVENESS_MS = 3000;
 
 // Feature-button state. GPIO 0 is active-LOW through an internal pull-up.
@@ -71,7 +91,15 @@ static const char* weightStateName(WeightState s);
 // The hash is a cheap concatenation of the fields that matter — the only
 // purpose is change detection, not security.
 static String g_lastPendingHash;
-static bool   g_pendingPushPending = false;  // force-push (e.g. on connect)
+static std::atomic<bool> g_pendingPushPending{false};   // force-push (e.g. on connect)
+// Set on console-connect (AsyncTCP task); consumed on the next loop
+// tick (loopTask) which sends ScaleVersion + CalibrationStatus.
+// Deferred (rather than sent inline from WS_EVT_CONNECT) because the
+// AsyncTCP queue isn't fully drained of the HTTP-upgrade response yet
+// at the moment WS_EVT_CONNECT fires; frames queued synchronously then
+// can be lost. Atomic so the loopTask sees the AsyncTCP write
+// immediately even on `-O2` reorders.
+static std::atomic<bool> g_pendingPushHandshake{false};
 
 static String _pendingHash(const OtaPending& p, uint32_t lastTs, const String& lastSt) {
     String s;
@@ -96,7 +124,7 @@ static void pushOtaPendingIfChanged(bool force) {
     if (!force && h == g_lastPendingHash) return;
     g_lastPendingHash = h;
 
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["firmware_current"]  = p.firmware_current;
     doc["firmware_latest"]   = p.firmware_latest;
     doc["frontend_current"]  = p.frontend_current;
@@ -111,11 +139,14 @@ static void pushOtaPendingIfChanged(bool force) {
 // Push the current calibration state to the console so its LCD scale-
 // settings screen renders "Calibration: N points" without polling.
 // Called after every action that mutates calibration (tare, addCalPoint,
-// clear, legacy single-point calibrate). Cheap — just two ints over WS.
+// clear, legacy single-point calibrate). Reads via SensorTask snapshot
+// so the cal struct comes from a brief mutex (consistent w.r.t. the
+// task's own concurrent saveCalibration writes).
 static void pushCalibrationStatus() {
-    JsonDocument doc;
-    doc["num_points"] = (int)g_scale.cal().numPoints;
-    doc["tare_raw"]   = (int32_t)g_scale.cal().tare_raw;
+    auto cal = SensorTask::snapshotCal();
+    JsonDocument doc(&g_psramJsonAlloc);
+    doc["num_points"] = (int)cal.numPoints;
+    doc["tare_raw"]   = (int32_t)cal.tare_raw;
     ScaleToConsole::send(ScaleToConsole::Type::CalibrationStatus, doc);
 }
 
@@ -129,34 +160,30 @@ static void handleConsoleMessage(ConsoleToScale::Message& msg) {
             int32_t weight = msg.doc.as<int32_t>();
             if (weight == 0) {
                 Serial.println("[App] Tare (Calibrate 0)");
-                g_scale.tare();
+                SensorTask::requestTare();
             } else {
                 Serial.printf("[App] Calibrate with known weight=%ldg\n", (long)weight);
-                g_scale.calibrate((float)weight);
+                SensorTask::requestCalibrate((float)weight);
             }
-            pushCalibrationStatus();
+            // Coordinator loop polls SensorTask::consumeCalDirty() and
+            // pushes CalibrationStatus once the request lands. Don't
+            // push synchronously from here — the cal data is mid-write.
             break;
         }
         case T::AddCalPoint: {
             // {"AddCalPoint": i32} — capture raw + add to multi-point curve.
-            // Mirrors the web /api/scale-cal-point flow used by the scale's
-            // own calibration wizard, only triggered from the console LCD.
             int32_t weight = msg.doc.as<int32_t>();
             if (weight <= 0) {
                 Serial.printf("[App] AddCalPoint ignored — bad weight %ld\n", (long)weight);
                 break;
             }
-            long raw = g_scale.captureRaw();
-            g_scale.addCalPoint((float)weight, raw);
-            Serial.printf("[App] AddCalPoint %ldg @ raw=%ld → %u points\n",
-                          (long)weight, raw, (unsigned)g_scale.cal().numPoints);
-            pushCalibrationStatus();
+            Serial.printf("[App] AddCalPoint %ldg → sensor task\n", (long)weight);
+            SensorTask::requestAddCalPoint((float)weight);
             break;
         }
         case T::ClearCalPoints: {
-            Serial.println("[App] ClearCalPoints");
-            g_scale.clearCalPoints();
-            pushCalibrationStatus();
+            Serial.println("[App] ClearCalPoints → sensor task");
+            SensorTask::requestClearCalPoints();
             break;
         }
         case T::ButtonResponse: {
@@ -176,24 +203,28 @@ static void handleConsoleMessage(ConsoleToScale::Message& msg) {
             break;
         }
         case T::WriteTag: {
-            const char* text   = msg.doc["text"]   | "";
-            const char* cookie = msg.doc["cookie"] | "";
-            JsonArray uid_arr  = msg.doc["check_uid"].as<JsonArray>();
-            uint8_t uid[7]; uint8_t uid_len = 0;
-            for (JsonVariant v : uid_arr) uid[uid_len++] = v.as<uint8_t>();
-            g_nfc.writeTag(uid, uid_len, text, cookie);
+            NfcTask::WriteRequest r{};
+            r.ndef_message = msg.doc["text"]   | "";
+            r.cookie       = msg.doc["cookie"] | "";
+            JsonArray uid_arr = msg.doc["check_uid"].as<JsonArray>();
+            for (JsonVariant v : uid_arr) {
+                if (r.uid_len < 7) r.uid[r.uid_len++] = v.as<uint8_t>();
+            }
+            NfcTask::requestWrite(r);
             break;
         }
         case T::EraseTag: {
+            NfcTask::EraseRequest r{};
             JsonArray uid_arr = msg.doc["check_uid"].as<JsonArray>();
-            uint8_t uid[7]; uint8_t uid_len = 0;
-            for (JsonVariant v : uid_arr) uid[uid_len++] = v.as<uint8_t>();
-            g_nfc.eraseTag(uid, uid_len);
+            for (JsonVariant v : uid_arr) {
+                if (r.uid_len < 7) r.uid[r.uid_len++] = v.as<uint8_t>();
+            }
+            NfcTask::requestErase(r);
             break;
         }
         case T::EmulateTag: {
-            const char* url = msg.doc["url"] | "";
-            g_nfc.emulateTag(url);
+            String url = msg.doc["url"] | "";
+            NfcTask::requestEmulate(url);
             break;
         }
         case T::UpdateFirmware: {
@@ -218,16 +249,13 @@ static void handleConsoleMessage(ConsoleToScale::Message& msg) {
             break;
         }
         case T::GetCurrentWeight: {
-            // On-demand read — console asks for the current weight so its
-            // UI can show a value without waiting for the next state
-            // change. Send the full-precision float (not the rounded
-            // display value) plus the scale's configured precision so the
-            // console-side renderer can show `123.4 g` as the headline
-            // and `123.456 g` in the muted full-precision fallback.
-            JsonDocument out;
-            out["weight_g"]  = g_scale.getWeightG();
-            out["state"]     = weightStateName(g_scale.getState());
-            out["precision"] = g_scale.params().precision;
+            // Snapshot read — sensor_task publishes via seqlock, no
+            // blocking, no torn reads.
+            auto snap = SensorTask::snapshot();
+            JsonDocument out(&g_psramJsonAlloc);
+            out["weight_g"]  = snap.weight_g;
+            out["state"]     = weightStateName(snap.state);
+            out["precision"] = snap.precision;
             ScaleToConsole::send(ScaleToConsole::Type::CurrentWeight, out);
             break;
         }
@@ -240,7 +268,7 @@ static void handleConsoleMessage(ConsoleToScale::Message& msg) {
             if (f) { f.print(tags); f.close(); }
 
             // Push to dashboard
-            JsonDocument dbg;
+            JsonDocument dbg(&g_psramJsonAlloc);
             dbg["tags"] = tags;
             g_web.broadcastDebug("tags_in_store", dbg);
             break;
@@ -295,11 +323,12 @@ static const char* weightStateName(WeightState s) {
 
 static void sendWeightEvent(WeightState state) {
     using T = ScaleToConsole::Type;
-    JsonDocument doc;
+    auto snap = SensorTask::snapshot();
+    JsonDocument doc(&g_psramJsonAlloc);
     // Send the raw float so the console can render at whatever precision
     // the user configured (see ScaleVersion/CurrentWeight `precision`
     // field). getDisplayWeight() would pre-round and throw away decimals.
-    doc["weight_g"] = g_scale.getWeightG();
+    doc["weight_g"] = snap.weight_g;
 
     switch (state) {
         case WeightState::Uncalibrated:
@@ -319,27 +348,69 @@ static void sendWeightEvent(WeightState state) {
         default: break;
     }
 
-    JsonDocument dbg;
+    JsonDocument dbg(&g_psramJsonAlloc);
     dbg["state"]    = weightStateName(state);
-    dbg["weight_g"] = g_scale.getWeightG();
+    dbg["weight_g"] = SensorTask::getWeightG();
     g_web.broadcastDebug("weight_state", dbg);
 }
 
-static void sendNfcEvent() {
-    JsonDocument doc;
-    doc["status"] = (int)g_nfc.getStatus();
+// Most recent successful tag read, kept across the lifetime of the
+// firmware for replay-on-reconnect. The console-scale WS link can
+// momentarily wedge (PONGs flow but TEXT doesn't) — if a tag scan
+// fires during that window the TagStatus frame gets queued, the
+// queue eventually overflows or the lib tears the connection down,
+// and the message is lost. Replaying the cached tag in the deferred
+// on-connect handshake ensures the console catches up after the
+// reconnect even though the original frame never landed.
+//
+// Only ReadSuccess frames are cached; Idle / Failure don't carry a
+// useful UID to replay.
+// Tag-replay cache. Today these are only touched from the main loop,
+// so there's no race. Phase C will move NFC into its own task, at
+// which point the writer becomes `nfc_task` and the reader is the
+// app coordinator on the same loop. The bool + uint32_t are atomic
+// already; the SpoolTag struct will need a mutex once it crosses the
+// task boundary. Leaving plain for now — guard added together with
+// the task split so the type changes land in one commit.
+static SpoolTag           g_lastSuccessTag = {};
+static TagStatus          g_lastSuccessTagStatus = TagStatus::Idle;
+static std::atomic<uint32_t> g_lastSuccessTagMs{0};
+static std::atomic<bool>     g_haveLastSuccessTag{false};
 
-    const SpoolTag& tag = g_nfc.getLastTag();
+static void _writeNfcDoc(JsonDocument& doc, TagStatus status, const SpoolTag& tag) {
+    doc["status"] = (int)status;
     if (tag.uid_len > 0) {
         JsonArray uid = doc["uid"].to<JsonArray>();
         for (int i = 0; i < tag.uid_len; i++) uid.add(tag.uid[i]);
         doc["url"] = tag.ndef_url;
         doc["is_bambulab"] = tag.is_bambulab;
     }
+}
+
+// Legacy entry point kept around in case the LCD refresh path needs it
+// later. The loop's NfcTask::pollEvent drain inlines the same work and
+// uses the event-snapshot tag (which can't race the next nfc_task
+// sample). Marked [[maybe_unused]] so removing the last caller doesn't
+// trip -Wunused-function under -Wall.
+[[maybe_unused]]
+static void sendNfcEvent_unused() {
+    auto snap = NfcTask::snapshot();
+    JsonDocument doc(&g_psramJsonAlloc);
+    _writeNfcDoc(doc, snap.status, snap.tag);
 
     ScaleToConsole::send(ScaleToConsole::Type::TagStatus, doc);
-    if (g_nfc.getStatus() != TagStatus::Idle)
+    if (snap.status != TagStatus::Idle)
         g_web.broadcastDebug("nfc", doc);
+
+    // Cache for replay on the next console connect — only ReadSuccess
+    // is worth replaying, the transient FoundTagNowReading status
+    // doesn't carry payload the console acts on.
+    if (snap.status == TagStatus::ReadSuccess && snap.tag.uid_len > 0) {
+        g_lastSuccessTag       = snap.tag;
+        g_lastSuccessTagStatus = snap.status;
+        g_lastSuccessTagMs.store(millis());
+        g_haveLastSuccessTag.store(true);
+    }
 }
 
 // LED priority (highest first), see rgb_led.h for the full palette:
@@ -347,10 +418,10 @@ static void sendNfcEvent() {
 //   console connected > WiFi only > AP mode > offline
 static void updateLed() {
     // OTA flow pins the amber slow pulse; let it run undisturbed.
-    if (g_pendingOta) return;
+    if (g_pendingOta.load() || otaTaskInFlight()) return;
     // HTTP upload in flight — keep the amber pulse pinned. Idempotent in
     // showUpdating() so re-calling each tick doesn't reset the animation.
-    if (g_uploadActiveUntil && millis() < g_uploadActiveUntil) {
+    if (g_uploadActiveUntil.load() && millis() < g_uploadActiveUntil.load()) {
         g_led.showUpdating();
         return;
     }
@@ -360,8 +431,9 @@ static void updateLed() {
 
     // NFC read/write in flight — takes priority over weighing so the user
     // knows "hold the tag steady" rather than "the weight is settled".
-    if (g_nfc.getStatus() == TagStatus::FoundTagNowReading ||
-        g_nfc.getStatus() == TagStatus::FoundTagNowWriting) {
+    TagStatus ts = NfcTask::getStatus();
+    if (ts == TagStatus::FoundTagNowReading ||
+        ts == TagStatus::FoundTagNowWriting) {
         g_led.showNfcActivity();
         return;
     }
@@ -370,7 +442,7 @@ static void updateLed() {
     // dark-teal family: flashing while the reading is settling, solid once
     // it's stable. Same hue means "weight in progress → weight done" reads
     // as a single state with two phases rather than two unrelated ones.
-    WeightState ws = g_scale.getState();
+    WeightState ws = SensorTask::getState();
     bool stable      = ws == WeightState::StableLoad ||
                        ws == WeightState::LoadChangedStable;
     bool loadPresent = stable ||
@@ -407,6 +479,18 @@ void setup() {
         Serial.println("[Main] SPIFFS mount failed");
     }
 
+    // Crash log persistence — promotes the previous boot's pending
+    // ring-tail to a stable /crash_<seq>.txt if the previous reset
+    // reason was crashy. Surfaces via the /api/crashes route below.
+    PanicPersist::begin();
+
+    // Pre-allocate the WS broadcast pool BEFORE any code path that might
+    // emit a state.* push (web server start, console connect callback).
+    // 8 slots × 8 KB each — covers every envelope shape the scale sends
+    // with margin. Slots live in DRAM (vector<uint8_t>) but are reused
+    // forever after; no per-broadcast allocation under steady state.
+    g_wsBufPool.begin(/*count*/ 8, /*initial_capacity*/ 8192);
+
     g_led.begin();
     g_led.showOffline();   // red solid until WiFi + console catch up
 
@@ -415,90 +499,80 @@ void setup() {
     g_scale.begin();
     g_nfc.begin();
 
-    g_web.onTare([]() { g_scale.tare(); });
-    g_web.onCalibrate([](float w) { g_scale.calibrate(w); });
-    g_web.onAddCalPoint([](float w) {
-        long raw = g_scale.captureRaw();
-        g_scale.addCalPoint(w, raw);
-    });
-    g_web.onClearCal([]() { g_scale.clearCalPoints(); });
-    g_web.onCaptureRaw([]() -> long { return g_scale.captureRaw(); });
-    // Apply precision / rounding / sampling changes live — no reboot
-    // required. The web handler just wrote NVS, so re-read it AND push
-    // the updated precision to the console so its dashboard/LCD re-
-    // format the live weight immediately. Re-using ScaleVersion here
-    // (vs. adding a new message type) costs a few extra bytes on the
-    // wire for the version string; worth it to keep the protocol
-    // surface small.
+    // Spawn the dedicated FreeRTOS tasks that own the load cell + PN532.
+    // Order matters: g_scale.begin() / g_nfc.begin() must finish first
+    // so the tasks see a fully-initialized chip on their first poll.
+    SensorTask::begin();
+    NfcTask::begin();
+    // Single-writer WS sender for the port-81 console link. Must be
+    // up before any ScaleToConsole::send() call — protocol.cpp's emit
+    // helpers route through ConsoleTx::send() now.
+    ConsoleTx::begin();
+
+    // All HTTP-handler callbacks now post commands to the sensor task
+    // instead of mutating g_scale directly. This isolates blocking
+    // HX711 reads (up to ~5 s for tare's 20-sample average) from the
+    // AsyncTCP task and lets HTTP responses complete instantly.
+    g_web.onTare([]()            { SensorTask::requestTare();        });
+    g_web.onCalibrate([](float w){ SensorTask::requestCalibrate(w); });
+    g_web.onAddCalPoint([](float w){ SensorTask::requestAddCalPoint(w); });
+    g_web.onClearCal([]()        { SensorTask::requestClearCalPoints(); });
+    // /api/scale-raw returns the LATEST cached raw sample — the HTTP
+    // handler doesn't block waiting for a fresh average. Frontend uses
+    // this as a live-display value, not a cal-quality reading.
+    g_web.onCaptureRaw([]() -> long { return SensorTask::getLastRaw(); });
     g_web.onConfigChanged([]() {
-        g_scale.loadParams();
+        SensorTask::requestReloadParams();
         if (g_console.isConnected()) {
-            JsonDocument doc;
+            JsonDocument doc(&g_psramJsonAlloc);
             doc["version"]   = FW_VERSION;
-            doc["precision"] = g_scale.params().precision;
+            doc["precision"] = SensorTask::getPrecision();
             ScaleToConsole::send(ScaleToConsole::Type::ScaleVersion, doc);
         }
     });
     g_web.onUploadStarted([](const char* /*type*/) {
-        // Slow amber pulse for the duration of the upload — same signal as
-        // the OTA-triggered path below; from the user's perspective both
-        // are "software being updated, please wait".
         g_led.showUpdating();
-        g_uploadActiveUntil = millis() + UPLOAD_LIVENESS_MS;
+        g_uploadActiveUntil.store(millis() + UPLOAD_LIVENESS_MS);
     });
     g_web.onUploadProgress([]() {
-        // Each chunk pushes the deadline out so updateLed() keeps the
-        // amber pulse pinned. If the client drops mid-upload the deadline
-        // expires UPLOAD_LIVENESS_MS later and the LED returns to normal.
-        g_uploadActiveUntil = millis() + UPLOAD_LIVENESS_MS;
+        g_uploadActiveUntil.store(millis() + UPLOAD_LIVENESS_MS);
     });
     g_web.onOtaRequested([]() {
-        // POST /api/ota-run on the scale's own web UI. Defer to the main
-        // loop's OTA path so the HTTP response can finish before we start
-        // pulling firmware over HTTPS.
-        g_pendingOta = true;
+        g_pendingOta.store(true);
     });
     g_web.begin();                   // register API routes (port 80)
     g_wifi.begin(g_web.server());    // register captive portal routes
-    g_web.start();                   // start the config server
 
-    // Port-81 WebSocket server — this is the channel the SpoolHard Console
-    // connects to after SSDP discovery finds us.
-    g_console.begin();
+    // Mount the console-link WS at /ws/console on the SAME port-80
+    // server. Single AsyncWebServer instance now hosts: SPA static,
+    // /api/* HTTP, /ws (browser dashboard), /ws/console (paired
+    // console). Must be done BEFORE start() — addHandler is only safe
+    // on a not-yet-listening server.
+    g_console.begin(g_web.server());
+
+    g_web.start();                   // start the unified server
     g_console.onConnected([](const String& ip) {
         Serial.printf("[Console] SpoolHard Console connected from %s\n", ip.c_str());
         // Push a connection event to the dashboard
-        JsonDocument dbg;
+        JsonDocument dbg(&g_psramJsonAlloc);
         dbg["connected"] = true;
         dbg["ip"]        = ip;
         g_web.broadcastDebug("console_conn", dbg);
 
-        // Version + current display precision on the same on-connect
-        // handshake. Console caches precision so it knows how many
-        // decimal places to render from the weight floats it receives.
-        JsonDocument doc;
-        doc["version"]   = FW_VERSION;
-        doc["precision"] = g_scale.params().precision;
-        ScaleToConsole::send(ScaleToConsole::Type::ScaleVersion, doc);
-
-        // Force a fresh OtaPending push on every reconnect — the console
-        // doesn't persist the cached state across its own reboots, so a
-        // reconnect (e.g. after a console OTA) needs to re-seed it.
-        g_pendingPushPending = true;
-
-        // Seed the console with the current calibration state so the
-        // LCD's scale-settings screen shows the right "N points" /
-        // "Uncalibrated" the first time the user taps it. Subsequent
-        // mutations push their own CalibrationStatus from
-        // pushCalibrationStatus().
-        JsonDocument calDoc;
-        calDoc["num_points"] = (int)g_scale.cal().numPoints;
-        calDoc["tare_raw"]   = (int32_t)g_scale.cal().tare_raw;
-        ScaleToConsole::send(ScaleToConsole::Type::CalibrationStatus, calDoc);
+        // Defer the actual handshake frames (ScaleVersion +
+        // CalibrationStatus) AND the OtaPending push to the next loop
+        // tick. AsyncTCP's queue is in a transient state at the moment
+        // WS_EVT_CONNECT fires — the WS upgrade response hasn't been
+        // fully ACK'd yet — and frames sent synchronously from this
+        // handler are intermittently dropped (the version field on the
+        // dashboard kept showing empty after a reconnect because of
+        // exactly this).
+        g_pendingPushHandshake.store(true);
+        g_pendingPushPending.store(true);
     });
     g_console.onDisconnected([]() {
         Serial.println("[Console] SpoolHard Console disconnected");
-        JsonDocument dbg;
+        JsonDocument dbg(&g_psramJsonAlloc);
         dbg["connected"] = false;
         g_web.broadcastDebug("console_conn", dbg);
     });
@@ -528,32 +602,50 @@ void setup() {
 }
 
 // ── Loop ──────────────────────────────────────────────────────
-void loop() {
-    // WiFi provisioning state machine
-    g_wifi.update();
+//
+// Per-step latency instrumentation. If any step takes longer than 50 ms
+// we log the offender so we can diagnose flapping on the scale↔console
+// link — long stalls in the main loop starve AsyncTCP and the WS
+// heartbeat (5 s cadence) starts arriving late, which the console reads
+// as a soft-disconnect.
+#define LAT_STEP(name, expr) do {                                \
+    uint32_t __t0 = millis();                                    \
+    expr;                                                        \
+    uint32_t __dt = millis() - __t0;                             \
+    if (__dt > 50) Serial.printf("[LoopLat] %s=%lums\n", name,   \
+                                 (unsigned long)__dt);           \
+} while (0)
 
-    // Weight
-    g_scale.update();
-    WeightState ws = g_scale.getState();
-    if (ws != g_lastWeightState) {
-        Serial.printf("[Weight] %s → %s (%.1fg)\n",
-                      weightStateName(g_lastWeightState), weightStateName(ws),
-                      g_scale.getDisplayWeight());
-        sendWeightEvent(ws);
-        g_lastWeightState = ws;
+void loop() {
+    uint32_t __loop_t0 = millis();
+    // WiFi provisioning state machine
+    LAT_STEP("wifi", g_wifi.update());
+
+    // Weight — owned by sensor_task. Drain its event queue here and
+    // also re-check the snapshot in case we missed a transient (queue
+    // full → drop policy means the latest state is still authoritative).
+    SensorTask::WeightEvent we;
+    while (SensorTask::pollEvent(we)) {
+        Serial.printf("[Weight] → %s (%.1fg)\n",
+                      weightStateName(we.new_state), we.weight_g);
+        sendWeightEvent(we.new_state);
+        g_lastWeightState = we.new_state;
+    }
+    // Calibration mutation that landed on the sensor task → push status.
+    if (SensorTask::consumeCalDirty()) {
+        pushCalibrationStatus();
     }
 
-    // Raw samples every 500ms — local debug UI only (port 80 WS). Not sent
-    // to the console WS channel: at 2 Hz it filled the per-client outbound
-    // queue whenever TCP ACKs were delayed, which caused AsyncWebSocket to
-    // close the console client (every 10-20 s link flap). The console
-    // firmware ignored these frames anyway.
+    // Raw samples every 500ms — local debug UI only (port 80 WS).
     if (millis() - g_lastRawSent > 500) {
-        JsonDocument doc;
-        doc["weight_g"] = g_scale.getWeightG();
-        doc["raw"]      = g_scale.getRaw();
-        g_web.broadcastDebug("raw_sample", doc);
         g_lastRawSent = millis();
+        if (g_web.wsClientCount() > 0) {
+            auto snap = SensorTask::snapshot();
+            JsonDocument doc(&g_psramJsonAlloc);
+            doc["weight_g"] = snap.weight_g;
+            doc["raw"]      = snap.last_raw;
+            g_web.broadcastDebug("raw_sample", doc);
+        }
     }
 
     // Feature button — GPIO 0, active-LOW with pull-up. Fire on the first
@@ -591,23 +683,33 @@ void loop() {
         }
     }
 
-    // NFC
-    TagStatus prevNfc = g_nfc.getStatus();
-    g_nfc.update();
-    TagStatus newNfc = g_nfc.getStatus();
-    if (newNfc != prevNfc) {
-        sendNfcEvent();
-        // Transient green twin-flash on a successful read — confirms to the
-        // user that the tag was detected AND parsed, separate from the
-        // steady blue NFC-activity indicator that was on during the read.
-        if (newNfc == TagStatus::ReadSuccess) g_led.ackTagRead();
+    // NFC — owned by nfc_task. Drain transitions; snapshot carries
+    // the full tag, so we don't need to re-poll g_nfc here.
+    NfcTask::StatusEvent ne;
+    while (NfcTask::pollEvent(ne)) {
+        // Build the protocol+debug payload from the event's snapshot
+        // rather than calling g_nfc.getLastTag() — that would race the
+        // nfc_task's next sample.
+        JsonDocument doc(&g_psramJsonAlloc);
+        _writeNfcDoc(doc, ne.new_status, ne.tag);
+        ScaleToConsole::send(ScaleToConsole::Type::TagStatus, doc);
+        if (ne.new_status != TagStatus::Idle) {
+            g_web.broadcastDebug("nfc", doc);
+        }
+        if (ne.new_status == TagStatus::ReadSuccess && ne.tag.uid_len > 0) {
+            g_lastSuccessTag       = ne.tag;
+            g_lastSuccessTagStatus = ne.new_status;
+            g_lastSuccessTagMs.store(millis());
+            g_haveLastSuccessTag.store(true);
+            g_led.ackTagRead();
+        }
     }
 
     // Console messages
     ConsoleToScale::Message msg;
-    while (ConsoleToScale::receive(msg)) {
+    LAT_STEP("console_msg", while (ConsoleToScale::receive(msg)) {
         handleConsoleMessage(msg);
-    }
+    });
 
     // WebSocket-layer Ping/Pong is handled automatically by ESPAsyncWebServer.
     // No app-level Ping is part of the SpoolHard protocol.
@@ -617,53 +719,178 @@ void loop() {
     g_led.update();
 
     // OTA periodic check (no-op until WiFi is up + interval elapsed).
-    g_ota_checker.update();
+    LAT_STEP("ota_check", g_ota_checker.update());
+
+    // Periodic flush of the ring-log tail to SPIFFS, so a panic on the
+    // next loop iteration leaves us a forensics trail. 30 s rate-gate
+    // inside.
+    PanicPersist::tick();
 
     // Push the latest pending state to the console if it changed (or if a
     // forced push was queued, e.g. on console reconnect). Cheap — peeks
     // cached fields, no network.
-    pushOtaPendingIfChanged(g_pendingPushPending);
-    g_pendingPushPending = false;
+    // exchange(false) returns the previous value AND clears the flag in
+    // a single atomic step — no TOCTOU window where AsyncTCP could set
+    // the flag between our read and our clear. Same idiom on the
+    // handshake flag below.
+    pushOtaPendingIfChanged(g_pendingPushPending.exchange(false));
+
+    // Deferred on-connect handshake (set by g_console.onConnected).
+    // Sending these from the loop instead of inline from WS_EVT_CONNECT
+    // sidesteps the AsyncTCP-still-mid-upgrade race that was eating the
+    // ScaleVersion frame.
+    if (g_pendingPushHandshake.load() && g_console.isConnected()) {
+        g_pendingPushHandshake.store(false);
+        JsonDocument verDoc(&g_psramJsonAlloc);
+        verDoc["version"]   = FW_VERSION;
+        verDoc["precision"] = SensorTask::getPrecision();
+        ScaleToConsole::send(ScaleToConsole::Type::ScaleVersion, verDoc);
+
+        auto cal = SensorTask::snapshotCal();
+        JsonDocument calDoc(&g_psramJsonAlloc);
+        calDoc["num_points"] = (int)cal.numPoints;
+        calDoc["tare_raw"]   = (int32_t)cal.tare_raw;
+        ScaleToConsole::send(ScaleToConsole::Type::CalibrationStatus, calDoc);
+
+        // Replay the most recent successful tag scan if it was within
+        // the last 60 s — the user just held the spool up and saw the
+        // LED ack, but the original TagStatus frame likely got lost in
+        // the WS wedge that triggered this reconnect. The console's
+        // PendingAms latch and wizard-start logic is idempotent on tag
+        // UID, so a duplicate replay after a real frame already landed
+        // is a no-op.
+        if (g_haveLastSuccessTag.load() &&
+            (millis() - g_lastSuccessTagMs.load()) < 60000UL) {
+            JsonDocument tagDoc(&g_psramJsonAlloc);
+            _writeNfcDoc(tagDoc, g_lastSuccessTagStatus, g_lastSuccessTag);
+            ScaleToConsole::send(ScaleToConsole::Type::TagStatus, tagDoc);
+            Serial.println("[Console] Replayed recent tag scan to console");
+        }
+    }
 
     // Browser-WS push for the scale's own dashboard. Each helper is
     // rate-gated inside broadcastState (5–30 s) and short-circuits when
     // no clients are connected, so a per-loop call is cheap.
-    g_web.pushOtaStatus();
-    g_web.pushWifiStatus();
+    LAT_STEP("ota_push",  g_web.pushOtaStatus());
+    LAT_STEP("wifi_push", g_web.pushWifiStatus());
 
-    // OTA (triggered by console command or UpdateFirmware message)
-    if (g_pendingOta) {
-        g_pendingOta = false;
-        g_led.showUpdating();    // amber slow pulse (same as web-upload)
+    // Once-per-second tick: cleanupClients() on both WS servers so dirty
+    // disconnects don't leave zombies pinning queued buffers / stuck
+    // counts (the LED-stuck-on-green bug). Also a 5 s Heartbeat to the
+    // console with uptime + heap so the dashboard can show "scale up
+    // for 3d 4h" beside the link badge.
+    {
+        static uint32_t s_lastCleanupMs = 0;
+        static uint32_t s_lastHeartbeatMs = 0;
+        uint32_t now = millis();
+        if (now - s_lastCleanupMs >= 1000) {
+            s_lastCleanupMs = now;
+            g_console.cleanupClients();
+            g_web.cleanupClients();
+            // DIAGNOSTIC: dump WS client queue/state every second so we
+            // can correlate the cycle's progression with queue-fill or
+            // drain-stall behaviour.
+            g_console.tickStats();
+            // Surface the FreeRTOS-level ConsoleTx queue state too.
+            // If this hits 0 free, we know the producer is over-running
+            // even before the lib's per-client queue gets a look-in.
+            static uint32_t s_lastTxStat = 0;
+            uint32_t tx  = ConsoleTx::framesTx();
+            uint32_t drp = ConsoleTx::framesDropped();
+            if (tx != s_lastTxStat || drp != 0) {
+                dlog("ConsoleTx", "free=%u/%u tx=%u dropped=%u",
+                     (unsigned)ConsoleTx::free(),
+                     (unsigned)ConsoleTx::total(),
+                     (unsigned)tx, (unsigned)drp);
+                s_lastTxStat = tx;
+            }
+        }
+        // Heartbeat cadence: 1.5 s. Originally 5 s, but in real-world
+        // operation the dashboard's "scale connection" telemetry was
+        // showing 15-25 s gaps between heartbeats — likely a mix of
+        // TCP retransmits absorbed by AsyncTCP queues + the
+        // occasional dropped frame on a marginal Wi-Fi link. At 5 s
+        // a single missed frame already exceeds the console's
+        // staleness window. At 1.5 s we have ~3-4 chances per 5 s
+        // window so even with occasional packet loss the dashboard
+        // sees fresh data.
+        if (g_console.isConnected() && (now - s_lastHeartbeatMs >= 1500)) {
+            s_lastHeartbeatMs = now;
+            JsonDocument hb(&g_psramJsonAlloc);
+            hb["uptime_s"]      = (uint32_t)(now / 1000);
+            hb["free_heap"]     = (uint32_t)ESP.getFreeHeap();
+            hb["min_free_heap"] = (uint32_t)ESP.getMinFreeHeap();
+            ScaleToConsole::send(ScaleToConsole::Type::Heartbeat, hb);
+            // Single-line trace so we can grep /api/logs and confirm
+            // the scale is actually queuing heartbeats. If the dlog
+            // prints but the console doesn't see them, the loss is
+            // wire-level (TCP / radio); if the dlog stops, it's a
+            // local issue (count()==0, scheduler stall, etc.).
+            static uint32_t s_hbSeq = 0;
+            dlog("HB", "#%u @%us heap=%u",
+                 ++s_hbSeq,
+                 (unsigned)(now/1000),
+                 (unsigned)ESP.getFreeHeap());
+        }
+    }
 
-        OtaConfig cfg;
-        cfg.load();
+    // Whole-tick latency. Anything over 100 ms is a candidate cause of
+    // pong delays — the WS lib's ping reply path runs on AsyncTCP's
+    // task, but `_ws.textAll()` queues from the main loop so a stalled
+    // loop does block app-level Heartbeat queuing.
+    uint32_t __loop_dt = millis() - __loop_t0;
+    if (__loop_dt > 100) Serial.printf("[LoopLat] total=%lums\n",
+                                       (unsigned long)__loop_dt);
 
-        // Seed the in-flight tracker so /api/ota-status can surface a
-        // "preparing…" state even before the first manifest fetch returns
-        // a percent. Cleared by otaRun's progress callback as soon as it
-        // ticks for real.
-        g_ota_in_flight = { true, "firmware", 0, millis() };
+    // OTA (triggered by console command or UpdateFirmware message).
+    // Spawned on its own FreeRTOS task so the main loop continues to
+    // sample weight, poll NFC, animate LED, and service the WS link
+    // throughout the multi-minute fetch+flash cycle. Was previously
+    // inline here, which starved AsyncTCP for the entire OTA window
+    // and caused the link to flap during every update.
+    if (g_pendingOta.exchange(false)) {
+        if (otaTaskInFlight()) {
+            Serial.println("[OTA] already in progress, ignoring spawn");
+        } else {
+            g_led.showUpdating();
+            OtaConfig cfg;
+            cfg.load();
+            g_ota_in_flight = { true, "firmware", 0, millis() };
 
-        JsonDocument prog_doc;
-        prog_doc["kind"]    = "firmware";
-        prog_doc["percent"] = 0;
-        ScaleToConsole::send(ScaleToConsole::Type::OtaProgressUpdate, prog_doc);
+            JsonDocument prog_doc(&g_psramJsonAlloc);
+            prog_doc["kind"]    = "firmware";
+            prog_doc["percent"] = 0;
+            ScaleToConsole::send(ScaleToConsole::Type::OtaProgressUpdate, prog_doc);
 
-        otaRun(cfg, [](OtaProgress p) {
-            const char* kind =
-                p.kind == OtaProgress::Kind::Frontend ? "frontend" :
-                p.kind == OtaProgress::Kind::Firmware ? "firmware" :
-                                                        "";
-            g_ota_in_flight = { true, kind, p.percent, g_ota_in_flight.started_ms };
-            JsonDocument doc;
-            if (*kind) doc["kind"] = kind;
-            doc["percent"] = p.percent;
-            ScaleToConsole::send(ScaleToConsole::Type::OtaProgressUpdate, doc);
-        });
-        // otaRun() reboots on success; if we get here it failed — show the
-        // "offline / broken" red so the user sees something went wrong
-        // rather than us quietly falling back to the normal state ladder.
+            otaTaskSpawn(cfg, [](OtaProgress p) {
+                const char* kind =
+                    p.kind == OtaProgress::Kind::Frontend ? "frontend" :
+                    p.kind == OtaProgress::Kind::Firmware ? "firmware" :
+                                                            "";
+                g_ota_in_flight = { true, kind, p.percent, g_ota_in_flight.started_ms };
+                // The progress callback runs on the OTA task's
+                // context. ScaleToConsole::send goes through the
+                // protocol-level mutexed sender (tap snapshot +
+                // g_console.sendText, which is itself thread-safe via
+                // AsyncWebSocket's internal locking), so it's safe to
+                // emit from this task. After Phase D this will go
+                // through the dedicated console_tx_task queue
+                // instead.
+                JsonDocument doc(&g_psramJsonAlloc);
+                if (*kind) doc["kind"] = kind;
+                doc["percent"] = p.percent;
+                ScaleToConsole::send(ScaleToConsole::Type::OtaProgressUpdate, doc);
+            });
+        }
+    }
+
+    // Surface OTA failure (task exited without rebooting) so the LED
+    // returns to a sensible state. We poll otaTaskInFlight() once per
+    // loop tick after the task was spawned: if it's now false but
+    // g_ota_in_flight.valid is still true, the run failed.
+    if (g_ota_in_flight.valid && !otaTaskInFlight() &&
+        g_ota_in_flight.percent < 100) {
+        g_ota_in_flight = {};
         g_led.showOffline();
     }
 

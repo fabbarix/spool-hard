@@ -3,7 +3,39 @@
 #include "sdcard.h"
 #include <SD.h>
 #include <esp_random.h>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
+
+// One-shot migration for stores written before the (printer,nozzle)
+// variants model. Old records are flat — every (printer, nozzle) sibling
+// of a logical filament was its own record, distinguished only by the
+// `name` suffix " @<printer> <nozzle> nozzle". We walk the index, group
+// records by parsed name prefix, fold all siblings into one record with
+// `variants[]` populated, and rewrite the file. Idempotent: if every
+// existing record already carries variants_json (post-migration), this
+// is a no-op.
+static String _parseGroupKey(const String& name) {
+    int at = name.indexOf(" @");
+    if (at < 0) return name;
+    return name.substring(0, at);
+}
+static void _parseSuffixToVariant(const String& name, FilamentVariant& fv) {
+    int at = name.indexOf(" @");
+    if (at < 0) return;
+    String suffix = name.substring(at + 2);   // "Bambu Lab H2S 0.4 nozzle"
+    int n_pos = suffix.indexOf(" nozzle");
+    if (n_pos < 0) return;
+    int dia_start = suffix.lastIndexOf(' ', n_pos - 1);
+    if (dia_start < 0) return;
+    fv.nozzle_diameter = suffix.substring(dia_start + 1, n_pos).toFloat();
+    int model_start = 0;
+    if (suffix.startsWith("Bambu Lab ")) model_start = 10;
+    String m = suffix.substring(model_start, dia_start);
+    m.trim();
+    if      (m == "X1 Carbon") m = "X1C";
+    else if (m == "A1 mini")   m = "A1mini";
+    else                       m.replace(" ", "");
+    fv.printer_model = m;
+}
 
 void UserFilamentsStore::begin() {
     _mounted = g_sd.isMounted();
@@ -12,6 +44,59 @@ void UserFilamentsStore::begin() {
         return;
     }
     _rebuildIndex();
+
+    // Detect pre-variants records and migrate.
+    std::map<String, std::vector<FilamentRecord>> groups;
+    bool needsMigration = false;
+    for (auto& kv : _idIndex) {
+        FilamentRecord rec;
+        if (!_readAt(kv.second, rec)) continue;
+        if (rec.variants_json.isEmpty() && rec.name.indexOf(" @") >= 0) {
+            needsMigration = true;
+        }
+        groups[_parseGroupKey(rec.name)].push_back(std::move(rec));
+    }
+    if (needsMigration) {
+        Serial.printf("[UserFilaments] Migrating %u flat records → variants...\n",
+                      (unsigned)_idIndex.size());
+        // Rewrite the file: tombstone the lot, then append one merged
+        // record per group.
+        for (auto& kv : _idIndex) _tombstone(kv.second);
+        _idIndex.clear();
+        for (auto& g : groups) {
+            const auto& siblings = g.second;
+            if (siblings.empty()) continue;
+            FilamentRecord merged = siblings.front();
+            merged.name = g.first;  // strip the " @..." suffix
+            // Variant from each sibling.
+            std::vector<FilamentVariant> vs;
+            std::vector<String> cloudIds;
+            for (const auto& s : siblings) {
+                FilamentVariant fv;
+                _parseSuffixToVariant(s.name, fv);
+                fv.nozzle_temp_print         = s.nozzle_temp_max;
+                fv.nozzle_temp_initial_layer = s.nozzle_temp_min;
+                vs.push_back(std::move(fv));
+                if (s.cloud_setting_id.length()) cloudIds.push_back(s.cloud_setting_id);
+            }
+            merged.setVariants(vs);
+            // Track sibling cloud ids so future pushes can clean up.
+            if (!cloudIds.empty()) {
+                JsonDocument idDoc;
+                JsonArray arr = idDoc.to<JsonArray>();
+                for (auto& c : cloudIds) arr.add(c);
+                String idsJson; serializeJson(idDoc, idsJson);
+                merged.cloud_variant_ids_json = idsJson;
+                merged.cloud_setting_id = cloudIds.front();
+            }
+            size_t off;
+            if (_append(merged, off)) _idIndex[merged.setting_id] = off;
+        }
+        Serial.printf("[UserFilaments] Migration done: %u groups\n",
+                      (unsigned)_idIndex.size());
+        pack();   // collapse the tombstones
+    }
+
     Serial.printf("[UserFilaments] Loaded %u user filament records\n",
                   (unsigned)_idIndex.size());
 }

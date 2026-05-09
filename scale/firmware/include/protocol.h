@@ -47,6 +47,14 @@ namespace ScaleToConsole {
         // tare_raw is the persisted zero reading; nonzero means the
         // scale has been tared at least once.
         CalibrationStatus,
+        // Periodic liveness + telemetry tick the scale fires every ~5 s
+        // while a console is connected. Struct variant:
+        //   {"Heartbeat": {"uptime_s": 12345, "free_heap": N,
+        //                  "min_free_heap": N}}
+        // The console caches this so the dashboard can render "scale
+        // up for 3d 4h" beside the link status, and notices stale
+        // heartbeats as a soft-disconnect indicator.
+        Heartbeat,
     };
 
     // Generic typed send. `doc` carries fields that are mapped into the

@@ -23,6 +23,7 @@ public:
     String getDeviceName() const        { return _deviceName; }
     String getSecurityKey() const       { return _securityKey; }
     String getApSsid() const            { return _apSsid; }
+    String getPinnedBssid() const       { return _pinnedBssid; }
 
 private:
     AsyncWebServer* _server = nullptr;
@@ -32,6 +33,12 @@ private:
     String _securityKey;
     String _apSsid;
 
+    // Mesh-pinning state — see scale/firmware/include/wifi_provisioning.h
+    // for the full rationale. Same NVS schema (NVS_KEY_PINNED_BSSID).
+    String _pinnedBssid;
+    bool   _pinnedActive = false;
+    static constexpr unsigned long PINNED_FALLBACK_MS = 60000;
+
     void _startAP();
     void _stopAP();
     void _startConnect(const String& ssid, const String& pass);
@@ -39,8 +46,11 @@ private:
     void _setupCaptiveRoutes();
     void _loadDeviceName();
     void _loadSecurityKey();
-    void _saveCredentials(const String& ssid, const String& pass, const String& name);
+    void _loadPinnedBssid();
+    void _saveCredentials(const String& ssid, const String& pass,
+                          const String& name, const String* pinnedBssid /*nullable*/);
 
+    static bool _parseBssid(const String& s, uint8_t out[6]);
     static String _buildScanJson();
     static String _buildPortalHtml();
 };

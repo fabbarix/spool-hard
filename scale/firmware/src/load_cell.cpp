@@ -3,6 +3,7 @@
 #include <Preferences.h>
 #include <math.h>
 #include <algorithm>
+#include "spoolhard/serial_mirror.h"
 
 // ── Piecewise-linear interpolation ───────────────────────────
 
@@ -63,9 +64,40 @@ void LoadCell::begin() {
 }
 
 void LoadCell::update() {
+    // Non-blocking: take at most ONE sample per call, even if the
+    // configured `samples` window is bigger. Each is_ready()-then-read
+    // pair takes ~50 µs; the chip itself outputs new samples at 10 Hz
+    // (~100 ms apart) by default. The OLD code looped reading
+    // `_params.samples` (default 10) values back-to-back via a
+    // _readRawAveraged() that internally `delay(1)`s while waiting for
+    // is_ready — total blocking was ~1 s per main-loop tick on a 10 Hz
+    // chip, which starved AsyncTCP long enough that WS pongs to the
+    // console arrived 7-9 s late and the link flapped every few
+    // minutes. With the rolling-ring approach below, update() costs
+    // a single sample read when the chip is ready, or nothing at all
+    // when it isn't, and the displayed weight is the moving average
+    // over the last `samples` reads.
     if (!_hx.is_ready()) return;
 
-    long raw = _readRawAveraged(_params.samples);
+    long sample = _hx.read();
+    _ringBuf[_ringHead] = sample;
+    _ringHead = (_ringHead + 1) % kRingMax;
+    if (_ringFilled < kRingMax) ++_ringFilled;
+
+    // Average over the smaller of (configured samples, ring fill).
+    // Walk backwards from the most recent entry so partial fills early
+    // after boot use the freshest samples rather than zeros from the
+    // unfilled tail.
+    int n = _params.samples;
+    if (n < 1)        n = 1;
+    if (n > kRingMax) n = kRingMax;
+    if (n > _ringFilled) n = _ringFilled;
+    long sum = 0;
+    for (int i = 0; i < n; ++i) {
+        int idx = (_ringHead - 1 - i + kRingMax) % kRingMax;
+        sum += _ringBuf[idx];
+    }
+    long raw = sum / n;
     _lastRaw = raw;
 
     if (_cal.isValid()) {

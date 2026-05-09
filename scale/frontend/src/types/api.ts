@@ -4,6 +4,15 @@ export interface WifiStatus {
   ssid: string;
   ip: string;
   rssi: number;
+  // Currently-associated AP. "" while disconnected.
+  bssid: string;
+  // Currently-associated channel (1..13 on 2.4 GHz). 0 while disconnected.
+  channel: number;
+  // User pin: target BSSID for WiFi.begin, or "" for auto-select.
+  // Persisted in NVS; survives reboot. Cleared in RAM after a 60 s
+  // fallback so the device stays reachable if the pinned node is offline,
+  // but NVS keeps the user's intent.
+  pinned_bssid: string;
 }
 
 export interface DeviceNameConfig {
@@ -57,10 +66,17 @@ export interface FirmwareInfo {
   spiffs_total: number;
   spiffs_used: number;
   free_heap: number;
+  // Lifetime low-water-mark — strictly monotonic, useful for spotting
+  // real leaks vs. transient allocation churn.
+  min_free_heap?: number;
+  // Seconds since boot.
+  uptime_s?: number;
 }
 
 export interface WifiNetwork {
   ssid: string;
+  bssid: string;     // mesh AP MAC, populated by /captive/api/wifi-scan
+  channel: number;
   rssi: number;
   secure: boolean;
 }

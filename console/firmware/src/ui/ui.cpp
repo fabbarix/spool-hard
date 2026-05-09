@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <cmath>      // fabsf — used by the calibration wizard's delta-vs-target colour cue
 #include <lvgl.h>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 // ── Theme tokens (mirror shared/frontend/src/app.css) ────────
 #define COL_BODY        lv_color_hex(0x0f1117)
@@ -85,6 +85,19 @@ static lv_obj_t* s_btn_spool_empty     = nullptr;
 static char      s_spool_id[40]   = {0};
 static spool_cb_t s_spool_cb      = nullptr;
 
+// Weight-confirm screen widget handles. Built once on init, populated
+// per-show with `existing_g` and `new_g` (both filament-only). The
+// Accept button is disabled when new_g < 0 (no empty-spool weight),
+// in which case the body shows the warning text.
+static lv_obj_t* s_weight_confirm        = nullptr;
+static lv_obj_t* s_lbl_wc_title          = nullptr;
+static lv_obj_t* s_lbl_wc_existing       = nullptr;
+static lv_obj_t* s_lbl_wc_new            = nullptr;
+static lv_obj_t* s_lbl_wc_warn           = nullptr;   // "no core" message
+static lv_obj_t* s_btn_wc_accept         = nullptr;
+static lv_obj_t* s_btn_wc_cancel         = nullptr;
+static weight_confirm_cb_t s_wc_cb       = nullptr;
+
 static lv_obj_t* s_lbl_ssid       = nullptr;
 static lv_obj_t* s_lbl_key        = nullptr;
 static lv_obj_t* s_lbl_onboard_ip = nullptr;  // onboarding screen (portal hint)
@@ -135,6 +148,12 @@ static lv_obj_t* s_slot_weight_hero   = nullptr;
 static lv_obj_t* s_slot_weight_sub    = nullptr;
 static lv_obj_t* s_slot_grid          = nullptr;
 static lv_obj_t* s_slot_note          = nullptr;
+// "Import from printer" affordance: button + a small notice label that
+// surfaces the import result (or an error). Hidden when no spool is
+// mapped to the slot — pressing it would 409 in main.cpp anyway.
+static lv_obj_t* s_slot_import_btn    = nullptr;
+static lv_obj_t* s_slot_import_notice = nullptr;
+static ui_slot_import_cb_t s_slot_import_cb = nullptr;
 
 // Home-screen AMS panel — a strip of fixed tiles below the weight card. See
 // ui_set_ams_panel() / UiAmsSlot in ui.h.
@@ -529,6 +548,82 @@ static void build_spool() {
     make_spool_button(s_spool, "Close", false, SPOOL_BTN_CLOSE, 388, 236, 80);
 }
 
+// Weight-update confirmation. Shown when the user taps "Capture
+// weight" on the spool detail. Big side-by-side comparison of the
+// stored filament weight vs. the freshly-computed one (scale reading
+// minus the stored empty-core), with Accept / Cancel. main.cpp owns
+// the persist + screen-restore flow; this builder just shapes the
+// visual.
+static void on_weight_confirm_btn(lv_event_t* e) {
+    weight_confirm_action_t action =
+        (weight_confirm_action_t)(intptr_t)lv_event_get_user_data(e);
+    if (s_wc_cb) s_wc_cb(action);
+}
+
+static lv_obj_t* make_wc_button(lv_obj_t* parent, const char* text, bool primary,
+                                weight_confirm_action_t action, int x, int y, int w) {
+    lv_obj_t* b = lv_btn_create(parent);
+    lv_obj_set_pos(b, x, y);
+    lv_obj_set_size(b, w, 48);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_bg_color(b, primary ? COL_BRAND : COL_CARD, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(b, primary ? COL_BORDER : COL_TEXT_MUTED, 0);
+    lv_obj_set_style_border_width(b, primary ? 0 : 1, 0);
+    lv_obj_add_event_cb(b, on_weight_confirm_btn, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)action);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_color(l, primary ? COL_BODY : COL_TEXT, 0);
+    lv_obj_set_style_text_font(l, &spoolhard_mont_18, 0);
+    lv_obj_center(l);
+    return b;
+}
+
+static void build_weight_confirm() {
+    s_weight_confirm = lv_obj_create(nullptr);
+    style_screen(s_weight_confirm);
+
+    // Header — spool title + arrow chevron back to spool detail. The
+    // user has to use the explicit Cancel button to back out so the
+    // intent is unambiguous; no top-right close shortcut.
+    s_lbl_wc_title = make_label(s_weight_confirm, "Update weight",
+                                COL_BRAND, &spoolhard_mont_22);
+    lv_obj_set_pos(s_lbl_wc_title, 12, 14);
+    lv_obj_set_width(s_lbl_wc_title, 456);
+    lv_label_set_long_mode(s_lbl_wc_title, LV_LABEL_LONG_DOT);
+
+    lv_obj_t* sub = make_label(s_weight_confirm,
+        "Filament-only — empty core already subtracted",
+        COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_set_pos(sub, 12, 44);
+
+    // Two side-by-side cards: existing on the left, new on the right.
+    lv_obj_t* lCard = make_card(s_weight_confirm,  18, 80, 218, 130);
+    make_label(lCard, "Existing", COL_TEXT_MUTED, &spoolhard_mont_14);
+    s_lbl_wc_existing = make_label(lCard, "— g", COL_TEXT, &spoolhard_mont_36);
+    lv_obj_align(s_lbl_wc_existing, LV_ALIGN_CENTER, 0, 4);
+
+    lv_obj_t* rCard = make_card(s_weight_confirm, 244, 80, 218, 130);
+    make_label(rCard, "New", COL_TEXT_MUTED, &spoolhard_mont_14);
+    s_lbl_wc_new = make_label(rCard, "— g", COL_BRAND, &spoolhard_mont_36);
+    lv_obj_align(s_lbl_wc_new, LV_ALIGN_CENTER, 0, 4);
+
+    // Warning (no-core case). Hidden when a real number is shown.
+    s_lbl_wc_warn = make_label(s_weight_confirm,
+        "Capture an empty spool first so we can subtract the core.",
+        COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_set_pos(s_lbl_wc_warn, 18, 218);
+    lv_obj_set_width(s_lbl_wc_warn, 444);
+    lv_label_set_long_mode(s_lbl_wc_warn, LV_LABEL_LONG_WRAP);
+
+    // Buttons: Cancel left, Accept right. Accept is the primary action.
+    s_btn_wc_cancel = make_wc_button(s_weight_confirm, "Cancel", false,
+                                     WEIGHT_CONFIRM_CANCEL, 18, 252, 200);
+    s_btn_wc_accept = make_wc_button(s_weight_confirm, "Accept", true,
+                                     WEIGHT_CONFIRM_ACCEPT, 244, 252, 218);
+}
+
 static void build_ota() {
     s_ota = lv_obj_create(nullptr);
     style_screen(s_ota);
@@ -617,7 +712,10 @@ static void build_slot_detail() {
     // trying to keep a fixed set of labels in sync.
     s_slot_grid = lv_obj_create(s_slot);
     lv_obj_set_pos(s_slot_grid, 164, 68);
-    lv_obj_set_size(s_slot_grid, 304, 210);
+    // Height shaved from 210 → 170 to make room for the import-button row
+    // (button on the left, notice text on the right) under both columns
+    // before the bottom note label.
+    lv_obj_set_size(s_slot_grid, 304, 170);
     lv_obj_set_style_bg_color(s_slot_grid, COL_CARD, 0);
     lv_obj_set_style_bg_opa(s_slot_grid, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(s_slot_grid, COL_BORDER, 0);
@@ -626,6 +724,35 @@ static void build_slot_detail() {
     lv_obj_set_style_pad_all(s_slot_grid, 10, 0);
     lv_obj_set_flex_flow(s_slot_grid, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_slot_grid, 4, 0);
+
+    // "Import from printer" button — sits in the strip under the right
+    // grid (which was shortened above). Mirrors the web AmsSlotPicker's
+    // "Import from printer" button so users get the same affordance from
+    // the LCD. Hidden by ui_show_slot_detail when no spool is mapped to
+    // the slot (firmware import helper would 409 anyway).
+    s_slot_import_btn = lv_btn_create(s_slot);
+    lv_obj_set_pos(s_slot_import_btn, 164, 246);
+    lv_obj_set_size(s_slot_import_btn, 130, 36);
+    lv_obj_set_style_radius(s_slot_import_btn, 8, 0);
+    lv_obj_set_style_bg_color(s_slot_import_btn, COL_INPUT, 0);
+    lv_obj_set_style_border_color(s_slot_import_btn, COL_TEXT_MUTED, 0);
+    lv_obj_set_style_border_width(s_slot_import_btn, 1, 0);
+    lv_obj_add_event_cb(s_slot_import_btn, [](lv_event_t*) {
+        if (s_slot_import_cb) s_slot_import_cb();
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* importLbl = lv_label_create(s_slot_import_btn);
+    lv_label_set_text(importLbl, LV_SYMBOL_DOWNLOAD "  Import");
+    lv_obj_set_style_text_color(importLbl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(importLbl, &spoolhard_mont_14, 0);
+    lv_obj_center(importLbl);
+
+    // Notice text to the right of the button — populated by
+    // ui_slot_detail_set_import_notice from main.cpp after the helper
+    // runs. Two-line wrap so "Imported 4 fields: …" can spell out which.
+    s_slot_import_notice = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_align(s_slot_import_notice, LV_ALIGN_TOP_LEFT, 304, 252);
+    lv_obj_set_size(s_slot_import_notice, 164, 32);
+    lv_label_set_long_mode(s_slot_import_notice, LV_LABEL_LONG_WRAP);
 
     // Note line at the very bottom, spans full width.
     s_slot_note = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_14);
@@ -927,6 +1054,7 @@ void ui_init() {
     build_home();
     build_ota();
     build_spool();
+    build_weight_confirm();
     build_slot_detail();
     build_scale_settings();
     build_calwiz_pick();
@@ -1084,6 +1212,49 @@ void ui_flash_spool_current() {
     // enough not to delay the user's next action. Starts on `hot` (white).
     s_spool_flash_count = 6;
     s_spool_flash_timer = lv_timer_create(_spool_flash_step, 140, nullptr);
+    lv_unlock();
+}
+
+void ui_set_weight_confirm_callback(weight_confirm_cb_t cb) { s_wc_cb = cb; }
+
+void ui_show_weight_confirm(const char* spool_title,
+                            int existing_g,
+                            int new_g) {
+    if (!s_weight_confirm) return;   // builder hasn't run yet (boot race)
+    lv_lock();
+
+    // Title prefixes with the spool's brand+material so the user is
+    // confident which record they're editing — relevant when multiple
+    // tags get scanned in quick succession.
+    char title[64];
+    snprintf(title, sizeof(title), "Update weight%s%s",
+             (spool_title && *spool_title) ? " — " : "",
+             (spool_title && *spool_title) ? spool_title : "");
+    lv_label_set_text(s_lbl_wc_title, title);
+
+    // Existing — render as "— g" if unset (-1), else "%d g".
+    char buf[24];
+    if (existing_g < 0) snprintf(buf, sizeof(buf), "— g");
+    else                snprintf(buf, sizeof(buf), "%d g", existing_g);
+    lv_label_set_text(s_lbl_wc_existing, buf);
+
+    if (new_g < 0) {
+        // No-core path: hide the "new" number, show the warning, and
+        // disable the Accept button. The user has to tap Cancel and
+        // capture an empty spool first.
+        lv_label_set_text(s_lbl_wc_new, "—");
+        lv_obj_clear_flag(s_lbl_wc_warn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_state(s_btn_wc_accept,  LV_STATE_DISABLED);
+        lv_obj_set_style_bg_opa(s_btn_wc_accept, LV_OPA_50, 0);
+    } else {
+        snprintf(buf, sizeof(buf), "%d g", new_g);
+        lv_label_set_text(s_lbl_wc_new, buf);
+        lv_obj_add_flag(s_lbl_wc_warn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_state(s_btn_wc_accept,  LV_STATE_DISABLED);
+        lv_obj_set_style_bg_opa(s_btn_wc_accept, LV_OPA_COVER, 0);
+    }
+
+    lv_screen_load(s_weight_confirm);
     lv_unlock();
 }
 
@@ -1749,6 +1920,26 @@ void ui_show_slot_detail(const UiSlotDetail* d) {
     lv_label_set_text(s_slot_note,
         (d->has_spool && d->note[0]) ? d->note : "");
 
+    // Import affordance — only useful when a spool is mapped (the firmware
+    // import helper 409s otherwise). Notice is cleared on each open so a
+    // stale "Imported N fields" doesn't follow the user across tiles.
+    if (s_slot_import_btn) {
+        if (d->has_spool) lv_obj_clear_flag(s_slot_import_btn, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_add_flag(s_slot_import_btn,   LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_slot_import_notice) lv_label_set_text(s_slot_import_notice, "");
+
     lv_screen_load(s_slot);
+    lv_unlock();
+}
+
+void ui_set_slot_import_callback(ui_slot_import_cb_t cb) {
+    s_slot_import_cb = cb;
+}
+
+void ui_slot_detail_set_import_notice(const char* text) {
+    if (!s_slot_import_notice) return;
+    lv_lock();
+    lv_label_set_text(s_slot_import_notice, text ? text : "");
     lv_unlock();
 }

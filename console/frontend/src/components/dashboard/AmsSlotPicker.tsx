@@ -1,8 +1,9 @@
 import { useState, useMemo } from 'react';
-import { X, Check, Eraser } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { X, Check, Eraser, Download } from 'lucide-react';
 import { Button } from '@spoolhard/ui/components/Button';
 import { useSpools, type SpoolRecord } from '../../hooks/useSpools';
-import { useSetAmsMapping } from '../../hooks/usePrinters';
+import { useSetAmsMapping, useImportAmsSpool } from '../../hooks/usePrinters';
 
 interface Props {
   serial: string;
@@ -23,7 +24,13 @@ interface Props {
 export function AmsSlotPicker({ serial, amsUnit, slotId, currentSpoolId, isOverride, onClose }: Props) {
   const { data } = useSpools(0, 500);   // 500 > any plausible inventory
   const setMapping = useSetAmsMapping();
+  const importSpool = useImportAmsSpool();
   const [q, setQ] = useState('');
+  // Last import outcome — kept around so the user can read "imported X
+  // fields" (or "already in sync") after the request settles, without
+  // closing the modal. Cleared whenever the user picks a different spool
+  // so a stale notice doesn't follow them around.
+  const [importNotice, setImportNotice] = useState<string | null>(null);
 
   const rows = useMemo(() => {
     const all = data?.rows ?? [];
@@ -38,15 +45,30 @@ export function AmsSlotPicker({ serial, amsUnit, slotId, currentSpoolId, isOverr
   }, [data, q]);
 
   const assign = (spool_id: string) => {
+    setImportNotice(null);
     setMapping.mutate({ serial, ams_unit: amsUnit, slot_id: slotId, spool_id }, {
       onSuccess: () => onClose(),
     });
   };
   const clear = () => assign('');
+  const runImport = () => {
+    importSpool.mutate(
+      { serial, ams_unit: amsUnit, slot_id: slotId },
+      {
+        onSuccess: (res) => {
+          setImportNotice(
+            res.unchanged || res.imported.length === 0
+              ? 'Already in sync — nothing to import.'
+              : `Imported ${res.imported.length} field${res.imported.length === 1 ? '' : 's'}: ${res.imported.join(', ')}.`,
+          );
+        },
+      },
+    );
+  };
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-[90] flex items-center justify-center bg-surface-body/80 backdrop-blur-sm animate-in fade-in"
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-surface-body/80 backdrop-blur-sm animate-in fade-in"
       onClick={onClose}
     >
       <div
@@ -93,22 +115,47 @@ export function AmsSlotPicker({ serial, amsUnit, slotId, currentSpoolId, isOverr
           )}
         </div>
 
-        <div className="flex items-center justify-between pt-2 border-t border-surface-border">
-          <Button
-            variant="secondary"
-            onClick={clear}
-            disabled={!isOverride || setMapping.isPending}
-            title={isOverride ? 'Remove manual mapping, fall back to tag_uid matching' : 'No manual mapping to clear'}
-          >
-            <Eraser size={14} className="mr-1.5 inline" />
-            Clear manual mapping
-          </Button>
-          {setMapping.error instanceof Error && (
-            <span className="text-xs text-status-error">{setMapping.error.message}</span>
+        <div className="pt-2 border-t border-surface-border space-y-2">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <Button
+              variant="secondary"
+              onClick={clear}
+              disabled={!isOverride || setMapping.isPending}
+              title={isOverride ? 'Remove manual mapping, fall back to tag_uid matching' : 'No manual mapping to clear'}
+            >
+              <Eraser size={14} className="mr-1.5 inline" />
+              Clear manual mapping
+            </Button>
+            {/* Pulls the AMS-reported filament info onto the currently
+                mapped spool. Only enabled when there's something to
+                import to — without a mapped spool the firmware would
+                409 anyway, so we hide the option upfront. */}
+            <Button
+              variant="secondary"
+              onClick={runImport}
+              disabled={!currentSpoolId || importSpool.isPending}
+              title={
+                currentSpoolId
+                  ? 'Copy material, color, slicer_filament, nozzle temps and brand from the printer onto the mapped spool'
+                  : 'Map a spool first, then import the printer\'s filament settings into it'
+              }
+            >
+              <Download size={14} className="mr-1.5 inline" />
+              {importSpool.isPending ? 'Importing…' : 'Import from printer'}
+            </Button>
+          </div>
+          {importNotice && (
+            <div className="text-xs text-text-muted">{importNotice}</div>
+          )}
+          {(setMapping.error instanceof Error || importSpool.error instanceof Error) && (
+            <div className="text-xs text-status-error">
+              {(setMapping.error as Error)?.message ?? (importSpool.error as Error)?.message}
+            </div>
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

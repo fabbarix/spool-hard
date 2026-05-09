@@ -2,6 +2,10 @@
 #include <Arduino.h>
 #include <IPAddress.h>
 #include <WebSocketsClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <atomic>
 #include <functional>
 #include "protocol.h"
 
@@ -16,7 +20,32 @@ public:
     using TagCb    = std::function<void(const char* uid, const char* url, bool bambu)>;
 
     void begin();
-    void update();    // called from loop on Core 0
+
+    // Spawn the dedicated FreeRTOS task that owns _ws. Must be called
+    // AFTER begin() and AFTER WiFi is up. Once spawned, the link runs
+    // entirely on its own thread — main loop no longer needs to call
+    // update(). Idempotent.
+    //
+    // Why: the links2004 WebSocketsClient is synchronous — _ws.loop()
+    // reads pending TCP bytes, runs the heartbeat ping/pong cycle, and
+    // dispatches incoming frames to the user callback. When main loop
+    // is blocked elsewhere (Bambu MQTT pushall parse, FTPS gcode
+    // analyzer, big SPIFFS reads), _ws.loop() doesn't run. The
+    // server-side AsyncWebSocketClient on the scale times out, closes
+    // the socket, and the link reconnects ~3 s later. We saw this as
+    // a clean ~17-19 s flap cycle even when both devices were on the
+    // same mesh AP. Pinning ruled out radio causes; Wi-Fi event log
+    // confirmed zero STA-level disconnects.
+    //
+    // After this task split, _ws.loop() runs at ~500 Hz regardless of
+    // what main loop is doing, so PINGs are answered on time and
+    // incoming TCP bytes are drained promptly.
+    void beginTask();
+
+    // Legacy entry point — now a no-op when the task is running.
+    // Kept so existing main.cpp call sites compile without churn while
+    // we transition; deletion candidate once we're confident.
+    void update();
 
     // State of the end-to-end link with the paired scale. Used by the UI to
     // colour the status dot:
@@ -36,6 +65,14 @@ public:
     // Called when the shared secret changes so the handshake state reflects
     // the new NVS value without waiting for a reconnect.
     void pokeHandshake() { _refreshHandshakeState(); }
+
+    // Tear down the current WS connection so the auto-reconnect timer
+    // re-runs `_connect()` with a freshly-loaded secret. Called from
+    // POST /api/scale-secret after the new value lands in NVS — the
+    // currently-open socket was authenticated with the old key (or
+    // none) and the scale would reject the new one mid-flight if we
+    // tried to upgrade in place.
+    void forceReconnect();
     String scaleIp() const   { return _scaleIp.toString(); }
     String scaleName() const { return _scaleName; }
 
@@ -77,6 +114,18 @@ public:
     // — a flap rarely changes versions and the cached value is strictly
     // more useful than blanking the OTA panel.
     const String& scaleFirmwareVersion() const { return _scaleFirmwareVersion; }
+
+    // Scale-side telemetry fed by the periodic Heartbeat message
+    // (ScaleToConsole::Heartbeat at ~5 s cadence). 0 until the first
+    // heartbeat lands; we persist the cached values across WS flaps so
+    // the dashboard doesn't blank out for the brief reconnect window
+    // (the heartbeat will overwrite within 5 s of the link returning).
+    // `_scaleHeartbeatRxMs` is the millis() at which we last received
+    // one — handy for the UI to fade the panel if heartbeats stop.
+    uint32_t scaleUptimeS()      const { return _scaleUptimeS; }
+    uint32_t scaleFreeHeap()     const { return _scaleFreeHeap; }
+    uint32_t scaleMinFreeHeap()  const { return _scaleMinFreeHeap; }
+    uint32_t scaleHeartbeatRxMs() const { return _scaleHeartbeatRxMs; }
 
     // Callbacks — called from main loop after update() drains the WS queue.
     void onConnect(VoidCb cb)      { _onConnect = std::move(cb); }
@@ -201,6 +250,14 @@ private:
     String   _lastEventScale;
 
     uint32_t _lastWsEventMs   = 0;  // debug: last _onWsEvent timestamp
+    // Last TEXT/BIN frame received from the scale. Tracked separately
+    // from _lastWsEventMs because the WebSocketsClient lib has been
+    // observed entering a "PONG-only" state where TCP keepalive
+    // pings/pongs flow normally but real frames stop arriving — usually
+    // after a long uptime or some specific disconnect+reconnect race.
+    // The kStaleMs check has to gate on text freshness, not any-event,
+    // or PONGs would mask the dead-data state forever.
+    uint32_t _lastWsTextMs    = 0;
 
     float    _lastWeightG     = 0.f;
     String   _lastWeightState;
@@ -209,6 +266,12 @@ private:
     // sensible pre-handshake default — matches the scale's own default.
     int      _scalePrecision  = 1;
     String   _scaleFirmwareVersion;   // populated from ScaleVersion msg
+    // Heartbeat-fed telemetry. Persists across WS flaps; the next
+    // heartbeat (~5 s after reconnect) overwrites with fresh values.
+    uint32_t _scaleUptimeS       = 0;
+    uint32_t _scaleFreeHeap      = 0;
+    uint32_t _scaleMinFreeHeap   = 0;
+    uint32_t _scaleHeartbeatRxMs = 0;   // millis() at last heartbeat
 
     VoidCb     _onConnect;
     VoidCb     _onDisconnect;
@@ -235,8 +298,22 @@ private:
     void _connect();
     void _onWsEvent(WStype_t type, uint8_t* payload, size_t length);
     void _dispatch(const ScaleToConsole::Message& msg);
-    void _send(String frame);  // by value — WebSocketsClient::sendTXT wants String& (non-const)
+    void _send(String frame);  // queue path; runs only on _task
     void _recordEvent(const char* kind, const String& detail);
+
+    // FreeRTOS task that owns _ws. Created by beginTask(); body lives in
+    // _taskBody (static) which casts arg to `this` and calls _taskTick().
+    TaskHandle_t  _task        = nullptr;
+    QueueHandle_t _sendQueue   = nullptr;       // holds heap-alloc String*
+    static constexpr size_t kSendQueueDepth = 16;
+    // forceReconnect() sets this; the task drains it next iteration so
+    // _ws.disconnect() runs only on the owning thread. The lib is not
+    // safe against concurrent calls from multiple tasks.
+    std::atomic<bool> _forceReconnectPending{false};
+
+    static void _taskBody(void* arg);
+    void _taskTick();
+    void _drainSendQueue();
     // Recompute the handshake state from _connected and the stored secret.
     // Called on every WS connect/disconnect and whenever the secret changes.
     void _refreshHandshakeState();
@@ -245,13 +322,20 @@ private:
     // update() when the WebSocketsClient hasn't noticed yet.
     void _markDisconnected(const char* reason);
 
-    // If we haven't heard a WS event from the scale in this long while
-    // _connected is supposedly true, treat the link as down. Sized to span
-    // 2 missed heartbeat cycles (ping every 5 s) plus some slack — the
-    // library's own heartbeat timeout can stall for ~60 s when the peer
-    // dies without a clean RST because clientDisconnect() blocks in TCP
-    // flush()/stop() while lwIP exhausts its retransmit schedule.
-    static constexpr uint32_t kStaleMs = 15000;
+    // Pure backstop for the case where the WebSocketsClient lib's own
+    // heartbeat (5 s ping × 3 missed × 5 s timeout ≈ 25 s detection)
+    // gets wedged on a half-dead TCP. The lib is the primary
+    // authority for "this peer is gone" — it tears down + reconnects
+    // when its heartbeat fires. kStaleMs only fires if the lib STILL
+    // hasn't noticed after 90 s of silence, which is rare.
+    //
+    // Was 30 s but each fire spawned a `_markDisconnected` →
+    // SSDP-driven reconnect cycle (lwIP socket teardown + new TCP +
+    // WS upgrade — full alloc churn). On a Wi-Fi link that
+    // occasionally drops 1-2 s of packets, 30 s was tearing down
+    // healthy connections every couple of minutes. 90 s gives the
+    // lib three full heartbeat cycles to act first.
+    static constexpr uint32_t kStaleMs = 90000;
 
     // Minimum time after kicking off _connect() before we'll honour an
     // SSDP-driven reconnect. The Bambu MQTT connect can hold the main loop
@@ -262,4 +346,12 @@ private:
     // outlast a worst-case bambu stall.
     static constexpr uint32_t kReconnectGuardMs = 35000;
     uint32_t _lastConnectMs = 0;
+
+    // Throttle for CheckOtaUpdates kicks on reconnect. Without this,
+    // a flapping link triggered an HTTPS manifest fetch on the scale
+    // every 17-30 s — which itself caused the next flap (mbedtls
+    // pressure on AsyncTCP). 5 min minimum spacing breaks the cycle
+    // and is harmless for OTA UX (the scale runs its own scheduled
+    // check at the configured interval, default 24 h).
+    uint32_t _lastOtaKickMs = 0;
 };

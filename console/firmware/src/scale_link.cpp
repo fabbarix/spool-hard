@@ -5,7 +5,7 @@
 #include "web_server.h"           // g_web.pushScaleLink()
 #include <Preferences.h>
 #include <WiFi.h>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 void ScaleLink::_refreshHandshakeState() {
     Handshake before = _handshake;
@@ -82,7 +82,60 @@ void ScaleLink::begin() {
     ScaleToConsole::setRxTap(nullptr);
 }
 
+// Public legacy entry point. The work moved into the dedicated
+// _task once beginTask() is called; main.cpp's loop() may still
+// invoke this for backwards compat, but it's a no-op when the task
+// is running. If the task hasn't been started yet (boot ordering),
+// fall through to the synchronous tick so the link still progresses.
 void ScaleLink::update() {
+    if (_task) return;          // task is running — nothing to do here
+    _taskTick();
+}
+
+void ScaleLink::beginTask() {
+    if (_task) return;
+    _sendQueue = xQueueCreate(kSendQueueDepth, sizeof(String*));
+    if (!_sendQueue) {
+        Serial.println("[ScaleLink] xQueueCreate failed");
+        return;
+    }
+    BaseType_t r = xTaskCreatePinnedToCore(
+        _taskBody, "scale_link", /*stack*/ 6 * 1024,
+        this, /*priority*/ 4, &_task, /*core*/ 1);
+    if (r != pdPASS) {
+        Serial.println("[ScaleLink] xTaskCreate failed");
+        _task = nullptr;
+        return;
+    }
+    Serial.println("[ScaleLink] task started — _ws now owned by scale_link task");
+}
+
+void ScaleLink::_taskBody(void* arg) {
+    auto* self = static_cast<ScaleLink*>(arg);
+    Serial.println("[ScaleLink] task running");
+    // Periodic alive-tick log — proves the task is scheduled even when
+    // _ws.loop() has nothing to emit. If we go silent on /api/logs for
+    // longer than the tick interval, the task itself is being starved.
+    uint32_t s_iter = 0;
+    uint32_t s_lastAliveMs = millis();
+    for (;;) {
+        self->_taskTick();
+        s_iter++;
+        uint32_t now = millis();
+        if (now - s_lastAliveMs >= 5000) {
+            Serial.printf("[ScaleLink-task] alive iter=%u "
+                          "iter_per_s=%u heap=%u\n",
+                          (unsigned)s_iter,
+                          (unsigned)(s_iter / 5),
+                          (unsigned)ESP.getFreeHeap());
+            s_iter = 0;
+            s_lastAliveMs = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+void ScaleLink::_taskTick() {
     if (WiFi.status() != WL_CONNECTED || !_have_scale) return;
 
     if (!_wsStarted) {
@@ -90,31 +143,35 @@ void ScaleLink::update() {
         _connect();
     }
 
-    // Drive the WS state machine FIRST so any pending events (most importantly
-    // CONNECTED) get processed before we decide whether the link is down.
-    // Order matters: when the bambu MQTT connect blocks the main loop for ~30 s,
-    // a WS handshake response can sit in TCP buffers across that whole window;
-    // running ws.loop() up here drains it on the very next tick instead of
-    // letting the staleness/SSDP-kick checks below fire on a stale snapshot.
-    _ws.loop();
+    // Outbound first — we want sends initiated this tick to actually
+    // hit the wire before the next _ws.loop() iteration. _send() now
+    // pushes onto _sendQueue; the actual sendTXT() runs here only.
+    _drainSendQueue();
 
-    // Staleness short-circuit: the library's heartbeat-based disconnect can
-    // stall for ~60 s when the scale dies without a clean RST (clientDisconnect
-    // blocks in flush()/stop() while lwIP retransmits give up). _lastWsEventMs
-    // ticks on every event coming from the scale (CONNECTED, TEXT, PING, PONG),
-    // so if it hasn't moved in kStaleMs the link is effectively dead — flip our
-    // own state now and let the library catch up in the background.
-    if (_connected && _lastWsEventMs &&
-        (millis() - _lastWsEventMs) > kStaleMs) {
-        _markDisconnected("stale");
+    // Force-reconnect from forceReconnect() — owner-thread teardown.
+    if (_forceReconnectPending.exchange(false)) {
+        Serial.println("[ScaleLink] forceReconnect — tearing down WS so the next "
+                       "auto-reconnect picks up the fresh secret");
+        _ws.disconnect();
+        _markDisconnected("secret-changed");
     }
 
-    // Drain the SSDP-driven reconnect flag set on AsyncUDP's task. Doing
-    // the actual _ws mutation here keeps all WebSocketsClient access on
-    // the main loop, which the library is not thread-safe against. The
-    // guard window prevents us from killing an in-flight connect before
-    // the WS upgrade has had time to complete (a bambu stall pushes that
-    // out by tens of seconds).
+    // Drive the WS state machine. Was running on main loop pre-task
+    // split; now running at ~500 Hz so PINGs always get answered on
+    // time regardless of bambu/FTPS/MQTT activity on other tasks.
+    _ws.loop();
+
+    // Staleness short-circuit. Gates on TEXT-frame freshness, not
+    // any-event freshness — see kStaleMs comment in scale_link.h.
+    if (_connected) {
+        uint32_t baseline = _lastWsTextMs ? _lastWsTextMs : _lastConnectMs;
+        if (baseline && (millis() - baseline) > kStaleMs) {
+            _markDisconnected("text-stale");
+        }
+    }
+
+    // SSDP-driven reconnect. Flag is set on AsyncUDP's task; consumed
+    // here so all _ws mutation stays on the owning thread.
     if (_ssdpKickReconnect) {
         _ssdpKickReconnect = false;
         if (_wsStarted && !_connected &&
@@ -131,16 +188,82 @@ void ScaleLink::update() {
     }
 }
 
+void ScaleLink::_drainSendQueue() {
+    if (!_sendQueue) return;
+    String* frame = nullptr;
+    while (xQueueReceive(_sendQueue, &frame, 0) == pdTRUE && frame) {
+        if (_connected) {
+            _ws.sendTXT(*frame);
+        } else {
+            // Drop on the floor — caller's contract is "best-effort
+            // when up". The retry-on-reconnect path is tag-replay etc.,
+            // already handled at the application layer.
+        }
+        delete frame;
+    }
+}
+
+void ScaleLink::forceReconnect() {
+    // Owner-thread-only call — the actual _ws.disconnect() runs on the
+    // scale_link task next iteration. Setting an atomic flag is safe
+    // from any thread (HTTP handlers, main loop). Saves the user
+    // surprise of "I called forceReconnect from AsyncTCP and the lib
+    // crashed mid-loop" — links2004 isn't safe against concurrent
+    // calls from multiple tasks.
+    _forceReconnectPending.store(true, std::memory_order_release);
+}
+
 void ScaleLink::_connect() {
-    Serial.printf("[ScaleLink] Connecting ws://%s:%u%s\n",
-                  _scaleIp.toString().c_str(), SCALE_WS_PORT, SCALE_WS_PATH);
+    // Append `?key=<secret>` to the WS path so the scale's
+    // wsAuthHandshake gate accepts the upgrade. The secret is the
+    // same value as the scale's NVS `wifi_cfg/fixed_key`; the user
+    // mirrors it into the console via the per-scale Security UI
+    // (POST /api/scale-secret, stored in `scale_cfg/secrets_json`).
+    //
+    // If no secret is stored, we connect with the bare path. The
+    // scale will accept this iff its fixed_key is unset / still the
+    // ship default — matching the dashboard's pre-pairing behaviour.
+    // URL-encode the secret because the user might pick characters
+    // (`+`, `&`, `=`, space) that would otherwise break parsing.
+    String url = SCALE_WS_PATH;
+    String secret = ScaleSecrets::get(_scaleName);
+    if (!secret.isEmpty()) {
+        url += "?key=";
+        // Tiny URL-encode: only escape characters that affect query
+        // parsing. Most fixed-key values are alphanumeric so this
+        // typically reserves nothing.
+        for (size_t i = 0; i < secret.length(); ++i) {
+            char c = secret[i];
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') ||
+                c == '-' || c == '_' || c == '.' || c == '~') {
+                url += c;
+            } else {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+                url += buf;
+            }
+        }
+    }
+    Serial.printf("[ScaleLink] Connecting ws://%s:%u%s%s\n",
+                  _scaleIp.toString().c_str(), SCALE_WS_PORT, SCALE_WS_PATH,
+                  secret.isEmpty() ? " (no key)" : " (auth)");
     _lastConnectMs = millis();
-    _ws.begin(_scaleIp.toString(), SCALE_WS_PORT, SCALE_WS_PATH);
+    _ws.begin(_scaleIp.toString(), SCALE_WS_PORT, url);
     _ws.onEvent([this](WStype_t t, uint8_t* p, size_t l) { _onWsEvent(t, p, l); });
     _ws.setReconnectInterval(3000);
-    // Ping every 5 s; drop connection if no pong within 3 s (after 2 failures).
-    // This detects a scale that has crashed or rebooted without a clean TCP close.
-    _ws.enableHeartbeat(5000, 3000, 2);
+    // Forgiving ping — every 5 s, 5 s pong window, 6 misses before
+    // disconnect (~30 s detection horizon). The scale's main loop
+    // occasionally stalls 3-4 s on AsyncTCP / mbedtls work that's
+    // pinned to the same core as the WS server — at the previous
+    // 5/5/3 setting (~15 s) those stalls were enough to lose 3 pongs
+    // in a row and tear the link down. With 6 misses we tolerate up
+    // to 30 s of pong silence; the application-side _lastWsTextMs /
+    // kStaleMs (90 s) check is the backstop for genuinely dead links
+    // where the lib still thinks pongs are flowing. The scale's
+    // 1.5 s Heartbeat over TEXT is what ticks _lastWsTextMs in
+    // practice, so a truly wedged link still trips within 90 s.
+    _ws.enableHeartbeat(5000, 5000, 6);
 }
 
 void ScaleLink::_onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
@@ -157,6 +280,12 @@ void ScaleLink::_onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
                   tname, (unsigned)length, (unsigned long)dt,
                   (unsigned)ESP.getFreeHeap());
     _lastWsEventMs = now;
+    // Only TEXT/BIN frames count as "real" traffic for the stale
+    // detector — PING/PONG keep the TCP connection alive but don't
+    // tell us the scale-side app is actually pushing data.
+    if (type == WStype_TEXT || type == WStype_BIN) {
+        _lastWsTextMs = now;
+    }
 
     switch (type) {
         case WStype_CONNECTED:
@@ -166,20 +295,30 @@ void ScaleLink::_onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
             // Re-derive handshake now that we're connected — this is where
             // the LCD + web status flip from red "offline" to amber/green.
             _refreshHandshakeState();
-            // Kick the scale's OTA checker. Two reasons:
-            //   1. The scale's onConnected callback only fires when its
-            //      client-count goes 0→1; a console reboot that doesn't
-            //      close TCP cleanly leaves the count stuck and the
-            //      handshake messages (ScaleVersion / CalibrationStatus
-            //      / OtaPending) never get pushed. CheckOtaUpdates
-            //      always triggers a push because g_ota_checker.kickNow()
-            //      flips the cached state and pushOtaPendingIfChanged
-            //      sees the change on its next loop tick.
-            //   2. Even on a clean reconnect, this forces a fresh
-            //      manifest fetch so "last_check_ts" tracks the live
-            //      session rather than something stale from the scale's
-            //      last own-scheduled check.
-            _send(ConsoleToScale::build(ConsoleToScale::Type::CheckOtaUpdates));
+            // Kick the scale's OTA checker — but throttle. Sending
+            // CheckOtaUpdates on EVERY reconnect was a death loop:
+            // each kick triggers an HTTPS manifest fetch on the scale
+            // (~60 KB temp heap, ~3-4 s of mbedtls work). On core 0
+            // alongside AsyncTCP, that scheduling pressure delayed
+            // Pongs for the 5/5/3 heartbeat window, the console then
+            // detected the link dead and reconnected — which fired
+            // another CheckOtaUpdates — etc. We saw 17-30 s connect
+            // cycles indefinitely. Now: send only if it's been at
+            // least 5 minutes since the last kick. The scale also has
+            // its own scheduled checker on a 24 h interval, so missing
+            // a kick on a flapping reconnect is harmless.
+            {
+                uint32_t now = millis();
+                if (_lastOtaKickMs == 0 ||
+                    (now - _lastOtaKickMs) > 5UL * 60UL * 1000UL) {
+                    _lastOtaKickMs = now;
+                    _send(ConsoleToScale::build(ConsoleToScale::Type::CheckOtaUpdates));
+                } else {
+                    Serial.printf("[ScaleLink] Skip CheckOtaUpdates kick "
+                                  "(last %lus ago)\n",
+                                  (unsigned long)((now - _lastOtaKickMs) / 1000));
+                }
+            }
             break;
         case WStype_DISCONNECTED:
             _markDisconnected("ws-event");
@@ -206,6 +345,10 @@ void ScaleLink::_markDisconnected(const char* reason) {
     if (!_connected) return;
     Serial.printf("[ScaleLink] Disconnected (%s)\n", reason);
     _connected = false;
+    // Reset the text-freshness tracker so the next session starts
+    // measuring from its own _lastConnectMs baseline rather than
+    // inheriting a stale timestamp from the previous one.
+    _lastWsTextMs = 0;
     // Keep the cached OtaPending across disconnects. Earlier code wiped
     // the cache on every disconnect, which meant a link flap (the WS
     // bounces every few minutes under load) reset the frontend to
@@ -418,17 +561,46 @@ void ScaleLink::_dispatch(const ScaleToConsole::Message& msg) {
             if (text && *text) _recordEvent("ota", text);
             break;
         }
+        case T::Heartbeat: {
+            // Periodic 5 s tick. Cache uptime + heap so the dashboard's
+            // /api/scale-link payload can render "scale up for 3d 4h"
+            // beside the connection badge. NOT logged via _recordEvent
+            // — that fires the WS push to browser clients, and at 5 s
+            // cadence it would just be noise. The fields show up in the
+            // periodic scale_link heartbeat the console-side already
+            // emits (see g_web.pushScaleLink in main.cpp's slow tick).
+            _scaleUptimeS       = msg.doc["uptime_s"]      | 0u;
+            _scaleFreeHeap      = msg.doc["free_heap"]     | 0u;
+            _scaleMinFreeHeap   = msg.doc["min_free_heap"] | 0u;
+            _scaleHeartbeatRxMs = millis();
+            break;
+        }
         default:
             break;  // PN532Status, ButtonPressed, Term
     }
 }
 
 void ScaleLink::_send(String frame) {
-    if (!_connected) {
-        Serial.println("[ScaleLink] _send: not connected, dropping");
+    // Producer-side: any thread (main loop, HTTP, AsyncTCP) can call.
+    // Heap-allocate the String so we can hand a pointer through the
+    // FreeRTOS queue without invoking String's copy semantics from
+    // the lib's task. The scale_link task drains and calls
+    // _ws.sendTXT() — single owner of the WS object.
+    //
+    // We accept frames even while disconnected and drop them on
+    // dequeue. The queue is small (16) and `_drainSendQueue` runs
+    // hot, so the worst case is a tiny burst of orphaned frames
+    // immediately after disconnect — they're freed promptly.
+    if (!_sendQueue) {
+        // Pre-task fallback — happens once at boot before beginTask().
+        if (_connected) _ws.sendTXT(frame);
         return;
     }
-    _ws.sendTXT(frame);
+    auto* p = new String(std::move(frame));
+    if (xQueueSend(_sendQueue, &p, pdMS_TO_TICKS(10)) != pdTRUE) {
+        Serial.println("[ScaleLink] send queue full — frame dropped");
+        delete p;
+    }
 }
 
 void ScaleLink::tare() {

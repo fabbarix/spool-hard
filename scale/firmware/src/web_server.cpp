@@ -2,13 +2,19 @@
 #include "config.h"
 #include "spoolhard/ota.h"
 #include "spoolhard/backup.h"
+#include "spoolhard/psram_json_alloc.h"
+#include "spoolhard/ws_buffer_pool.h"
+#include "spoolhard/auth.h"
+#include "spoolhard/common_routes.h"
 #include "load_cell.h"
 #include "console_channel.h"
+#include "spoolhard/ring_log.h"
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
 #include <Update.h>
+#include "spoolhard/serial_mirror.h"
 
 // ── Lifecycle ────────────────────────────────────────────────
 
@@ -21,27 +27,57 @@ void ScaleWebServer::start() {
     Serial.println("[WebServer] Started on port 80");
 }
 
+// Print sink that writes into a vector<uint8_t> by reference. Lets
+// `serializeJson(env, sink)` populate the WS shared buffer in-place
+// without an intermediate String. Mirrors the console's helper.
+namespace {
+struct VectorPrint : public Print {
+    std::vector<uint8_t>* v;
+    explicit VectorPrint(std::vector<uint8_t>* dst) : v(dst) {}
+    size_t write(uint8_t b) override {
+        v->push_back(b);
+        return 1;
+    }
+    size_t write(const uint8_t* buffer, size_t size) override {
+        v->insert(v->end(), buffer, buffer + size);
+        return size;
+    }
+};
+}  // namespace
+
 // ── Debug broadcast ──────────────────────────────────────────
+//
+// All WS broadcast paths funnel through the WsBufferPool: an 8-slot
+// ring of pre-reserved 8 KB AsyncWebSocketSharedBuffers. The JSON
+// envelope is built with the PSRAM-backed allocator so the node tree
+// lives in external RAM, then serialized directly into the pool slot.
+// Net per-broadcast internal-DRAM allocation under steady state: ZERO.
 
 void ScaleWebServer::broadcastDebug(const String& type, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
-    JsonDocument env;
+    auto buf = g_wsBufPool.acquire();
+    if (!buf) return;   // every slot in flight; drop this push
+    JsonDocument env(&g_psramJsonAlloc);
     env["type"] = type;
     env["data"] = payload;
-    String out;
-    serializeJson(env, out);
-    _ws.textAll(out);
+    buf->clear();
+    VectorPrint sink(buf.get());
+    serializeJson(env, sink);
+    _ws.textAll(buf);
 }
 
 void ScaleWebServer::broadcastConsoleFrame(const char* dir, const String& frame) {
     if (_ws.count() == 0) return;
-    JsonDocument env;
+    auto buf = g_wsBufPool.acquire();
+    if (!buf) return;
+    JsonDocument env(&g_psramJsonAlloc);
     env["type"]  = "console";
     env["dir"]   = dir;
     env["frame"] = frame;
-    String out;
-    serializeJson(env, out);
-    _ws.textAll(out);
+    buf->clear();
+    VectorPrint sink(buf.get());
+    serializeJson(env, sink);
+    _ws.textAll(buf);
 }
 
 // Per-resource rate-limit table for broadcastState. Mirror of the
@@ -69,73 +105,36 @@ static bool _stateRateGate(const char* resource) {
 void ScaleWebServer::broadcastState(const char* resource, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
     if (!_stateRateGate(resource)) return;
-    JsonDocument env;
-    String type = "state.";
-    type += resource;
-    env["type"] = type;
+    auto buf = g_wsBufPool.acquire();
+    if (!buf) return;
+    char typeBuf[40];
+    snprintf(typeBuf, sizeof(typeBuf), "state.%s", resource);
+    JsonDocument env(&g_psramJsonAlloc);
+    env["type"] = typeBuf;
     env["data"] = payload;
-    String out;
-    serializeJson(env, out);
-    _ws.textAll(out);
+    buf->clear();
+    VectorPrint sink(buf.get());
+    serializeJson(env, sink);
+    _ws.textAll(buf);
 }
 
 // ── Route setup ──────────────────────────────────────────────
-
-
-// ── Auth ─────────────────────────────────────────────────────
-
+//
+// Auth (`requireAuth`, `/api/auth-status`, `/api/test-key`,
+// `/api/fixed-key-config`, `/api/device-name-config`) and the common
+// routes (`/api/restart`, `/api/logs`, `/api/logs/current`) live in
+// the shared spoolhard_core library — see spoolhard/auth.h and
+// spoolhard/common_routes.h. ScaleWebServer just registers them at
+// setup time.
 bool ScaleWebServer::_requireAuth(AsyncWebServerRequest* req) {
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    String stored = prefs.getString(NVS_KEY_FIXED_KEY, "");
-    prefs.end();
-
-    if (stored.isEmpty() || stored == DEFAULT_FIXED_KEY) return true;
-
-    String auth = req->header("Authorization");
-    if (auth.startsWith("Bearer ") && auth.substring(7) == stored) return true;
-
-    if (req->hasParam("key") && req->getParam("key")->value() == stored) return true;
-
-    req->send(401, "application/json", "{\"error\":\"unauthorized\"}");
-    return false;
-}
-
-void ScaleWebServer::_handleAuthStatus(AsyncWebServerRequest* req) {
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    String stored = prefs.getString(NVS_KEY_FIXED_KEY, "");
-    String device = prefs.getString(NVS_KEY_DEVICE_NAME, "SpoolHardScale");
-    prefs.end();
-
-    bool required = !stored.isEmpty() && stored != DEFAULT_FIXED_KEY;
-    bool authed   = !required;
-    if (required) {
-        String auth = req->header("Authorization");
-        if (auth.startsWith("Bearer ") && auth.substring(7) == stored) authed = true;
-    }
-    JsonDocument doc;
-    doc["auth_required"] = required;
-    doc["authenticated"] = authed;
-    doc["device_name"]   = device;
-    doc["product"]       = "scale";
-    String out; serializeJson(doc, out);
-    req->send(200, "application/json", out);
+    return SpoolhardAuth::requireAuth(req);
 }
 
 void ScaleWebServer::_setupRoutes() {
     // Auth gate on the WS upgrade. Mirrors `_requireAuth` for HTTP —
     // both transports gated by the same stored fixed key. Returning
     // false here makes ESPAsyncWebServer 401 the upgrade.
-    _ws.handleHandshake([](AsyncWebServerRequest* req) -> bool {
-        Preferences prefs;
-        prefs.begin(NVS_NS_WIFI, true);
-        String stored = prefs.getString(NVS_KEY_FIXED_KEY, "");
-        prefs.end();
-        if (stored.isEmpty() || stored == DEFAULT_FIXED_KEY) return true;
-        if (req->hasParam("key") && req->getParam("key")->value() == stored) return true;
-        return false;
-    });
+    _ws.handleHandshake(SpoolhardAuth::wsAuthHandshake);
     // Browser-facing dashboard WebSocket. On connect: push the current
     // console-link state (so the dashboard doesn't sit at "Console N/A"
     // if the console paired before the UI was opened — the console_conn
@@ -146,10 +145,21 @@ void ScaleWebServer::_setupRoutes() {
                    AwsEventType type, void*, uint8_t*, size_t) {
         if (type == WS_EVT_CONNECT) {
             client->setCloseClientOnQueueFull(false);
+            // Periodic ping so stale browser tabs (closed laptop lid,
+            // sleeping phone) get cleaned up in seconds instead of hours.
+            client->keepAlivePeriod(5);
+            // Bump AsyncTCP-esphome's ack timeout from its 5 s default
+            // to 30 s for the same reason as /ws/console: a single
+            // missed TCP ACK on a flaky mesh AP would otherwise tear
+            // the WS down via _onTimeout. See console_channel.cpp for
+            // the full rationale.
+            if (client->client()) {
+                client->client()->setAckTimeout(30000);
+            }
             Serial.printf("[WS] Client #%u connected from %s (total=%u)\n",
                           client->id(), client->remoteIP().toString().c_str(),
                           server->count());
-            JsonDocument env;
+            JsonDocument env(&g_psramJsonAlloc);
             env["type"] = "console_conn";
             JsonObject data = env["data"].to<JsonObject>();
             data["connected"] = g_console.isConnected();
@@ -163,14 +173,37 @@ void ScaleWebServer::_setupRoutes() {
     });
     _server.addHandler(&_ws);
 
-    // Always-open auth probe. Never 401s; reports whether a key is set
-    // and whether the supplied Authorization header is valid.
-    _server.on("/api/auth-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleAuthStatus(req);
+    // Auth + device-name + key routes — shared lib registrations.
+    _server.on("/api/auth-status", HTTP_GET, [](AsyncWebServerRequest* req) {
+        SpoolhardAuth::handleAuthStatus(req, "SpoolHardScale", "scale");
     });
+    _server.on("/api/device-name-config", HTTP_GET, [](AsyncWebServerRequest* req) {
+        SpoolhardAuth::handleDeviceNameGet(req, "SpoolHardScale");
+    });
+    _server.on("/api/device-name-config", HTTP_POST,
+        [](AsyncWebServerRequest*) {},
+        nullptr,
+        [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!SpoolhardAuth::requireAuth(req)) return;
+            SpoolhardAuth::handleDeviceNamePost(req, data, len);
+        }
+    );
+    _server.on("/api/test-key", HTTP_GET, [](AsyncWebServerRequest* req) {
+        SpoolhardAuth::handleTestKey(req);
+    });
+    _server.on("/api/fixed-key-config", HTTP_POST,
+        [](AsyncWebServerRequest*) {},
+        nullptr,
+        [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!SpoolhardAuth::requireAuth(req)) return;
+            SpoolhardAuth::handleFixedKeyConfigPost(req, data, len);
+        }
+    );
 
+    // /api/restart, /api/logs, /api/logs/current — shared.
+    SpoolhardCommonRoutes::registerAll(_server);
 
-    // ── API endpoints (registered before static handler for priority) ──
+    // ── Scale-specific API endpoints ────────────────────────────
 
     _server.on("/api/nfc-module-config", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleNfcConfig(req);
@@ -178,33 +211,6 @@ void ScaleWebServer::_setupRoutes() {
     _server.on("/api/nfc-module-config", HTTP_POST, [this](AsyncWebServerRequest* req) {
         _handleNfcConfig(req);
     });
-
-    _server.on("/api/device-name-config", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleDeviceName(req);
-    });
-    _server.on("/api/device-name-config", HTTP_POST,
-        [](AsyncWebServerRequest*) {},
-        nullptr,
-        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
-            if (!_requireAuth(req)) return;
-            JsonDocument doc;
-            if (deserializeJson(doc, data, len)) {
-                req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
-                return;
-            }
-            String name = doc["device_name"] | "";
-            if (name.isEmpty()) {
-                req->send(400, "application/json", "{\"ok\":false,\"error\":\"name required\"}");
-                return;
-            }
-            Preferences prefs;
-            prefs.begin(NVS_NS_WIFI, false);
-            prefs.putString(NVS_KEY_DEVICE_NAME, name);
-            prefs.end();
-            Serial.printf("[Config] Device name changed to '%s'\n", name.c_str());
-            req->send(200, "application/json", "{\"ok\":true}");
-        }
-    );
 
     _server.on("/api/wifi-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleWifiStatus(req);
@@ -238,28 +244,57 @@ void ScaleWebServer::_setupRoutes() {
         req->send(200, "application/json", "{\"ok\":true}");
     });
 
-    _server.on("/api/restart", HTTP_POST, [this](AsyncWebServerRequest* req) {
-        if (!_requireAuth(req)) return;
-        req->send(200, "application/json", "{\"ok\":true}");
+    // /api/restart, /api/logs, /api/logs/current, /api/auth-status,
+    // /api/test-key, /api/fixed-key-config, /api/device-name-config
+    // are all registered above via SpoolhardCommonRoutes / SpoolhardAuth.
+
+    // Legacy alias kept for backwards-compat with older console builds
+    // that still POST to /api/reset-device. New clients use /api/restart.
+    _server.on("/api/reset-device", HTTP_POST, [](AsyncWebServerRequest* req) {
+        if (!SpoolhardAuth::requireAuth(req)) return;
+        req->send(200, "application/json", "{\"status\":\"resetting\"}");
         delay(500);
         ESP.restart();
     });
 
-    _server.on("/api/reset-device", HTTP_POST, [this](AsyncWebServerRequest* req) {
-        _handleReset(req);
+    // ── Crash log retrieval ────────────────────────────────────
+    // PanicPersist promotes pending ring-log tails to /crash_<seq>.txt
+    // when the previous boot ended in a panic. List + download here.
+    _server.on("^\\/api\\/crashes\\/([0-9]+)$", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        String seq = req->pathArg(0);
+        String path = "/crash_" + seq + ".txt";
+        if (!SPIFFS.exists(path)) { req->send(404); return; }
+        req->send(SPIFFS, path, "text/plain");
     });
-
-    _server.on("/api/test-key", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleTestKey(req);
+    _server.on("^\\/api\\/crashes\\/([0-9]+)$", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        String seq = req->pathArg(0);
+        String path = "/crash_" + seq + ".txt";
+        if (SPIFFS.exists(path)) SPIFFS.remove(path);
+        req->send(200, "application/json", "{\"ok\":true}");
     });
-    _server.on("/api/fixed-key-config", HTTP_POST,
-        [](AsyncWebServerRequest*) {},
-        nullptr,
-        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
-            if (!_requireAuth(req)) return;
-            _handleFixedKeyConfigPost(req, data, len);
+    _server.on("/api/crashes", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        JsonDocument doc(&g_psramJsonAlloc);
+        JsonArray arr = doc["crashes"].to<JsonArray>();
+        File root = SPIFFS.open("/");
+        if (root) {
+            File f = root.openNextFile();
+            while (f) {
+                String name = f.name();
+                if (name.startsWith("crash_") && name.endsWith(".txt")) {
+                    int seq = name.substring(6, name.length() - 4).toInt();
+                    JsonObject o = arr.add<JsonObject>();
+                    o["seq"]   = seq;
+                    o["bytes"] = (uint32_t)f.size();
+                }
+                f = root.openNextFile();
+            }
         }
-    );
+        String out; serializeJson(doc, out);
+        req->send(200, "application/json", out);
+    });
 
     _server.on("/api/tags-in-store", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
@@ -270,7 +305,7 @@ void ScaleWebServer::_setupRoutes() {
         File f = SPIFFS.open("/tags_in_store.txt", FILE_READ);
         String tags = f.readString();
         f.close();
-        JsonDocument doc;
+        JsonDocument doc(&g_psramJsonAlloc);
         doc["tags"] = tags;
         String resp;
         serializeJson(doc, resp);
@@ -315,7 +350,7 @@ void ScaleWebServer::_setupRoutes() {
         nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
-            JsonDocument doc;
+            JsonDocument doc(&g_psramJsonAlloc);
             if (deserializeJson(doc, data, len)) {
                 req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
                 return;
@@ -334,7 +369,7 @@ void ScaleWebServer::_setupRoutes() {
     _server.on("/api/scale-raw", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         long raw = _onCaptureRaw ? _onCaptureRaw() : 0;
-        JsonDocument doc;
+        JsonDocument doc(&g_psramJsonAlloc);
         doc["raw"] = raw;
         String resp;
         serializeJson(doc, resp);
@@ -347,7 +382,7 @@ void ScaleWebServer::_setupRoutes() {
         nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
-            JsonDocument doc;
+            JsonDocument doc(&g_psramJsonAlloc);
             if (deserializeJson(doc, data, len)) {
                 req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
                 return;
@@ -389,7 +424,7 @@ void ScaleWebServer::_setupRoutes() {
                           "{\"error\":\"upload incomplete or rejected\"}");
                 return;
             }
-            JsonDocument doc;
+            JsonDocument doc(&g_psramJsonAlloc);
             DeserializationError jerr = deserializeJson(doc, _restoreBuffer);
             _restoreBuffer = String();
             _restoreReady  = false;
@@ -414,7 +449,7 @@ void ScaleWebServer::_setupRoutes() {
             // ship with the firmware and are explicitly out of scope.
             SpoolhardBackup::RestoreReport rep;
             bool ok = SpoolhardBackup::applyRestore(src, doc, rep);
-            JsonDocument resp;
+            JsonDocument resp(&g_psramJsonAlloc);
             resp["ok"]               = ok;
             resp["nvs_keys_set"]     = rep.nvs_keys_set;
             resp["nvs_keys_skipped"] = rep.nvs_keys_skipped;
@@ -588,43 +623,39 @@ void ScaleWebServer::_handleNfcConfig(AsyncWebServerRequest* req) {
     bool available = prefs.getBool(NVS_KEY_NFC_AVAIL, false);
     prefs.end();
 
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["available"] = available;
     String resp;
     serializeJson(doc, resp);
     req->send(200, "application/json", resp);
 }
 
-void ScaleWebServer::_handleDeviceName(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
+// Build the wifi-status JSON used by both /api/wifi-status and the
+// state.wifi_status WS push. Single source of truth so the bytes are
+// identical and the React Query cache lands cleanly on each side.
+static void _buildWifiStatusDoc(JsonDocument& doc) {
     Preferences prefs;
     prefs.begin(NVS_NS_WIFI, true);
-    String name = prefs.getString(NVS_KEY_DEVICE_NAME, "SpoolHardScale");
+    bool   configured  = prefs.isKey(NVS_KEY_SSID);
+    String ssid        = prefs.getString(NVS_KEY_SSID, "");
+    String pinnedBssid = prefs.getString(NVS_KEY_PINNED_BSSID, "");
     prefs.end();
 
-    JsonDocument doc;
-    doc["device_name"] = name;
-    String resp;
-    serializeJson(doc, resp);
-    req->send(200, "application/json", resp);
+    bool connected = (WiFi.status() == WL_CONNECTED);
+    doc["configured"]   = configured && !ssid.isEmpty();
+    doc["connected"]    = connected;
+    doc["ssid"]         = connected ? WiFi.SSID() : ssid;
+    doc["ip"]           = connected ? WiFi.localIP().toString() : "";
+    doc["rssi"]         = connected ? WiFi.RSSI() : 0;
+    doc["bssid"]        = connected ? WiFi.BSSIDstr() : "";
+    doc["channel"]      = connected ? WiFi.channel() : 0;
+    doc["pinned_bssid"] = pinnedBssid;
 }
 
 void ScaleWebServer::_handleWifiStatus(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    bool   configured = prefs.isKey(NVS_KEY_SSID);
-    String ssid       = prefs.getString(NVS_KEY_SSID, "");
-    prefs.end();
-
-    bool connected = (WiFi.status() == WL_CONNECTED);
-
-    JsonDocument doc;
-    doc["configured"] = configured && !ssid.isEmpty();
-    doc["connected"]  = connected;
-    doc["ssid"]       = connected ? WiFi.SSID() : ssid;
-    doc["ip"]         = connected ? WiFi.localIP().toString() : "";
-    doc["rssi"]       = connected ? WiFi.RSSI() : 0;
+    JsonDocument doc(&g_psramJsonAlloc);
+    _buildWifiStatusDoc(doc);
     String resp;
     serializeJson(doc, resp);
     req->send(200, "application/json", resp);
@@ -635,7 +666,7 @@ void ScaleWebServer::_handleOtaConfigGet(AsyncWebServerRequest* req) {
     OtaConfig cfg;
     cfg.load();
 
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["url"]              = cfg.url;
     doc["use_ssl"]          = cfg.use_ssl;
     doc["verify_ssl"]       = cfg.verify_ssl;
@@ -648,7 +679,7 @@ void ScaleWebServer::_handleOtaConfigGet(AsyncWebServerRequest* req) {
 
 void ScaleWebServer::_handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len) {
     if (!_requireAuth(req)) return;
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     if (deserializeJson(doc, data, len)) {
         req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
         return;
@@ -671,7 +702,7 @@ void ScaleWebServer::_handleOtaConfigPost(AsyncWebServerRequest* req, uint8_t* d
 
     cfg.save();
 
-    JsonDocument resp_doc;
+    JsonDocument resp_doc(&g_psramJsonAlloc);
     resp_doc["url"]              = cfg.url;
     resp_doc["use_ssl"]          = cfg.use_ssl;
     resp_doc["verify_ssl"]       = cfg.verify_ssl;
@@ -687,7 +718,7 @@ void ScaleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
     OtaConfig cfg; cfg.load();
     auto p = g_ota_checker.pending();
 
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["check_enabled"]     = cfg.check_enabled;
     doc["check_interval_h"]  = cfg.check_interval_h;
     doc["last_check_ts"]     = g_ota_checker.lastCheckTs();
@@ -718,18 +749,8 @@ void ScaleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
 // bytes-identical data.
 void ScaleWebServer::pushWifiStatus() {
     if (_ws.count() == 0) return;
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    bool   configured = prefs.isKey(NVS_KEY_SSID);
-    String ssid       = prefs.getString(NVS_KEY_SSID, "");
-    prefs.end();
-    bool connected = (WiFi.status() == WL_CONNECTED);
-    JsonDocument doc;
-    doc["configured"] = configured && !ssid.isEmpty();
-    doc["connected"]  = connected;
-    doc["ssid"]       = connected ? WiFi.SSID() : ssid;
-    doc["ip"]         = connected ? WiFi.localIP().toString() : "";
-    doc["rssi"]       = connected ? WiFi.RSSI() : 0;
+    JsonDocument doc(&g_psramJsonAlloc);
+    _buildWifiStatusDoc(doc);
     broadcastState("wifi_status", doc);
 }
 
@@ -737,7 +758,7 @@ void ScaleWebServer::pushOtaStatus() {
     if (_ws.count() == 0) return;
     OtaConfig cfg; cfg.load();
     auto p = g_ota_checker.pending();
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["check_enabled"]     = cfg.check_enabled;
     doc["check_interval_h"]  = cfg.check_interval_h;
     doc["last_check_ts"]     = g_ota_checker.lastCheckTs();
@@ -757,60 +778,11 @@ void ScaleWebServer::pushOtaStatus() {
     broadcastState("ota", doc);
 }
 
-void ScaleWebServer::_handleReset(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    req->send(200, "application/json", "{\"status\":\"resetting\"}");
-    delay(500);
-    ESP.restart();
-}
-
-void ScaleWebServer::_handleTestKey(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    bool   configured = prefs.isKey(NVS_KEY_FIXED_KEY);
-    String key        = prefs.getString(NVS_KEY_FIXED_KEY, DEFAULT_FIXED_KEY);
-    prefs.end();
-
-    String masked = key;
-    if (key.length() > 4)
-        masked = key.substring(0, 2) + "***" + key.substring(key.length() - 2);
-
-    JsonDocument doc;
-    doc["configured"]  = configured;
-    doc["key_preview"] = masked;
-    String resp;
-    serializeJson(doc, resp);
-    req->send(200, "application/json", resp);
-}
-
-void ScaleWebServer::_handleFixedKeyConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len) {
-    if (!_requireAuth(req)) return;
-    JsonDocument doc;
-    if (deserializeJson(doc, data, len)) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
-        return;
-    }
-    String key = doc["key"] | "";
-    if (key.isEmpty()) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"key required\"}");
-        return;
-    }
-
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, false);
-    prefs.putString(NVS_KEY_FIXED_KEY, key);
-    prefs.end();
-
-    Serial.printf("[Security] Fixed key updated\n");
-    req->send(200, "application/json", "{\"ok\":true}");
-}
-
 void ScaleWebServer::_handleScaleConfigGet(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
     Preferences prefs;
     prefs.begin(NVS_NS_SCALE, true);
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["samples"]          = prefs.getInt(NVS_KEY_SAMPLES,     WEIGHT_SAMPLES);
     doc["stable_threshold"] = prefs.getFloat(NVS_KEY_STABLE_THR, STABLE_THRESHOLD_G);
     doc["stable_count"]     = prefs.getInt(NVS_KEY_STABLE_CNT,  STABLE_COUNT_REQ);
@@ -875,7 +847,7 @@ void ScaleWebServer::_handleScaleConfigGet(AsyncWebServerRequest* req) {
 
 void ScaleWebServer::_handleScaleConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len) {
     if (!_requireAuth(req)) return;
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     if (deserializeJson(doc, data, len)) {
         req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
         return;
@@ -906,13 +878,19 @@ void ScaleWebServer::_handleScaleConfigPost(AsyncWebServerRequest* req, uint8_t*
 
 void ScaleWebServer::_handleFirmwareInfo(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
-    JsonDocument doc;
-    doc["fw_version"]   = FW_VERSION;
-    doc["fe_version"]   = FE_VERSION;
-    doc["flash_size"]   = ESP.getFlashChipSize();
-    doc["spiffs_total"] = SPIFFS.totalBytes();
-    doc["spiffs_used"]  = SPIFFS.usedBytes();
-    doc["free_heap"]    = ESP.getFreeHeap();
+    JsonDocument doc(&g_psramJsonAlloc);
+    doc["fw_version"]      = FW_VERSION;
+    doc["fe_version"]      = FE_VERSION;
+    doc["flash_size"]      = ESP.getFlashChipSize();
+    doc["spiffs_total"]    = SPIFFS.totalBytes();
+    doc["spiffs_used"]     = SPIFFS.usedBytes();
+    doc["free_heap"]       = ESP.getFreeHeap();
+    doc["min_free_heap"]   = ESP.getMinFreeHeap();
+    doc["max_alloc_heap"]  = (uint32_t)ESP.getMaxAllocHeap();
+    doc["psram_free"]      = (uint32_t)ESP.getFreePsram();
+    doc["uptime_s"]        = (uint32_t)(millis() / 1000);
+    doc["ws_pool_total"]   = (uint32_t)g_wsBufPool.totalSlots();
+    doc["ws_pool_free"]    = (uint32_t)g_wsBufPool.freeSlots();
     String resp;
     serializeJson(doc, resp);
     req->send(200, "application/json", resp);
@@ -933,7 +911,7 @@ void ScaleWebServer::_handleBackupGet(AsyncWebServerRequest* req) {
     };
     // No FS mounts — all scale state lives in NVS.
 
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     SpoolhardBackup::buildBackup(src, "spoolscale", device, FW_VERSION, doc, nullptr);
 
     String body;
@@ -959,9 +937,20 @@ void ScaleWebServer::_handleRestorePost(AsyncWebServerRequest* req,
         }
         _restoreBuffer = String();
         _restoreReady  = false;
-        if (total > 0 && total < 1 * 1024 * 1024) {
+        // Cap at 256 KB. A scale backup is typically a few KB of NVS
+        // namespaces, never more than a hundred. Capping the up-front
+        // reservation means an aborted upload can't pin megabytes of
+        // heap until the next restore attempt.
+        if (total > 0 && total < 256 * 1024) {
             _restoreBuffer.reserve(total);
         }
+    }
+    // Reject oversize uploads early so the buffer can't exceed the cap
+    // even if the caller lies / streams chunked-without-Content-Length.
+    if (total > 256 * 1024) {
+        _restoreBuffer = String();
+        _restoreReady  = false;
+        return;
     }
     if (len > 0) _restoreBuffer.concat((const char*)data, len);
     if (index + len >= total) {

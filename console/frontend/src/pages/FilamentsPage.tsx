@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   FlaskConical, Library, User as UserIcon,
-  Plus, Trash2, ChevronDown, ChevronRight, Cloud, CloudUpload, RefreshCw, Thermometer, Gauge, Eye,
+  Plus, Trash2, ChevronDown, ChevronRight, Cloud, CloudUpload, RefreshCw, Thermometer, Eye,
 } from 'lucide-react';
 import { Card } from '@spoolhard/ui/components/Card';
 import { Button } from '@spoolhard/ui/components/Button';
@@ -148,15 +149,6 @@ function StockFilamentRow({ entry }: { entry: FilamentEntry }) {
               label="Density"
               value={typeof entry.density === 'number' && entry.density > 0 ? `${entry.density} g/cm³` : '—'}
             />
-            <DetailField
-              label="Pressure advance (default)"
-              icon={<Gauge size={10} />}
-              value={
-                typeof entry.pressure_advance === 'number' && entry.pressure_advance > 0
-                  ? entry.pressure_advance.toFixed(3)
-                  : '—'
-              }
-            />
           </div>
         </div>
       )}
@@ -250,13 +242,26 @@ function UserFilamentsSection() {
         </div>
       )}
 
-      {(creating || editing) && (
-        <div className="mb-3">
-          <UserFilamentForm
-            initial={editing ?? undefined}
-            onClose={() => { setCreating(false); setEditing(null); }}
-          />
-        </div>
+      {(creating || editing) && createPortal(
+        <div
+          className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto p-6
+                     bg-black/50 backdrop-blur-md"
+          onClick={(ev) => {
+            // Close on backdrop click; ignore clicks inside the dialog.
+            if (ev.target === ev.currentTarget) {
+              setCreating(false);
+              setEditing(null);
+            }
+          }}
+        >
+          <div className="w-full max-w-3xl my-8 shadow-2xl rounded-md">
+            <UserFilamentForm
+              initial={editing ?? undefined}
+              onClose={() => { setCreating(false); setEditing(null); }}
+            />
+          </div>
+        </div>,
+        document.body,
       )}
 
       {isLoading && <div className="text-sm text-text-muted">Loading…</div>}
@@ -273,7 +278,14 @@ function UserFilamentsSection() {
             r={r}
             hasToken={hasToken}
             onEdit={() => { setCreating(false); setEditing(r); }}
-            onDelete={() => del.mutate(r.setting_id)}
+            onDelete={() => {
+              const isCloudSynced = !!r.cloud_setting_id;
+              const msg = isCloudSynced
+                ? `Delete "${r.name}" — this will also remove every variant of this filament from Bambu Cloud. Cancel to keep both.`
+                : `Delete "${r.name}"?`;
+              if (!confirm(msg)) return;
+              del.mutate({ id: r.setting_id });
+            }}
           />
         ))}
       </div>
@@ -405,17 +417,70 @@ function UserFilamentRow({
               value={resolved.nozzle_temp_min > 0 ? `${resolved.nozzle_temp_min}` : '—'} />
             <ResolvedField label="Nozzle max (°C)" inherited={resolved.inherited.nozzle_temp_max}
               value={resolved.nozzle_temp_max > 0 ? `${resolved.nozzle_temp_max}` : '—'} />
-            <ResolvedField label="PA default (K)" inherited={resolved.inherited.pressure_advance}
-              value={resolved.pressure_advance > 0 ? resolved.pressure_advance.toFixed(3) : '—'} />
-            <div>
-              <div className="text-text-muted">PA per nozzle</div>
-              <div className="text-text-primary">
-                {resolved.pa_by_nozzle.length > 0
-                  ? resolved.pa_by_nozzle.map((e) => `${e.nozzle}mm:${e.k.toFixed(3)}`).join(', ')
-                  : '—'}
+          </div>
+          {r.variants && r.variants.length > 0 && (
+            <div className="border-t border-surface-border pt-2 space-y-2">
+              <div className="text-[10px] uppercase tracking-wider text-text-muted">
+                Per-printer / nozzle variants ({r.variants.length})
+              </div>
+              <div className="space-y-2">
+                {r.variants.map((v, i) => {
+                  const labels = v.extruder_variants ?? [];
+                  const speeds = v.max_volumetric_speed ?? [];
+                  const ks     = v.pressure_advance ?? [];
+                  const slotCount = Math.max(labels.length, speeds.length, ks.length);
+                  return (
+                    <div key={i} className="rounded-md border border-surface-border bg-surface-card/30">
+                      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-surface-border">
+                        <span className="text-[10px] uppercase tracking-wider text-text-muted">Variant</span>
+                        <span className="text-xs font-mono text-text-primary">{v.printer_model || 'any printer'}</span>
+                        <span className="text-text-muted">·</span>
+                        <span className="text-xs font-mono text-text-primary">
+                          {v.nozzle_diameter ? `${v.nozzle_diameter} mm` : 'any nozzle'}
+                        </span>
+                      </div>
+                      <div className="p-3 space-y-2 text-xs font-mono">
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                          <div>
+                            <div className="text-text-muted">Print temp</div>
+                            <div className="text-text-primary">{v.nozzle_temp_print ? `${v.nozzle_temp_print} °C` : '—'}</div>
+                          </div>
+                          <div>
+                            <div className="text-text-muted">Initial-layer T</div>
+                            <div className="text-text-primary">{v.nozzle_temp_initial_layer ? `${v.nozzle_temp_initial_layer} °C` : '—'}</div>
+                          </div>
+                        </div>
+                        {slotCount > 0 && (
+                          <table className="w-full">
+                            <thead className="text-text-muted">
+                              <tr className="text-left">
+                                <th className="font-normal py-0.5 pr-2">Extruder</th>
+                                <th className="font-normal py-0.5 pr-2">Max vol.</th>
+                                <th className="font-normal py-0.5 pr-2">PA K</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Array.from({ length: slotCount }).map((_, j) => (
+                                <tr key={j} className="border-t border-surface-border/40">
+                                  <td className="py-0.5 pr-2">{labels[j] || '—'}</td>
+                                  <td className="py-0.5 pr-2 text-text-primary">
+                                    {speeds[j] ? `${speeds[j]} mm³/s` : '—'}
+                                  </td>
+                                  <td className="py-0.5 pr-2 text-text-primary">
+                                    {ks[j] ? ks[j].toFixed(3) : '—'}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
-          </div>
+          )}
           <div className="flex flex-wrap gap-2">
             <Button variant="secondary" onClick={onEdit}>Edit</Button>
             {hasToken && (

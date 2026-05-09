@@ -45,6 +45,29 @@ release scripts under `*/scripts/release.sh` additionally build the
 frontend, gzip it, produce a SPIFFS image, and emit a `manifest.json` for
 distribution — only needed for actual releases.
 
+## Local secrets — `.env` at repo root
+
+`.env` (gitignored) holds local credentials needed to talk to the running
+devices. Source it or read keys directly:
+
+- `SPULETTO_KEY` — fixed-key for the **console** at `192.168.20.153`
+  (hostname `spuletto.local`). Used as `Authorization: Bearer <KEY>` or
+  `?key=<KEY>` against `/api/*` endpoints.
+- `SCALINATA_KEY` — fixed-key for the **scale** at `192.168.20.154`
+  (hostname `scalinata.local`). In typical setups this is the same key as
+  the console.
+- `BAMBU_PRINTER_IP` / `BAMBU_PRINTER_SERIAL` / `BAMBU_PRINTER_ACCESS_CODE`
+  — paired Bambu printer's LAN address, serial, and access code.
+- `ACCESS_TOKEN` — Bambu Cloud bearer token for `tools/bambu_login.py`
+  / `tools/get_resources.py`.
+
+Typical use:
+
+```bash
+export $(grep -v '^#' .env | xargs)
+curl -H "Authorization: Bearer $SCALINATA_KEY" http://192.168.20.154/api/logs
+```
+
 ## Shared firmware library: `spoolhard_core`
 
 Code that's identical for both products lives in
@@ -62,12 +85,41 @@ the headers are `#include`d).
 
 - `spoolhard/ota.h` / `src/ota.cpp` — manifest-driven OTA: scheduled
   version checker, `OtaConfig` (NVS-backed), `otaRun()` runner that
-  flashes firmware then frontend with sha256 verification.
+  flashes firmware then frontend with sha256 verification, and
+  `otaTaskSpawn()` which lifts the run onto its own FreeRTOS task so
+  the caller's loop keeps running through the multi-minute fetch.
 - `spoolhard/product_signature.h` — `SPOOLHARD-PRODUCT=<id>` byte marker
   + `ProductSignatureMatcher` for streaming-upload validation.
 - `spoolhard/version_marker.h` / `src/version_marker.cpp` —
   `SPOOLHARD-VERSION=<v>\x01` byte marker + `VersionMarkerParser` that
   pulls the version out of an uploaded firmware image.
+- `spoolhard/backup.h` / `src/backup.cpp` — `/api/backup` + `/api/restore`
+  serializer covering NVS namespaces + on-disk files.
+- `spoolhard/ring_log.h` / `src/ring_log.cpp` — bounded in-RAM log ring
+  + `dlog(tag, fmt, ...)` printf-style helper. Backs `/api/logs`.
+- `spoolhard/serial_mirror.h` / `src/serial_mirror.cpp` — `Serial`
+  macro override that mirrors every `Serial.print*` to the ring log.
+  Include AFTER all framework + project headers in each TU.
+- `spoolhard/psram_json_alloc.h` / `src/psram_json_alloc.cpp` — `g_psramJsonAlloc`
+  singleton: `JsonDocument doc(&g_psramJsonAlloc);` routes the node
+  tree to PSRAM. All hot WS/HTTP paths use this.
+- `spoolhard/ws_buffer_pool.h` / `src/ws_buffer_pool.cpp` — `g_wsBufPool`
+  singleton: 8 × 8 KB pre-allocated `AsyncWebSocketSharedBuffer` slots.
+  Eliminates internal-DRAM churn on broadcastDebug/broadcastState pushes.
+- `spoolhard/auth.h` / `src/auth.cpp` — `requireAuth`, `wsAuthHandshake`,
+  `handleAuthStatus`, `handleTestKey`, `handleFixedKeyConfigPost`,
+  `handleDeviceName{Get,Post}`. Shared NVS schema: namespace `wifi_cfg`
+  with keys `ssid`, `pass`, `device_name`, `fixed_key`.
+- `spoolhard/common_routes.h` / `src/common_routes.cpp` — `registerAll(server)`
+  installs `/api/restart` + `/api/logs`. Both products call this once
+  in `_setupRoutes`. (`/api/logs/current` is product-specific because
+  the console serves SD-persisted output; the scale doesn't have one.)
+- `spoolhard/panic_persist.h` / `src/panic_persist.cpp` — best-effort
+  crash-log persistence without an esp_core_dump partition. On boot,
+  if `esp_reset_reason()` indicates panic/WDT/brownout AND a pending
+  ring-log tail file exists, it's promoted to `/crash_<seq>.txt`. The
+  pending file is rewritten every 30 s during normal operation. Each
+  product registers its own `/api/crashes` route to surface the files.
 
 **Per-product identity**: the library has no per-product config header
 on its include path. Identity comes in as `-D` build flags from each
@@ -91,6 +143,52 @@ schema; do not re-define those keys in the per-product `config.h`.
 
 When adding new shared code, prefer extending the lib over duplicating
 between `console/` and `scale/`.
+
+## Scale firmware task model (0.8.0+)
+
+The scale used to run everything serially in `loop()`. As of 0.8.0
+sensors and slow operations are split into dedicated FreeRTOS tasks
+so the coordinator loop never blocks on hardware I/O:
+
+| Task            | Stack | Core | Owns                                       |
+|-----------------|-------|------|--------------------------------------------|
+| `loopTask`      | Arduino default | 1 | Coordinator: drains task event queues, dispatches WS broadcasts, runs the LED state machine, services WiFi state machine. |
+| `sensor_task`   | 4 KB  | 1    | `g_scale` (LoadCell). 100 Hz poll, drains command queue (tare/calibrate/addCalPoint/clear/reloadParams). Publishes a seqlock snapshot. |
+| `nfc_task`      | 4 KB  | 1    | `g_nfc` (NfcReader / PN532 SPI). 50 Hz poll, drains write/erase/emulate command queue. Publishes a seqlock snapshot. |
+| `console_tx`    | 4 KB  | 1    | Single writer to the port-80 `/ws/console` AsyncWebSocket. Drains a 32-deep frame queue. |
+| `ota_run`       | 12 KB | 0    | Spawned on demand by `otaTaskSpawn`; self-deletes when done. Handles HTTPS manifest + binary fetch, sha256, `Update.write`. |
+| `AsyncTCP_task` | system | 0   | mathieucarbou's lib + lwIP + WiFi. |
+
+**Cross-task communication rules:**
+
+- Single writer per resource. `g_scale` is mutated only from
+  `sensor_task`; reads from anywhere else go through `SensorTask::*`
+  accessors which are seqlock-safe. Same for `g_nfc` /
+  `NfcTask::*`. Outbound WS frames go through `ConsoleTx::send()`,
+  which the dedicated sender task drains.
+- Bounded queues, drop-on-overflow. No queue grows without bound; if
+  a queue is full, the producer logs a warning and discards. The
+  sample/event loops are idempotent — the next tick always carries
+  the latest authoritative state.
+- Atomics for cross-task flags. `g_pendingOta`, `g_pendingPushHandshake`,
+  `g_pendingPushPending`, `g_uploadActiveUntil`, `g_haveLastSuccessTag`
+  are `std::atomic<>` because they're set from AsyncTCP callbacks and
+  consumed by `loopTask`. Use `.exchange(false)` when reading-and-clearing
+  to avoid TOCTOU windows.
+- `ConsoleToScale::g_queue` is mutex-guarded (FreeRTOS semaphore). The
+  inbound parser (`deliver`) runs on AsyncTCP; the dispatcher
+  (`receive`) runs on `loopTask`.
+
+**Single web server**: as of 0.8.0 there's only one `AsyncWebServer`
+on port 80. `/ws` serves the browser dashboard, `/ws/console` serves
+the paired console link. The retired port-81 server lives on in
+`SCALE_WS_PORT_LEGACY` / `SCALE_WS_PATH_LEGACY` for older scale
+firmware fallback (none deployed today).
+
+**HX711 hardware rate**: `HX711_HW_RATE_HZ` in `scale/firmware/include/config.h`
+documents whether the chip's RATE pin is wired for 80 Hz vs the 10 Hz
+default. The `sensor_task` polls at 100 Hz unconditionally; the
+constant is informational + drives the default `STABLE_COUNT_REQ`.
 
 ## Code navigation & editing — use Serena MCP
 

@@ -149,6 +149,34 @@ void ui_set_spool_ams_status(const char* text);
 // hasn't been built or isn't currently visible.
 void ui_flash_spool_current();
 
+// ── Weight-update confirmation screen ───────────────────────────
+// Modal-style screen shown when the user taps "Capture weight" on the
+// spool detail. Renders both the existing filament weight and the
+// newly-weighed filament weight (both net of the spool's empty core)
+// so the user can sanity-check the delta before committing. main.cpp
+// computes the net values and passes them in; the user picks Accept
+// (persist + flash) or Cancel (revert).
+//
+// If `new_g` is negative, the screen renders a "no empty-spool weight"
+// warning instead of a number, and only Cancel is enabled — the user
+// must capture an empty spool first to get a meaningful filament-only
+// reading.
+typedef enum {
+    WEIGHT_CONFIRM_ACCEPT = 1,
+    WEIGHT_CONFIRM_CANCEL = 2,
+} weight_confirm_action_t;
+typedef void (*weight_confirm_cb_t)(weight_confirm_action_t action);
+
+// Register the callback once at boot (matches ui_set_spool_callback).
+void ui_set_weight_confirm_callback(weight_confirm_cb_t cb);
+
+// Switch to the confirm screen with the supplied numbers. Pass -1 for
+// new_g to render the "no empty-spool weight known" warning instead of
+// a number; the Accept button is disabled in that case.
+void ui_show_weight_confirm(const char* spool_title,
+                            int existing_g,
+                            int new_g);
+
 // ── Home-screen AMS panel ──────────────────────────────────────
 // One-line snapshot of the currently selected printer's AMS trays + external
 // spool holder. main.cpp builds this array from the first connected Bambu
@@ -224,6 +252,17 @@ void ui_set_slot_tap_callback(ui_slot_tap_cb_t cb);
 
 // Show the detail screen with the packed info. Internally switches screen.
 void ui_show_slot_detail(const UiSlotDetail* detail);
+
+// User tapped the slot-detail "Import from printer" button. main.cpp
+// resolves the currently-shown slot (the same slot_idx it last passed
+// to ui_show_slot_detail) and invokes the firmware-side import helper.
+typedef void (*ui_slot_import_cb_t)(void);
+void ui_set_slot_import_callback(ui_slot_import_cb_t cb);
+
+// Update the small notice line below the import button. Pass NULL or ""
+// to clear it. Used by main.cpp to surface the import result —
+// "Imported N fields" or an error string.
+void ui_slot_detail_set_import_notice(const char* text);
 
 // ── Scale settings + calibration wizard ────────────────────────
 // Reachable by tapping the Scale card on the home screen. Hosts a

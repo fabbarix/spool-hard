@@ -79,7 +79,20 @@ private:
     CalibrationData _cal;
     ScaleParams     _params;
 
+    // Rolling sample window — fed one HX711 read per `update()` call so
+    // the main loop never blocks waiting on the chip's per-sample
+    // ready signal (~100 ms each in 10 Hz mode). The averaged value is
+    // cached in `_lastRaw` / `_weightG` for synchronous getters that
+    // don't want to think about the ring's fill state.
+    static constexpr int kRingMax = 32;
+    long  _ringBuf[kRingMax]   = {0};
+    int   _ringHead            = 0;
+    int   _ringFilled          = 0;
+
     float _rawToWeight(long raw) const;
+    // Synchronous — only used from cal/tare paths where blocking up to
+    // ~5 s is acceptable (user has explicitly requested a precise
+    // measurement). Never call from update().
     long  _readRawAveraged(int samples);
     void  _setState(WeightState s);
 };

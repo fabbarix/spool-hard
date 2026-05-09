@@ -1,4 +1,6 @@
 #include "web_server.h"
+#include <map>
+#include <set>
 #include "config.h"
 #include "display.h"
 #include "spoolhard/ota.h"
@@ -7,7 +9,12 @@
 #include "user_filaments_store.h"
 #include "stock_filaments_store.h"
 #include "bambu_cloud_filaments.h"
-#include "ring_log.h"
+#include "spoolhard/ring_log.h"
+#include "crash_logger.h"
+#include "spoolhard/psram_json_alloc.h"
+#include "spoolhard/ws_buffer_pool.h"
+#include "spoolhard/auth.h"
+#include "spoolhard/common_routes.h"
 #include "scale_link.h"
 #include "scale_secrets.h"
 #include "core_weights.h"
@@ -26,7 +33,7 @@
 #include <LittleFS.h>
 #include <SD.h>
 #include <Update.h>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 // ── Lifecycle ────────────────────────────────────────────────
 
@@ -137,14 +144,58 @@ void ConsoleWebServer::begin()  {
 }
 void ConsoleWebServer::start()  { _server.begin(); Serial.println("[WebServer] Listening on :80"); }
 
+// ── WS broadcast pipeline ───────────────────────────────────────────
+//
+// The hot path used to do, per call:
+//   1. JsonDocument env;            ArduinoJson node tree (DRAM)
+//   2. String type / String out;    realloc 16 → 32 → 64 …
+//   3. serializeJson(env, out);     another realloc as body grows
+//   4. _ws.textAll(out);            lib's makeSharedBuffer() does
+//                                   make_shared<vector<uint8_t>>()
+//                                   — one more DRAM alloc + free
+// 5–10 broadcasts/sec while a dashboard tab is open. Fragmented
+// internal DRAM until a 30 K mbedtls handshake context couldn't
+// find contiguous space → panic.
+//
+// Now: the JsonDocument's node tree lives in PSRAM via
+// g_psramJsonAlloc; we serialize *directly into* a pre-allocated
+// `AsyncWebSocketSharedBuffer` from g_wsBufPool (4 slots × 8 KB
+// pre-reserved at boot). Step 4's per-call alloc/free goes away —
+// the lib's `textAll(AsyncWebSocketSharedBuffer)` overload accepts
+// our shared_ptr directly. After the broadcast, the lib's clients
+// hold copies of the shared_ptr in their queues; when they drain,
+// refcount returns to 1 (pool only) and the slot is acquirable
+// again. Net per-broadcast internal-DRAM allocation: ZERO under
+// steady state.
+
+namespace {
+// Print sink that writes into a vector<uint8_t> by reference. Lets
+// `serializeJson(env, sink)` populate the shared buffer in-place.
+struct VectorPrint : public Print {
+    std::vector<uint8_t>* v;
+    explicit VectorPrint(std::vector<uint8_t>* dst) : v(dst) {}
+    size_t write(uint8_t b) override {
+        v->push_back(b);
+        return 1;
+    }
+    size_t write(const uint8_t* buffer, size_t size) override {
+        v->insert(v->end(), buffer, buffer + size);
+        return size;
+    }
+};
+}  // namespace
+
 void ConsoleWebServer::broadcastDebug(const String& type, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
-    JsonDocument env;
+    auto buf = g_wsBufPool.acquire();
+    if (!buf) return;   // every slot in flight; drop this push
+    JsonDocument env(&g_psramJsonAlloc);
     env["type"] = type;
     env["data"] = payload;
-    String out;
-    serializeJson(env, out);
-    _ws.textAll(out);
+    buf->clear();        // keeps capacity; the next insert reuses it
+    VectorPrint sink(buf.get());
+    serializeJson(env, sink);
+    _ws.textAll(buf);
 }
 
 // Per-resource rate-limit table for broadcastState. Producers that fire
@@ -180,14 +231,17 @@ static bool _stateRateGate(const char* resource) {
 void ConsoleWebServer::broadcastState(const char* resource, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
     if (!_stateRateGate(resource)) return;
-    JsonDocument env;
-    String type = "state.";
-    type += resource;
-    env["type"] = type;
+    auto buf = g_wsBufPool.acquire();
+    if (!buf) return;
+    char typeBuf[40];
+    snprintf(typeBuf, sizeof(typeBuf), "state.%s", resource);
+    JsonDocument env(&g_psramJsonAlloc);
+    env["type"] = typeBuf;
     env["data"] = payload;
-    String out;
-    serializeJson(env, out);
-    _ws.textAll(out);
+    buf->clear();
+    VectorPrint sink(buf.get());
+    serializeJson(env, sink);
+    _ws.textAll(buf);
 }
 
 // Resource push helpers — each serializes via the same static helper
@@ -207,30 +261,41 @@ void ConsoleWebServer::pushPrintersList() {
 
 void ConsoleWebServer::pushScaleLink() {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeScaleLink(doc.to<JsonObject>(), _scale);
     broadcastState("scale_link", doc);
 }
 
 void ConsoleWebServer::pushPrinterAnalysis(const BambuPrinter& printer) {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeAnalysis(doc.to<JsonObject>(), const_cast<BambuPrinter*>(&printer));
     broadcastState("printer_analysis", doc);
 }
 
 void ConsoleWebServer::pushPrinterAnalysisForce(const BambuPrinter& printer) {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    auto buf = g_wsBufPool.acquire();
+    if (!buf) return;
+    // Same wire shape as broadcastState("printer_analysis", …) but
+    // without the 250 ms rate-limit gate — used for the analyse-end
+    // edge so the in_progress=false / valid=true terminal frame
+    // always lands.
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeAnalysis(doc.to<JsonObject>(), const_cast<BambuPrinter*>(&printer));
-    // Bypass the rate gate by emitting the envelope directly. Reaches
-    // the same wire shape `broadcastState` would produce.
-    JsonDocument env;
+    JsonDocument env(&g_psramJsonAlloc);
     env["type"] = "state.printer_analysis";
     env["data"] = doc;
-    String out;
-    serializeJson(env, out);
-    _ws.textAll(out);
+    buf->clear();
+    VectorPrint sink(buf.get());
+    serializeJson(env, sink);
+    _ws.textAll(buf);
 }
 
 void ConsoleWebServer::pushSpoolsList() {
@@ -255,7 +320,10 @@ void ConsoleWebServer::pushSpoolsList() {
 
 void ConsoleWebServer::pushCoreWeights() {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     JsonArray arr = doc.to<JsonArray>();
     for (const auto& e : CoreWeights::list()) {
         JsonObject o = arr.add<JsonObject>();
@@ -270,35 +338,50 @@ void ConsoleWebServer::pushCoreWeights() {
 
 void ConsoleWebServer::pushOtaStatus() {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeOtaStatus(doc, _scale);
     broadcastState("ota", doc);
 }
 
 void ConsoleWebServer::pushDiscoveryPrinters() {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeDiscoveryPrinters(doc);
     broadcastState("discovery_printers", doc);
 }
 
 void ConsoleWebServer::pushDiscoveryScales() {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeDiscoveryScales(doc, _scale);
     broadcastState("discovery_scales", doc);
 }
 
 void ConsoleWebServer::pushWifiStatus() {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeWifiStatus(doc);
     broadcastState("wifi_status", doc);
 }
 
 void ConsoleWebServer::pushFirmwareInfo() {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeFirmwareInfo(doc);
     broadcastState("firmware_info", doc);
 }
@@ -324,7 +407,10 @@ void ConsoleWebServer::pushFilamentsInfo() {
 
 void ConsoleWebServer::pushCloudPublicCache() {
     if (_ws.count() == 0) return;
-    JsonDocument doc;
+    // Push helper's local doc — route through the PSRAM allocator so
+    // the high-rate state.* envelopes don't pressure-cook internal
+    // DRAM. broadcastState() does the same for its outer envelope.
+    JsonDocument doc(&g_psramJsonAlloc);
     if (g_sd.isMounted()) {
         File f = SD.open(CLOUD_PUBLIC_CACHE_PATH);
         if (f) {
@@ -342,74 +428,50 @@ void ConsoleWebServer::pushCloudPublicCache() {
 }
 
 // ── Auth ─────────────────────────────────────────────────────
-
+//
+// Implementation lives in the shared spoolhard_core lib (see
+// spoolhard/auth.h). This wrapper exists only to keep callers using
+// the short `_requireAuth(req)` form.
 bool ConsoleWebServer::_requireAuth(AsyncWebServerRequest* req) {
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    String stored = prefs.getString(NVS_KEY_FIXED_KEY, "");
-    prefs.end();
-
-    // No key set, or still the ship-default placeholder → auth is off.
-    if (stored.isEmpty() || stored == DEFAULT_FIXED_KEY) return true;
-
-    String auth = req->header("Authorization");
-    if (auth.startsWith("Bearer ") && auth.substring(7) == stored) return true;
-
-    // Allow ?key= fallback for multipart uploads and WebSocket handshake.
-    if (req->hasParam("key") && req->getParam("key")->value() == stored) return true;
-
-    req->send(401, "application/json", "{\"error\":\"unauthorized\"}");
-    return false;
-}
-
-void ConsoleWebServer::_handleAuthStatus(AsyncWebServerRequest* req) {
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    String stored = prefs.getString(NVS_KEY_FIXED_KEY, "");
-    String device = prefs.getString(NVS_KEY_DEVICE_NAME, "SpoolHardConsole");
-    prefs.end();
-
-    bool required = !stored.isEmpty() && stored != DEFAULT_FIXED_KEY;
-    bool authed   = !required;
-    if (required) {
-        String auth = req->header("Authorization");
-        if (auth.startsWith("Bearer ") && auth.substring(7) == stored) authed = true;
-    }
-    JsonDocument doc;
-    doc["auth_required"] = required;
-    doc["authenticated"] = authed;
-    doc["device_name"]   = device;
-    doc["product"]       = "console";
-    String out; serializeJson(doc, out);
-    req->send(200, "application/json", out);
+    return SpoolhardAuth::requireAuth(req);
 }
 
 // ── Routes ───────────────────────────────────────────────────
 
 void ConsoleWebServer::_setupRoutes() {
-    // Auth gate on the WS upgrade. The handshake handler runs BEFORE
-    // the upgrade is committed; returning false makes ESPAsyncWebServer
-    // 401 the request. Same `?key=` semantics the HTTP routes use via
-    // _requireAuth, so a single stored key gates both transports.
-    // No-op when no key is configured (matches HTTP behaviour).
-    _ws.handleHandshake([](AsyncWebServerRequest* req) -> bool {
-        Preferences prefs;
-        prefs.begin(NVS_NS_WIFI, true);
-        String stored = prefs.getString(NVS_KEY_FIXED_KEY, "");
-        prefs.end();
-        if (stored.isEmpty() || stored == DEFAULT_FIXED_KEY) return true;
-        if (req->hasParam("key") && req->getParam("key")->value() == stored) return true;
-        return false;
-    });
+    // Auth gate on the WS upgrade — shared lib handler.
+    _ws.handleHandshake(SpoolhardAuth::wsAuthHandshake);
     _ws.onEvent([](AsyncWebSocket* server, AsyncWebSocketClient* client,
                    AwsEventType type, void*, uint8_t*, size_t) {
         if (type == WS_EVT_CONNECT) {
-            // Drop frames instead of closing on a full per-client queue
-            // (default 32 messages). State-update broadcasts can come
-            // faster than a slow tab can drain them; we'd rather lose
-            // a frame and let the next state push reconcile than tear
-            // down the connection. Per-client setting, applied here.
-            client->setCloseClientOnQueueFull(false);
+            // Disconnect a slow client when its 32-slot per-client
+            // message queue fills up. Counter-intuitively this is
+            // KINDER than the alternative once we're using the WS
+            // buffer pool: each queued message holds a shared_ptr ref
+            // to one of the pool's pre-allocated buffers, so a single
+            // slow client whose queue stays at 32 entries can pin
+            // every pool buffer permanently — broadcasts to ALL
+            // clients (healthy + slow) start dropping silently
+            // because the pool reports 0 free.
+            // With close-on-full the slow client gets dropped, its
+            // queue destructs, the pool buffers free up, and the
+            // browser reconnects within a couple of seconds via the
+            // WebSocketProvider's watchdog. Net UX: slow client
+            // sees a brief flicker; everyone else stays current.
+            client->setCloseClientOnQueueFull(true);
+            // Bump AsyncTCP-esphome's ack timeout from its 5 s default
+            // to 30 s. AsyncWebSocketClient::_onTimeout unconditionally
+            // closes the client when the timeout fires — on a flaky
+            // mesh-AP (multi-BSSID roaming, deferred frame delivery)
+            // a single missed TCP ACK is enough to tear the WS down.
+            // The dashboard's React client reconnects automatically,
+            // but the flap masks real state changes for a beat. 30 s
+            // gives plenty of room for retransmits + roam events;
+            // browser-side liveness is still detected via the lib's
+            // own ping/pong cycle.
+            if (client->client()) {
+                client->client()->setAckTimeout(30000);
+            }
             Serial.printf("[WS] Client #%u connected from %s (total=%u)\n",
                           client->id(), client->remoteIP().toString().c_str(),
                           server->count());
@@ -420,40 +482,26 @@ void ConsoleWebServer::_setupRoutes() {
     });
     _server.addHandler(&_ws);
 
-    // Always-open auth probe. Never 401s; reports whether a key is set and
-    // whether the supplied Authorization header is valid. The frontend uses
-    // this both as the pre-login gate check and as the password-verification
-    // endpoint on submit.
-    _server.on("/api/auth-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleAuthStatus(req);
+    // Auth + device-name routes — shared lib registrations.
+    _server.on("/api/auth-status", HTTP_GET, [](AsyncWebServerRequest* req) {
+        SpoolhardAuth::handleAuthStatus(req, "SpoolHardConsole", "console");
     });
-
-    // ── Device config ───────────────────────────────────────
-    _server.on("/api/device-name-config", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleDeviceName(req);
+    _server.on("/api/device-name-config", HTTP_GET, [](AsyncWebServerRequest* req) {
+        SpoolhardAuth::handleDeviceNameGet(req, "SpoolHardConsole");
     });
     _server.on("/api/device-name-config", HTTP_POST,
         [](AsyncWebServerRequest*) {},
         nullptr,
-        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
-            if (!_requireAuth(req)) return;
-            JsonDocument doc;
-            if (deserializeJson(doc, data, len)) {
-                req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
-                return;
-            }
-            String name = doc["device_name"] | "";
-            if (name.isEmpty()) {
-                req->send(400, "application/json", "{\"ok\":false,\"error\":\"name required\"}");
-                return;
-            }
-            Preferences prefs;
-            prefs.begin(NVS_NS_WIFI, false);
-            prefs.putString(NVS_KEY_DEVICE_NAME, name);
-            prefs.end();
-            req->send(200, "application/json", "{\"ok\":true}");
+        [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!SpoolhardAuth::requireAuth(req)) return;
+            SpoolhardAuth::handleDeviceNamePost(req, data, len);
         }
     );
+
+    // /api/restart, /api/logs — shared lib registrations. /api/logs/current
+    // stays a console-specific handler because it serves the SD-persisted
+    // log file, not the in-RAM ring head.
+    SpoolhardCommonRoutes::registerAll(_server);
 
     _server.on("/api/wifi-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleWifiStatus(req);
@@ -500,48 +548,53 @@ void ConsoleWebServer::_setupRoutes() {
         req->send(200, "application/json", "{\"ok\":true}");
     });
 
-    // Remote tail of the in-RAM ring log. Use ?since=<seq> to poll
-    // incrementally; ?since=0 (or omit) returns the last batch (up to
-    // ~200 lines). Returns plain text — easy to curl from a terminal
-    // and easy to parse from React Query.
-    _server.on("/api/logs", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    // /api/logs is registered above by SpoolhardCommonRoutes::registerAll.
+
+    // Crash logs preserved on SD by CrashLogger. List, download a single
+    // log, delete one, or delete all. Helps diagnose instability remotely
+    // when the ring buffer was wiped by the crash itself.
+    // CRITICAL: register the per-id (regex) routes BEFORE the literal
+    // `/api/crashes` collection routes. mathieucarbou's ESPAsyncWebServer
+    // does PREFIX match on literal `on()` paths — `/api/crashes` would
+    // otherwise capture every `/api/crashes/<id>` request and serve the
+    // list JSON instead of the requested crash log.
+    _server.on("^\\/api\\/crashes\\/([0-9]+)$", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
-        uint32_t since = 0;
-        if (req->hasParam("since")) {
-            since = (uint32_t)req->getParam("since")->value().toInt();
-        }
-        auto rows = RingLog::snapshot(since, 200);
-        JsonDocument doc;
-        doc["head"]  = RingLog::headSeq();
-        doc["since"] = since;
-        JsonArray arr = doc["lines"].to<JsonArray>();
-        for (auto& e : rows) {
-            JsonObject o = arr.add<JsonObject>();
-            o["seq"]    = e.seq;
-            o["t_ms"]   = e.millis_at;
-            o["text"]   = e.line;
-        }
-        String out; serializeJson(doc, out);
-        req->send(200, "application/json", out);
+        _handleCrashGet(req);
+    });
+    _server.on("^\\/api\\/crashes\\/([0-9]+)$", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCrashDelete(req);
+    });
+    _server.on("/api/crashes", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCrashesList(req);
+    });
+    _server.on("/api/crashes", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCrashesDeleteAll(req);
+    });
+    _server.on("/api/logs/current", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _handleCurrentLog(req);
     });
 
-    _server.on("/api/restart", HTTP_POST, [this](AsyncWebServerRequest* req) {
-        if (!_requireAuth(req)) return;
-        req->send(200, "application/json", "{\"ok\":true}");
+    // /api/restart is registered above by SpoolhardCommonRoutes::registerAll.
+    // Legacy alias for older clients that POST to /api/reset-device.
+    _server.on("/api/reset-device", HTTP_POST, [](AsyncWebServerRequest* req) {
+        if (!SpoolhardAuth::requireAuth(req)) return;
+        req->send(200, "application/json", "{\"status\":\"resetting\"}");
         delay(500);
         ESP.restart();
     });
-    _server.on("/api/reset-device", HTTP_POST, [this](AsyncWebServerRequest* req) {
-        _handleReset(req);
-    });
 
-    _server.on("/api/test-key", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleTestKey(req);
+    _server.on("/api/test-key", HTTP_GET, [](AsyncWebServerRequest* req) {
+        SpoolhardAuth::handleTestKey(req);
     });
     _server.on("/api/fixed-key-config", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
-        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
-            if (!_requireAuth(req)) return;
-            _handleFixedKeyConfigPost(req, data, len);
+        [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!SpoolhardAuth::requireAuth(req)) return;
+            SpoolhardAuth::handleFixedKeyConfigPost(req, data, len);
         }
     );
 
@@ -766,6 +819,12 @@ void ConsoleWebServer::_setupRoutes() {
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handlePrinterAmsMappingPost(req, data, len);
+        });
+    _server.on("^\\/api\\/printers\\/([^/]+)\\/import-ams-spool$", HTTP_POST,
+        [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!_requireAuth(req)) return;
+            _handlePrinterImportAmsSpool(req, data, len);
         });
     // Interactive FTP debug: starts a background task that runs the requested
     // operation (probe / list / download) and streams per-step progress over
@@ -1367,32 +1426,25 @@ void ConsoleWebServer::_setupRoutes() {
 
 // ── Handlers ─────────────────────────────────────────────────
 
-void ConsoleWebServer::_handleDeviceName(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    String name = prefs.getString(NVS_KEY_DEVICE_NAME, "SpoolHardConsole");
-    prefs.end();
-    JsonDocument doc; doc["device_name"] = name;
-    String r; serializeJson(doc, r);
-    req->send(200, "application/json", r);
-}
-
 // Same shape `/api/wifi-status` returns. Shared between the HTTP
 // handler and `pushWifiStatus()` so the wire bytes are identical.
 static void serializeWifiStatus(JsonDocument& doc) {
     Preferences prefs;
     prefs.begin(NVS_NS_WIFI, true);
-    bool configured = prefs.isKey(NVS_KEY_SSID);
-    String ssid     = prefs.getString(NVS_KEY_SSID, "");
+    bool configured    = prefs.isKey(NVS_KEY_SSID);
+    String ssid        = prefs.getString(NVS_KEY_SSID, "");
+    String pinnedBssid = prefs.getString(NVS_KEY_PINNED_BSSID, "");
     prefs.end();
 
     bool connected = (WiFi.status() == WL_CONNECTED);
-    doc["configured"] = configured && !ssid.isEmpty();
-    doc["connected"]  = connected;
-    doc["ssid"]       = connected ? WiFi.SSID() : ssid;
-    doc["ip"]         = connected ? WiFi.localIP().toString() : "";
-    doc["rssi"]       = connected ? WiFi.RSSI() : 0;
+    doc["configured"]   = configured && !ssid.isEmpty();
+    doc["connected"]    = connected;
+    doc["ssid"]         = connected ? WiFi.SSID() : ssid;
+    doc["ip"]           = connected ? WiFi.localIP().toString() : "";
+    doc["rssi"]         = connected ? WiFi.RSSI() : 0;
+    doc["bssid"]        = connected ? WiFi.BSSIDstr() : "";
+    doc["channel"]      = connected ? WiFi.channel() : 0;
+    doc["pinned_bssid"] = pinnedBssid;
 }
 
 void ConsoleWebServer::_handleWifiStatus(AsyncWebServerRequest* req) {
@@ -1526,50 +1578,6 @@ void ConsoleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
     req->send(200, "application/json", s);
 }
 
-void ConsoleWebServer::_handleReset(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    req->send(200, "application/json", "{\"status\":\"resetting\"}");
-    delay(500);
-    ESP.restart();
-}
-
-void ConsoleWebServer::_handleTestKey(AsyncWebServerRequest* req) {
-    if (!_requireAuth(req)) return;
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    bool configured = prefs.isKey(NVS_KEY_FIXED_KEY);
-    String key = prefs.getString(NVS_KEY_FIXED_KEY, DEFAULT_FIXED_KEY);
-    prefs.end();
-
-    String masked = key;
-    if (key.length() > 4) masked = key.substring(0, 2) + "***" + key.substring(key.length() - 2);
-
-    JsonDocument doc;
-    doc["configured"]  = configured;
-    doc["key_preview"] = masked;
-    String r; serializeJson(doc, r);
-    req->send(200, "application/json", r);
-}
-
-void ConsoleWebServer::_handleFixedKeyConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len) {
-    if (!_requireAuth(req)) return;
-    JsonDocument doc;
-    if (deserializeJson(doc, data, len)) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
-        return;
-    }
-    String key = doc["key"] | "";
-    if (key.isEmpty()) {
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"key required\"}");
-        return;
-    }
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, false);
-    prefs.putString(NVS_KEY_FIXED_KEY, key);
-    prefs.end();
-    req->send(200, "application/json", "{\"ok\":true}");
-}
-
 // Same shape `/api/firmware-info` returns. Shared.
 static void serializeFirmwareInfo(JsonDocument& doc) {
     doc["fw_version"]   = FW_VERSION;
@@ -1581,6 +1589,20 @@ static void serializeFirmwareInfo(JsonDocument& doc) {
     doc["userfs_used"]  = LittleFS.usedBytes();
     doc["free_heap"]    = ESP.getFreeHeap();
     doc["psram_free"]   = ESP.getFreePsram();
+    // Lifetime-low water marks. Strictly monotonic (never grows) so a
+    // declining trend over time = a real leak, distinct from the
+    // steady-state alloc/free churn that makes the instantaneous
+    // free_heap fluctuate by ~15 KB.
+    doc["min_free_heap"]    = ESP.getMinFreeHeap();
+    doc["min_free_psram"]   = ESP.getMinFreePsram();
+    doc["max_alloc_heap"]   = ESP.getMaxAllocHeap();
+    doc["max_alloc_psram"]  = ESP.getMaxAllocPsram();
+    doc["uptime_s"]         = (uint32_t)(millis() / 1000);
+    // WS buffer pool telemetry — `free` ticking down toward 0 means
+    // a slow client is back-pressuring the queues; broadcasts get
+    // dropped silently when free hits 0.
+    doc["ws_pool_total"]    = (uint32_t)g_wsBufPool.totalSlots();
+    doc["ws_pool_free"]     = (uint32_t)g_wsBufPool.freeSlots();
     doc["sd_mounted"]   = g_sd.isMounted();
     doc["sd_total"]     = (double)g_sd.totalBytes();
     doc["sd_used"]      = (double)g_sd.usedBytes();
@@ -1645,16 +1667,116 @@ void ConsoleWebServer::_handleRestorePost(AsyncWebServerRequest* req,
         _restoreReady  = false;
         _restoreError  = "";
         // Reserve up-front when we know the size — saves a few reallocs
-        // on big payloads. Bounded by client behaviour; PSRAM keeps the
-        // ceiling generous.
-        if (total > 0 && total < 2 * 1024 * 1024) {
+        // on big payloads. Cap aggressively at 256 KB: realistic console
+        // backup payloads fit comfortably under that, and capping the
+        // pre-reservation means a connection that drops mid-upload
+        // can't leave megabytes of PSRAM pinned until the next restore.
+        if (total > 0 && total < 256 * 1024) {
             _restoreBuffer.reserve(total);
         }
+    }
+    // Reject anything bigger than the cap — the existing buffer would
+    // grow on concat() past the reservation and we don't want that on
+    // a hostile / runaway upload.
+    if (total > 256 * 1024) {
+        _restoreError = "backup too large (>256 KB)";
+        _restoreBuffer = String();
+        _restoreReady  = false;
+        return;
     }
     if (len > 0) _restoreBuffer.concat((const char*)data, len);
     if (index + len >= total) {
         _restoreReady = true;
     }
+}
+
+// ── Crash logs ───────────────────────────────────────────────
+
+void ConsoleWebServer::_handleCrashesList(AsyncWebServerRequest* req) {
+    JsonDocument doc;
+    doc["available"] = CrashLogger::isAvailable();
+    JsonArray arr = doc["crashes"].to<JsonArray>();
+    if (CrashLogger::isAvailable()) {
+        auto entries = CrashLogger::list();
+        for (const auto& e : entries) {
+            JsonObject o = arr.add<JsonObject>();
+            o["seq"]    = e.seq;
+            o["reason"] = e.reason;
+            o["bytes"]  = e.size_bytes;
+            o["mtime"]  = e.mtime_unix;
+        }
+    }
+    String out;
+    serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+void ConsoleWebServer::_handleCrashGet(AsyncWebServerRequest* req) {
+    if (!CrashLogger::isAvailable()) {
+        req->send(503, "application/json",
+                  "{\"error\":\"crash logging unavailable (no SD card?)\"}");
+        return;
+    }
+    if (req->pathArg(0).isEmpty()) {
+        req->send(400, "application/json", "{\"error\":\"missing seq\"}");
+        return;
+    }
+    uint32_t seq = (uint32_t)req->pathArg(0).toInt();
+    String path  = CrashLogger::pathFor(seq);
+    if (path.isEmpty()) {
+        req->send(404, "application/json", "{\"error\":\"crash not found\"}");
+        return;
+    }
+    // AsyncWebServer streams from the FS object — internal allocator
+    // handles buffer reuse, no big String materialisation here.
+    req->send(SD, path, "text/plain");
+}
+
+void ConsoleWebServer::_handleCrashDelete(AsyncWebServerRequest* req) {
+    if (!CrashLogger::isAvailable()) {
+        req->send(503, "application/json",
+                  "{\"error\":\"crash logging unavailable\"}");
+        return;
+    }
+    uint32_t seq = (uint32_t)req->pathArg(0).toInt();
+    bool ok = CrashLogger::remove(seq);
+    if (!ok) {
+        req->send(404, "application/json", "{\"error\":\"crash not found\"}");
+        return;
+    }
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+void ConsoleWebServer::_handleCrashesDeleteAll(AsyncWebServerRequest* req) {
+    if (!CrashLogger::isAvailable()) {
+        req->send(503, "application/json",
+                  "{\"error\":\"crash logging unavailable\"}");
+        return;
+    }
+    size_t n = CrashLogger::removeAll();
+    JsonDocument doc;
+    doc["ok"]      = true;
+    doc["removed"] = (uint32_t)n;
+    String out;
+    serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+void ConsoleWebServer::_handleCurrentLog(AsyncWebServerRequest* req) {
+    if (!CrashLogger::isAvailable()) {
+        req->send(503, "application/json",
+                  "{\"error\":\"log persistence unavailable (no SD card?)\"}");
+        return;
+    }
+    // Force a flush before serving so the user sees the latest in-RAM
+    // entries on disk too — otherwise the file lags up to ~3 s behind.
+    CrashLogger::flush();
+    const char* path = CrashLogger::currentLogPath();
+    if (!SD.exists(path)) {
+        req->send(204, "text/plain", "");
+        return;
+    }
+    req->send(SD, path, "text/plain");
 }
 
 // ── Spool CRUD ───────────────────────────────────────────────
@@ -1961,11 +2083,69 @@ void ConsoleWebServer::_handleUserFilamentPost(AsyncWebServerRequest* req,
 void ConsoleWebServer::_handleUserFilamentDelete(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
     String id = req->pathArg(0);
-    if (!g_user_filaments.remove(id)) {
+    FilamentRecord rec;
+    if (!g_user_filaments.findById(id, rec)) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
         return;
     }
-    req->send(200, "application/json", "{\"ok\":true}");
+    // Cascade deletes to Bambu Cloud when this record was ever synced.
+    // Each variant we own is a separate cloud preset, so we walk the
+    // sibling-id list (`cloud_variant_ids` is the canonical set; older
+    // records only carry `cloud_setting_id` so fall back to that).
+    // ?keep_cloud=1 lets the user opt out and only delete locally.
+    bool keepCloud = false;
+    if (req->hasParam("keep_cloud"))
+        keepCloud = req->getParam("keep_cloud")->value() == "1";
+    std::vector<String> cloudIds;
+    if (!keepCloud) {
+        if (rec.cloud_variant_ids_json.length()) {
+            JsonDocument idDoc;
+            if (!deserializeJson(idDoc, rec.cloud_variant_ids_json)) {
+                for (JsonVariantConst v : idDoc.as<JsonArrayConst>()) {
+                    const char* s = v | "";
+                    if (*s) cloudIds.push_back(String(s));
+                }
+            }
+        }
+        if (cloudIds.empty() && rec.cloud_setting_id.length())
+            cloudIds.push_back(rec.cloud_setting_id);
+    }
+
+    JsonDocument resp;
+    resp["ok"] = true;
+
+    // Synchronous cloud deletes — same pattern as the cloud-push handler.
+    // Failures don't block the local delete; the user explicitly asked
+    // to remove this filament. We surface the diagnostics so they can
+    // see why a sibling remained on the cloud.
+    if (!cloudIds.empty() && g_bambu_cloud.haveToken()) {
+        BambuCloudFilaments::Diag diag;
+        int deleted = 0, failed = 0;
+        for (const auto& cid : cloudIds) {
+            auto dr = BambuCloudFilaments::deleteOne(g_bambu_cloud.token(),
+                                                    g_bambu_cloud.region(),
+                                                    cid, &diag);
+            if (dr == BambuCloudFilaments::Result::Ok) ++deleted;
+            else ++failed;
+        }
+        resp["cloud_deleted"] = deleted;
+        if (failed > 0) {
+            resp["cloud_failed"] = failed;
+            JsonObject d = resp["diagnostics"].to<JsonObject>();
+            d["stage"]         = diag.stage;
+            d["request_url"]   = diag.url;
+            d["http_status"]   = diag.httpStatus;
+            d["cf_blocked"]    = diag.cfBlocked;
+            d["response_body"] = diag.body;
+        }
+    }
+
+    if (!g_user_filaments.remove(id)) {
+        req->send(500, "application/json", "{\"error\":\"local remove failed\"}");
+        return;
+    }
+    String out; serializeJson(resp, out);
+    req->send(200, "application/json", out);
 }
 
 // ── Cloud sync (Phase C) ───────────────────────────────────────
@@ -2004,6 +2184,7 @@ struct CloudSyncState {
     String          result_status;      // "ok" | "rejected" | "unreachable" (Done only)
     int             added = 0;
     int             updated = 0;
+    int             removed = 0;
     BambuCloudFilaments::Diag diag;
 };
 static CloudSyncState  s_cloudSync;
@@ -2019,16 +2200,30 @@ static void _cloudSyncTask(void* /*arg*/) {
     dlog("CloudSync", "fetchAll returned status=%s entries=%u",
          _cloudResultStr(r), (unsigned)cloudList.size());
 
-    int added = 0, updated = 0, failed = 0;
+    int added = 0, updated = 0, failed = 0, removed = 0;
     if (r == BambuCloudFilaments::Result::Ok) {
-        // Snapshot existing cloud_setting_id → local setting_id once, instead
-        // of re-listing the SD-backed store on every preset (was O(N²) and
-        // performed a fresh SD read for each comparison — both wasteful and a
-        // contention risk against any concurrent write).
-        std::map<String, String> existingByCloud;
-        for (auto& local : g_user_filaments.list(0, 1000, "")) {
+        // Build the set of cloud preset IDs that came back in this
+        // sync. We need the FULL sibling-id set (not just the anchor
+        // cloud_setting_id) — a single local record now maps to many
+        // cloud presets via cloud_variant_ids.
+        std::map<String, String> existingByCloud;          // anchor id → local setting_id
+        std::vector<FilamentRecord> locals = g_user_filaments.list(0, 1000, "");
+        for (auto& local : locals) {
             if (local.cloud_setting_id.length()) {
                 existingByCloud[local.cloud_setting_id] = local.setting_id;
+            }
+        }
+        std::set<String> cloudIdSet;
+        for (auto& cf : cloudList) {
+            cloudIdSet.insert(cf.cloud_setting_id);
+            if (cf.cloud_variant_ids_json.length()) {
+                JsonDocument d;
+                if (!deserializeJson(d, cf.cloud_variant_ids_json)) {
+                    for (JsonVariantConst v : d.as<JsonArrayConst>()) {
+                        const char* s = v | "";
+                        if (*s) cloudIdSet.insert(String(s));
+                    }
+                }
             }
         }
         for (auto& cf : cloudList) {
@@ -2048,9 +2243,38 @@ static void _cloudSyncTask(void* /*arg*/) {
                 ++added;
             }
         }
+        // Reconcile deletes: drop any local cloud-synced record whose
+        // entire cloud-id set has vanished from this sync's response.
+        // A record is considered cloud-only if it has cloud_setting_id
+        // (locals without sync metadata are user-created and untouched).
+        for (auto& local : locals) {
+            if (local.cloud_setting_id.isEmpty()) continue;
+            std::vector<String> ids;
+            ids.push_back(local.cloud_setting_id);
+            if (local.cloud_variant_ids_json.length()) {
+                JsonDocument d;
+                if (!deserializeJson(d, local.cloud_variant_ids_json)) {
+                    for (JsonVariantConst v : d.as<JsonArrayConst>()) {
+                        const char* s = v | "";
+                        if (*s) ids.push_back(String(s));
+                    }
+                }
+            }
+            bool anyAlive = false;
+            for (auto& id : ids) {
+                if (cloudIdSet.count(id)) { anyAlive = true; break; }
+            }
+            if (!anyAlive) {
+                if (g_user_filaments.remove(local.setting_id)) {
+                    ++removed;
+                    dlog("CloudSync", "removed orphaned local %s (%s) — gone from cloud",
+                         local.setting_id.c_str(), local.name.c_str());
+                }
+            }
+        }
     }
-    dlog("CloudSync", "reconcile: added=%d updated=%d failed=%d",
-         added, updated, failed);
+    dlog("CloudSync", "reconcile: added=%d updated=%d removed=%d failed=%d",
+         added, updated, removed, failed);
 
     if (xSemaphoreTake(s_cloudSyncMtx, pdMS_TO_TICKS(100)) == pdTRUE) {
         s_cloudSync.phase         = CloudSyncState::Phase::Done;
@@ -2058,10 +2282,11 @@ static void _cloudSyncTask(void* /*arg*/) {
         s_cloudSync.result_status = _cloudResultStr(r);
         s_cloudSync.added         = added;
         s_cloudSync.updated       = updated;
+        s_cloudSync.removed       = removed;
         s_cloudSync.diag          = diag;
         xSemaphoreGive(s_cloudSyncMtx);
     }
-    dlog("CloudSync", "task done added=%d updated=%d", added, updated);
+    dlog("CloudSync", "task done added=%d updated=%d removed=%d", added, updated, removed);
     vTaskDelete(nullptr);
 }
 
@@ -2127,6 +2352,7 @@ void ConsoleWebServer::_handleUserFilamentsCloudSyncStatus(AsyncWebServerRequest
             resp["status"]  = s_cloudSync.result_status;
             resp["added"]   = s_cloudSync.added;
             resp["updated"] = s_cloudSync.updated;
+            resp["removed"] = s_cloudSync.removed;
             if (s_cloudSync.result_status != "ok") {
                 JsonObject d = resp["diagnostics"].to<JsonObject>();
                 d["stage"]         = s_cloudSync.diag.stage;
@@ -2171,10 +2397,27 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
     BambuCloudFilaments::Diag diag;
     JsonDocument resp;
 
-    if (rec.cloud_setting_id.length()) {
+    // Each variant on this filament is its own cloud preset (Bambu's
+    // catalog stores per-(printer,nozzle) presets). On update we have to
+    // delete every sibling, not just the anchor — the create cycle
+    // emits one new preset per variant.
+    std::vector<String> oldIds;
+    if (rec.cloud_variant_ids_json.length()) {
+        JsonDocument idDoc;
+        if (!deserializeJson(idDoc, rec.cloud_variant_ids_json)) {
+            for (JsonVariantConst v : idDoc.as<JsonArrayConst>()) {
+                const char* s = v | "";
+                if (*s) oldIds.push_back(String(s));
+            }
+        }
+    }
+    if (oldIds.empty() && rec.cloud_setting_id.length()) {
+        oldIds.push_back(rec.cloud_setting_id);
+    }
+    for (const auto& cid : oldIds) {
         auto dr = BambuCloudFilaments::deleteOne(g_bambu_cloud.token(),
                                                   g_bambu_cloud.region(),
-                                                  rec.cloud_setting_id, &diag);
+                                                  cid, &diag);
         if (dr != BambuCloudFilaments::Result::Ok) {
             resp["status"] = _cloudResultStr(dr);
             JsonObject d = resp["diagnostics"].to<JsonObject>();
@@ -2187,12 +2430,12 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
             req->send(200, "application/json", out);
             return;
         }
-        // Optimistically clear locally — even if the upcoming create
-        // fails, the cloud-side preset is gone so we mustn't try to
-        // delete it again next time.
-        rec.cloud_setting_id = "";
-        g_user_filaments.upsert(rec);
     }
+    // Cloud-side ids are gone — optimistically clear before the create
+    // cycle so we don't try to delete dead ids on a retry.
+    rec.cloud_setting_id        = "";
+    rec.cloud_variant_ids_json  = "";
+    g_user_filaments.upsert(rec);
 
     String newCloudId;
     auto cr = BambuCloudFilaments::createOne(g_bambu_cloud.token(),
@@ -2208,6 +2451,9 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
         d["response_body"] = diag.body;
     } else {
         rec.cloud_setting_id = newCloudId;
+        // createOne stashes the JSON-array of sibling cloud ids in
+        // diag.body on success so we can persist the full set.
+        rec.cloud_variant_ids_json = diag.body;
         rec.cloud_synced_at  = (uint32_t)time(nullptr);
         g_user_filaments.upsert(rec);
         resp["cloud_setting_id"] = newCloudId;
@@ -2735,6 +2981,17 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
         JsonObject unit = ams.add<JsonObject>();
         unit["id"]       = s.ams[u].id;
         unit["humidity"] = s.ams[u].humidity;
+        if (s.ams[u].humidity_raw >= 0)  unit["humidity_raw"] = s.ams[u].humidity_raw;
+        if (s.ams[u].temp_c > -100.f)    unit["temp_c"]       = s.ams[u].temp_c;
+        // Drying block only when the AMS is actually running a dry cycle.
+        // duration_h == -1 means inactive; the printer also reports
+        // temperature == -1 in that case.
+        if (s.ams[u].dry_duration_h > 0 || s.ams[u].dry_temperature_c > 0) {
+            JsonObject dry = unit["drying"].to<JsonObject>();
+            if (s.ams[u].dry_duration_h    > 0) dry["duration_h"]    = s.ams[u].dry_duration_h;
+            if (s.ams[u].dry_temperature_c > 0) dry["temperature_c"] = s.ams[u].dry_temperature_c;
+            if (s.ams[u].dry_filament.length()) dry["filament"]      = s.ams[u].dry_filament;
+        }
         JsonArray trays = unit["trays"].to<JsonArray>();
         for (int t = 0; t < 4; ++t) {
             const AmsTray& tr = s.ams[u].trays[t];
@@ -2962,6 +3219,89 @@ void ConsoleWebServer::_handlePrinterAmsMappingPost(AsyncWebServerRequest* req,
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
+// Adopt the AMS-reported filament info onto the SpoolRecord currently
+// mapped to a given slot. The flow assumes the user has already set up
+// the filament on the printer's panel (or a Bambu RFID tag pre-loaded
+// it) and wants the local spool entry to match. Only fields that differ
+// from the current record get touched, so the response can tell the UI
+// exactly what changed.
+//
+// Body: {"ams_unit": <0..3 | 254 for vt_tray>, "slot_id": <0..3 | 0 for vt_tray>}
+// Response on success: {"ok": true, "spool_id": "...", "imported": ["...", ...]}
+//                      "imported": [] means the record was already in sync.
+void ConsoleWebServer::_handlePrinterImportAmsSpool(AsyncWebServerRequest* req,
+                                                    uint8_t* data, size_t len) {
+    String serial = req->pathArg(0);
+    BambuPrinter* p = g_bambu.find(serial);
+    if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, data, len)) {
+        req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+        return;
+    }
+    if (!doc["ams_unit"].is<int>() || !doc["slot_id"].is<int>()) {
+        req->send(400, "application/json", "{\"error\":\"ams_unit and slot_id (int) required\"}");
+        return;
+    }
+    int ams_unit = doc["ams_unit"];
+    int slot_id  = doc["slot_id"];
+
+    const PrinterState& s = p->state();
+    const AmsTray* tr = nullptr;
+    if (ams_unit == 254) {
+        if (!s.has_vt_tray) {
+            req->send(404, "application/json", "{\"error\":\"external tray not present\"}");
+            return;
+        }
+        tr = &s.vt_tray;
+    } else if (ams_unit >= 0 && ams_unit < 4 && slot_id >= 0 && slot_id < 4 &&
+               ams_unit < s.ams_count) {
+        tr = &s.ams[ams_unit].trays[slot_id];
+        if (tr->id < 0) {
+            req->send(404, "application/json", "{\"error\":\"slot empty\"}");
+            return;
+        }
+    } else {
+        req->send(400, "application/json", "{\"error\":\"invalid ams_unit / slot_id\"}");
+        return;
+    }
+
+    if (tr->mapped_spool_id.isEmpty()) {
+        req->send(409, "application/json",
+                  "{\"error\":\"no spool mapped to this slot — assign one first\"}");
+        return;
+    }
+    if (!_store) {
+        req->send(503, "application/json", "{\"error\":\"spool store unavailable\"}");
+        return;
+    }
+
+    SpoolRecord rec;
+    if (!_store->findById(tr->mapped_spool_id, rec)) {
+        req->send(404, "application/json", "{\"error\":\"mapped spool not found in store\"}");
+        return;
+    }
+
+    std::vector<String> changed = applyAmsTrayToSpool(*tr, rec);
+
+    JsonDocument resp;
+    resp["ok"]       = true;
+    resp["spool_id"] = rec.id;
+    JsonArray imported = resp["imported"].to<JsonArray>();
+    for (const auto& f : changed) imported.add(f);
+
+    if (changed.empty()) {
+        resp["unchanged"] = true;
+    } else if (!_store->upsert(rec)) {
+        req->send(500, "application/json", "{\"error\":\"spool upsert failed\"}");
+        return;
+    }
+
+    String out; serializeJson(resp, out);
+    req->send(200, "application/json", out);
+}
+
 void ConsoleWebServer::_handlePrinterFtpDebug(AsyncWebServerRequest* req,
                                               uint8_t* data, size_t len) {
     String serial = req->pathArg(0);
@@ -3150,7 +3490,14 @@ void ConsoleWebServer::_handleScaleSecretPost(AsyncWebServerRequest* req, uint8_
     ScaleSecrets::set(name, secret);
     // Ping the link state so the UI's handshake indicator updates immediately
     // without waiting for a reconnect event.
-    if (_scale) _scale->pokeHandshake();
+    if (_scale) {
+        _scale->pokeHandshake();
+        // Force a fresh WS handshake — the open socket (if any) was
+        // authenticated under the old secret. The scale's
+        // wsAuthHandshake will reject the next upgrade if we don't
+        // include the freshly-stored key.
+        _scale->forceReconnect();
+    }
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -3422,6 +3769,20 @@ static void serializeScaleLink(JsonObject doc, ScaleLink* sc) {
         w["grams"]  = 0;
         w["state"]  = "";
         w["ago_ms"] = -1;
+    }
+
+    // Scale-side telemetry from the periodic Heartbeat message. 0
+    // values until the first heartbeat lands. heartbeat_ago_ms lets
+    // the dashboard fade the panel if heartbeats stop arriving.
+    JsonObject t = doc["telemetry"].to<JsonObject>();
+    t["uptime_s"]      = sc->scaleUptimeS();
+    t["free_heap"]     = sc->scaleFreeHeap();
+    t["min_free_heap"] = sc->scaleMinFreeHeap();
+    t["fw_version"]    = sc->scaleFirmwareVersion();
+    if (sc->scaleHeartbeatRxMs() > 0) {
+        t["heartbeat_ago_ms"] = (int)(millis() - sc->scaleHeartbeatRxMs());
+    } else {
+        t["heartbeat_ago_ms"] = -1;
     }
 }
 

@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 export function useSaveWifi() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (body: { ssid: string; pass: string }) =>
+    mutationFn: (body: { ssid: string; pass: string; pinned_bssid?: string }) =>
       fetch('/captive/api/wifi-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

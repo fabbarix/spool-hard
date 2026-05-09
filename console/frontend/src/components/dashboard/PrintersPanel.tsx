@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import { Pin, Gauge, ExternalLink, Sparkles, Loader2 } from 'lucide-react';
+import { useId, useMemo, useState } from 'react';
+import { Pin, Gauge, ExternalLink, Sparkles, Loader2, Thermometer, Wind } from 'lucide-react';
 import { Card } from '@spoolhard/ui/components/Card';
 import { Button } from '@spoolhard/ui/components/Button';
 import { StatusDot } from '@spoolhard/ui/components/StatusDot';
@@ -8,6 +8,7 @@ import {
   usePrinterAnalysis,
   useStartPrinterAnalysis,
   type AmsTray,
+  type AmsUnit,
   type GcodeAnalysis,
   type Printer,
 } from '../../hooks/usePrinters';
@@ -97,30 +98,29 @@ function PrinterRow({ p, spoolById }: { p: Printer; spoolById: Map<string, Spool
             </div>
           )}
           {hasAnyTray && (
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-1">
-              {s.ams?.flatMap((u) =>
-                u.trays.map((t) => (
-                  <AmsSlotCard
-                    key={`${u.id}-${t.id}`}
-                    t={t}
-                    active={s.active_tray === t.id}
-                    serial={p.serial}
-                    amsUnit={u.id}
-                    spool={t.spool_id ? spoolById.get(t.spool_id) : undefined}
-                    label={`AMS ${u.id + 1}·${t.id + 1}`}
-                  />
-                ))
-              )}
-              {s.vt_tray && (
-                <AmsSlotCard
-                  t={s.vt_tray}
-                  active={s.active_tray === s.vt_tray.id}
+            <div className="space-y-2 mt-1">
+              {s.ams?.map((u) => (
+                <AmsUnitBlock
+                  key={u.id}
+                  u={u}
+                  unitNumber={u.id + 1}
+                  activeTray={s.active_tray}
                   serial={p.serial}
-                  amsUnit={254}
-                  spool={s.vt_tray.spool_id ? spoolById.get(s.vt_tray.spool_id) : undefined}
-                  label="External"
-                  external
+                  spoolById={spoolById}
                 />
+              ))}
+              {s.vt_tray && (
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                  <AmsSlotCard
+                    t={s.vt_tray}
+                    active={s.active_tray === s.vt_tray.id}
+                    serial={p.serial}
+                    amsUnit={254}
+                    spool={s.vt_tray.spool_id ? spoolById.get(s.vt_tray.spool_id) : undefined}
+                    label="External"
+                    external
+                  />
+                </div>
               )}
             </div>
           )}
@@ -130,6 +130,124 @@ function PrinterRow({ p, spoolById }: { p: Printer; spoolById: Map<string, Spool
         <div className="text-xs text-text-muted">{s.error ?? s.link}</div>
       )}
     </div>
+  );
+}
+
+function AmsUnitBlock({ u, unitNumber, activeTray, serial, spoolById }: {
+  u: AmsUnit;
+  unitNumber: number;
+  activeTray: number | undefined;
+  serial: string;
+  spoolById: Map<string, SpoolRecord>;
+}) {
+  return (
+    <div>
+      <AmsUnitHeader u={u} unitNumber={unitNumber} />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        {u.trays.map((t) => (
+          <AmsSlotCard
+            key={t.id}
+            t={t}
+            active={activeTray === t.id}
+            serial={serial}
+            amsUnit={u.id}
+            spool={t.spool_id ? spoolById.get(t.spool_id) : undefined}
+            label={`AMS ${unitNumber}·${t.id + 1}`}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Per-unit status strip: temperature + humidity (raw % when reported, else
+// the 1..5 scaled drop) + drying chip when a dry cycle is active. Sits
+// above the row of slot cards so the AMS block reads as one unit.
+function AmsUnitHeader({ u, unitNumber }: { u: AmsUnit; unitNumber: number }) {
+  const hasTemp = typeof u.temp_c === 'number' && u.temp_c > -100;
+  const hasRawHum = typeof u.humidity_raw === 'number' && u.humidity_raw >= 0;
+  const hasScaledHum = typeof u.humidity === 'number' && u.humidity >= 1 && u.humidity <= 5;
+  if (!hasTemp && !hasRawHum && !hasScaledHum && !u.drying) return null;
+  return (
+    <div className="flex items-center flex-wrap gap-x-3 gap-y-1 text-xs text-text-muted mb-1.5 px-0.5">
+      <span className="text-[10px] uppercase tracking-wider font-medium text-text-primary">
+        AMS {unitNumber}
+      </span>
+      {hasTemp && (
+        <span className="inline-flex items-center gap-1 font-mono tabular-nums" title="AMS chamber temperature">
+          <Thermometer size={11} />
+          {u.temp_c!.toFixed(1)}°C
+        </span>
+      )}
+      {hasRawHum && (
+        <span className="inline-flex items-center gap-1 font-mono tabular-nums" title={`Relative humidity (raw)${hasScaledHum ? ` · scale ${u.humidity}/5` : ''}`}>
+          <HumidityDrop level={hasScaledHum ? u.humidity : 3} />
+          {u.humidity_raw}% RH
+        </span>
+      )}
+      {!hasRawHum && hasScaledHum && (
+        <span className="inline-flex items-center gap-1 font-mono tabular-nums" title={`Humidity ${u.humidity}/5 (5=driest, 1=wettest)`}>
+          <HumidityDrop level={u.humidity} />
+          {u.humidity}/5
+        </span>
+      )}
+      {u.drying && <DryingChip d={u.drying} />}
+    </div>
+  );
+}
+
+// Tear-drop SVG with a level-indexed fill. Bambu's `humidity` is 1..5 with
+// **5 = driest, 1 = wettest** — matches the printer's own dot indicator.
+// We mirror that meaning: level 5 → empty outline (green = good), level 1
+// → fully filled (yellow = warning), intermediates interpolate hue along
+// the green→yellow arc. The clipPath ID is unique per render so multiple
+// AMS units on one page can't collide.
+function HumidityDrop({ level }: { level: number }) {
+  const id = useId();
+  const safe = Math.max(1, Math.min(5, level));
+  const fillFrac = (5 - safe) / 4;             // 0 at level 5 (dry), 1.0 at level 1 (wet)
+  // viewBox 0..24; the drop occupies roughly y=2.5 (apex) to y=21.5 (base).
+  const dropTop = 2.5;
+  const dropBottom = 21.5;
+  const dropHeight = dropBottom - dropTop;
+  const fillY = dropBottom - dropHeight * fillFrac;
+  const hue = 120 - fillFrac * 60;              // 120° green → 60° yellow
+  const color = `hsl(${hue} 75% 50%)`;
+  const path = 'M12 2.5c0 2.5 1.5 4.9 3.5 6.5C17 10.5 18 12.4 18 14.5a6 6 0 1 1-12 0c0-2.1 1-4 2.5-5.5C10.5 7.4 12 5 12 2.5z';
+  const clipId = `drop-${id}`;
+  return (
+    <svg width="13" height="14" viewBox="0 0 24 24" aria-hidden>
+      <defs>
+        <clipPath id={clipId}><path d={path} /></clipPath>
+      </defs>
+      {fillFrac > 0 && (
+        <rect
+          x="0"
+          y={fillY}
+          width="24"
+          height={dropHeight * fillFrac}
+          fill={color}
+          clipPath={`url(#${clipId})`}
+        />
+      )}
+      <path d={path} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function DryingChip({ d }: { d: NonNullable<AmsUnit['drying']> }) {
+  const parts: string[] = [];
+  if (d.filament)                       parts.push(d.filament);
+  if (typeof d.temperature_c === 'number') parts.push(`${d.temperature_c}°C`);
+  if (typeof d.duration_h === 'number')    parts.push(`${d.duration_h}h`);
+  return (
+    <span
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[10px] font-mono uppercase tracking-wide"
+      title="AMS drying cycle in progress"
+    >
+      <Wind size={10} />
+      Drying{parts.length ? ` · ${parts.join(' · ')}` : ''}
+    </span>
   );
 }
 

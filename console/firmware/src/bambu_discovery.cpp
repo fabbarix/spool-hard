@@ -1,7 +1,7 @@
 #include "bambu_discovery.h"
 #include "config.h"
 #include "ssdp_hub.h"
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 BambuDiscovery g_bambu_discovery;
 

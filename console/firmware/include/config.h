@@ -76,6 +76,9 @@
 #define NVS_KEY_DEVICE_NAME  "device_name"
 #define NVS_KEY_FIXED_KEY    "fixed_key"
 #define DEFAULT_FIXED_KEY    "Change-Me!"
+// Optional mesh-AP pin: "AA:BB:CC:DD:EE:FF" or "" for auto-select.
+// See wifi_provisioning.cpp for the connect-and-fallback semantics.
+#define NVS_KEY_PINNED_BSSID "pinned_bssid"
 
 // OTA persistence (namespace + keys) is owned by spoolhard_core/src/ota.cpp
 // — see the local-namespace constants there. Both products use the same
@@ -183,8 +186,19 @@
 #define BAMBU_SSDP_URN_TAG   "bambulab"        // substring match on NT
 
 // ── Scale WebSocket endpoint (scale is server, console is client) ──
-#define SCALE_WS_PORT        81
-#define SCALE_WS_PATH        "/ws"
+//
+// As of scale firmware 0.8.x, the console-link WebSocket lives on the
+// SAME port as the dashboard (mounted at /ws/console). The separate
+// port-81 server was retired so both ports' AsyncTCP load funnels
+// through one server instance — fewer client lists to keep coherent,
+// less DRAM for socket buffers, one place to reason about handshake +
+// keepalive. Older scale builds (0.7.x and below) still listen on 81;
+// keep SCALE_WS_PORT_LEGACY around so the link can fall back if the
+// primary path returns 401 / refuses connect.
+#define SCALE_WS_PORT          80
+#define SCALE_WS_PATH         "/ws/console"
+#define SCALE_WS_PORT_LEGACY   81
+#define SCALE_WS_PATH_LEGACY  "/ws"
 
 // ── Bambu MQTT (M2) ─────────────────────────────────────────
 #define BAMBU_MQTT_PORT      8883

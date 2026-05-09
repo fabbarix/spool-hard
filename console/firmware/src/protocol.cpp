@@ -1,6 +1,6 @@
 #include "protocol.h"
 #include <deque>
-#include "serial_mirror.h"
+#include "spoolhard/serial_mirror.h"
 
 // ── Scale → Console parse ────────────────────────────────────
 
@@ -26,6 +26,7 @@ static Type nameToType(const char* name) {
     if (strcmp(name, "Term")                == 0) return Type::Term;
     if (strcmp(name, "CurrentWeight")       == 0) return Type::CurrentWeight;
     if (strcmp(name, "CalibrationStatus")   == 0) return Type::CalibrationStatus;
+    if (strcmp(name, "Heartbeat")           == 0) return Type::Heartbeat;
     return Type::Unknown;
 }
 
@@ -45,6 +46,7 @@ const char* typeToString(Type t) {
         case Type::Term:                return "Term";
         case Type::CurrentWeight:       return "CurrentWeight";
         case Type::CalibrationStatus:   return "CalibrationStatus";
+        case Type::Heartbeat:           return "Heartbeat";
         default:                        return "Unknown";
     }
 }

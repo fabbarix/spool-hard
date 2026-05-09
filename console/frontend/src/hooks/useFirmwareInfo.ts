@@ -13,6 +13,15 @@ export interface FirmwareInfo {
   sd_mounted: boolean;
   sd_total: number;
   sd_used: number;
+  // Lifetime low-water-marks. Strictly monotonic — a declining trend
+  // over time = real leak (vs. allocation churn that makes free_heap
+  // swing 15 K every few seconds).
+  min_free_heap?:    number;
+  min_free_psram?:   number;
+  max_alloc_heap?:   number;
+  max_alloc_psram?:  number;
+  // Seconds since boot. Resets on reboot, OTA, or panic.
+  uptime_s?: number;
 }
 
 export function useFirmwareInfo() {
