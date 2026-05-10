@@ -1120,19 +1120,36 @@ static String _ftpListName(const String& raw) {
 
 // List `dir` and return the most plausible *.3mf match for `hint` — the
 // MQTT subtask_name when we have one. Matching is fuzzy: we lowercase
-// both sides and treat spaces/underscores/dashes as the same character,
-// because Bambu sometimes sanitizes one but not the other when writing
-// the file vs. populating subtask_name (ha-bambulab #1520, and the
-// "filename has parens but the on-disk copy doesn't" case the user
-// just hit). When nothing matches the hint, return the last *.3mf in
-// the listing — Bambu's `LIST` sorts oldest first, so the active job
-// tends to sit at the bottom. Returns "" if the listing has no .3mf
-// entries or if the LIST command itself fails.
+// both sides, treat spaces/underscores/dashes/parens as the same
+// character, AND substitute Bambu's filename encoding for filename-
+// illegal chars in the hint ("/" → "2f", etc.). The encoding step is
+// load-bearing: subtask_name comes from MQTT in raw printable form,
+// while the on-disk filename in /cache replaces FAT-illegal chars with
+// their two-hex-digit equivalent (no leading "%"). Without it, a
+// subtask like "Standard / Large (...)" never matches the on-disk
+// "Standard 2f Large (...).gcode.3mf" and the caller silently falls
+// back to a wrong file. (The fallback used to pick the listing's last
+// *.3mf — that was alphabetic, not chronological, and routinely picked
+// a stale, unrelated job. We now refuse to guess when ambiguous.)
 static String _normalizeForMatch(const String& s) {
-    String out; out.reserve(s.length());
+    String out; out.reserve(s.length() + 8);
     for (size_t i = 0; i < s.length(); ++i) {
         char c = s[i];
         if (c >= 'A' && c <= 'Z') c += 32;
+        // Bambu encodes FAT-illegal chars as their lowercase hex pair
+        // (no "%" prefix) when committing to /cache. Mirror that on
+        // the hint side so `indexOf` hits.
+        switch (c) {
+            case '/':  out += "2f"; continue;
+            case '\\': out += "5c"; continue;
+            case ':':  out += "3a"; continue;
+            case '*':  out += "2a"; continue;
+            case '?':  out += "3f"; continue;
+            case '"':  out += "22"; continue;
+            case '<':  out += "3c"; continue;
+            case '>':  out += "3e"; continue;
+            case '|':  out += "7c"; continue;
+        }
         if (c == ' ' || c == '_' || c == '-' || c == '(' || c == ')') c = '_';
         out += c;
     }
@@ -1145,7 +1162,8 @@ static String _bestThreeMfIn(PrinterFtp& ftp, const String& dir, const String& h
         return "";
     }
     dlog("ftp", "listDir(%s) returned %u entries", dir.c_str(), (unsigned)lines.size());
-    String last3mf;
+    String soleThreeMf;       // only meaningful when threeMfCount == 1
+    int    threeMfCount = 0;
     String best;
     String hintLower = _normalizeForMatch(hint);
     if (hintLower.endsWith(".3mf")) hintLower = hintLower.substring(0, hintLower.length() - 4);
@@ -1154,7 +1172,8 @@ static String _bestThreeMfIn(PrinterFtp& ftp, const String& dir, const String& h
         if (name.length() < 5) continue;
         String lower = name; lower.toLowerCase();
         if (!lower.endsWith(".3mf")) continue;
-        last3mf = name;
+        ++threeMfCount;
+        if (threeMfCount == 1) soleThreeMf = name;
         if (hintLower.length()) {
             String norm = _normalizeForMatch(name);
             if (norm.endsWith(".3mf")) norm = norm.substring(0, norm.length() - 4);
@@ -1165,10 +1184,17 @@ static String _bestThreeMfIn(PrinterFtp& ftp, const String& dir, const String& h
             }
         }
     }
-    if (!best.length() && last3mf.length()) {
-        dlog("ftp", "no fuzzy match for '%s' — using last *.3mf '%s'",
-             hint.c_str(), last3mf.c_str());
-        best = last3mf;
+    // Fallback: with exactly one *.3mf in the listing, no ambiguity is
+    // possible — use it. With multiple, refuse to guess: silently
+    // picking the alphabetically-last entry routinely billed unrelated
+    // prior prints to whichever spool the slicer's filament_id matched.
+    if (!best.length() && threeMfCount == 1) {
+        dlog("ftp", "no fuzzy match for '%s' — only one *.3mf in %s, using '%s'",
+             hint.c_str(), dir.c_str(), soleThreeMf.c_str());
+        best = soleThreeMf;
+    } else if (!best.length() && threeMfCount > 1) {
+        dlog("ftp", "no fuzzy match for '%s' in %s (%d *.3mf candidates) — refusing to guess",
+             hint.c_str(), dir.c_str(), threeMfCount);
     }
     if (!best.length()) return "";
     return dir.endsWith("/") ? (dir + best) : (dir + "/" + best);
@@ -1246,7 +1272,31 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
         total = ftp.size(path);
     } else {
         std::vector<String> candidates;
-        auto addCandidates = [&candidates](const String& nameRaw) {
+        // Encode the FAT-illegal chars Bambu rewrites on disk (e.g. "/"
+        // → "2f") so subtask_name "Standard / Large (...)" lines up with
+        // the on-disk filename "Standard 2f Large (...).gcode.3mf". Names
+        // without any illegal chars are unchanged. Mirrors the encoding
+        // table in _normalizeForMatch.
+        auto encodeFilename = [](const String& in) -> String {
+            String out; out.reserve(in.length() + 8);
+            for (size_t i = 0; i < in.length(); ++i) {
+                char c = in[i];
+                switch (c) {
+                    case '/':  out += "2f"; continue;
+                    case '\\': out += "5c"; continue;
+                    case ':':  out += "3a"; continue;
+                    case '*':  out += "2a"; continue;
+                    case '?':  out += "3f"; continue;
+                    case '"':  out += "22"; continue;
+                    case '<':  out += "3c"; continue;
+                    case '>':  out += "3e"; continue;
+                    case '|':  out += "7c"; continue;
+                }
+                out += c;
+            }
+            return out;
+        };
+        auto addCandidates = [&candidates, &encodeFilename](const String& nameRaw) {
             if (!nameRaw.length()) return;
             String name = nameRaw;
             // gcode_file is a ramdisk path on X1 LAN prints — not FTP-
@@ -1258,30 +1308,41 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
                 int slash = name.lastIndexOf('/');
                 name = name.substring(slash + 1);
             }
+            // Bambu's filename encoding for FAT-illegal chars. If the
+            // basename has none, encoded == name (no extra probes).
+            String encoded = encodeFilename(name);
             // Two suffix conventions and two search dirs (/cache then /).
             // ha-bambulab finds the LAN-print variant lives under /cache
             // with the ".gcode.3mf" suffix, while cloud/MakerWorld uses
             // ".3mf" only. Try the no-suffix variant when the field
             // already ends in ".3mf" so we don't accidentally double it.
             const char* dirs[] = {"/cache/", "/"};
+            // Push (raw, encoded) variants per dir. When name has no
+            // illegal chars they're identical and the SIZE probe just
+            // hits cache twice; cheap relative to the listing fallback.
+            String variants[2] = { name, encoded };
+            int variant_count = (encoded == name) ? 1 : 2;
             for (const char* dir : dirs) {
-                if (name.endsWith(".3mf")) {
-                    candidates.push_back(String(dir) + name);
-                } else if (name.endsWith(".gcode")) {
-                    // Already a raw-gcode filename — try as-is.
-                    candidates.push_back(String(dir) + name);
-                } else {
-                    // Some H2D firmwares store the active job as a raw
-                    // .gcode (no 3MF wrapper) — `<name>_plate_<N>.gcode`
-                    // under /cache. Try those first since they're far
-                    // more common in practice on this firmware than
-                    // the .3mf variants. Also keep the .3mf candidates
-                    // for cloud/MakerWorld jobs.
-                    candidates.push_back(String(dir) + name + "_plate_1.gcode");
-                    candidates.push_back(String(dir) + name + "_plate_2.gcode");
-                    candidates.push_back(String(dir) + name + ".gcode");
-                    candidates.push_back(String(dir) + name + ".3mf");
-                    candidates.push_back(String(dir) + name + ".gcode.3mf");
+                for (int v = 0; v < variant_count; ++v) {
+                    const String& nm = variants[v];
+                    if (nm.endsWith(".3mf")) {
+                        candidates.push_back(String(dir) + nm);
+                    } else if (nm.endsWith(".gcode")) {
+                        // Already a raw-gcode filename — try as-is.
+                        candidates.push_back(String(dir) + nm);
+                    } else {
+                        // Some H2D firmwares store the active job as a raw
+                        // .gcode (no 3MF wrapper) — `<name>_plate_<N>.gcode`
+                        // under /cache. Try those first since they're far
+                        // more common in practice on this firmware than
+                        // the .3mf variants. Also keep the .3mf candidates
+                        // for cloud/MakerWorld jobs.
+                        candidates.push_back(String(dir) + nm + "_plate_1.gcode");
+                        candidates.push_back(String(dir) + nm + "_plate_2.gcode");
+                        candidates.push_back(String(dir) + nm + ".gcode");
+                        candidates.push_back(String(dir) + nm + ".3mf");
+                        candidates.push_back(String(dir) + nm + ".gcode.3mf");
+                    }
                 }
             }
         };
@@ -1687,12 +1748,38 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
 
     analyzer.finalise();
 
+    // Single-tool prints: only one slicer tool has mm > 0, so the printer's
+    // `tray_now` (i.e. _state.active_tray) is constant for the entire job and
+    // is the ground truth — the user may have manually rerouted to a different
+    // AMS slot at print start regardless of what the slicer mapping says.
+    // For multi-tool prints active_tray switches mid-print, so we keep the
+    // slicer-derived per-tool mapping for those.
+    int tools_with_grams = 0;
+    for (int i = 0; i < GCodeAnalyzer::MAX_TOOLS; ++i) {
+        if (analyzer.tool(i).mm > 0.f) ++tools_with_grams;
+    }
+    const bool single_tool_print = (tools_with_grams == 1);
+
     // Helper: resolve a slicer tool-idx → physical AMS tray index.
     //   * Returns 0..15 for an AMS slot, 254 for vt_tray, -1 for unknown.
-    //   * Priority: .bbl `ams mapping` (canonical) → gcode header
-    //     filament_ids match → header filament_colour match →
-    //     _state.active_tray (single-tool fallback).
+    //   * Priority for single-tool prints: _state.active_tray → slicer-
+    //     derived steps as fallback.
+    //   * Priority for multi-tool prints: .bbl `ams mapping` (canonical) →
+    //     gcode header filament_ids match → header filament_colour match →
+    //     _state.active_tray (last-resort fallback).
     auto resolveTray = [&](int tool_idx) -> int {
+        // 0. Single-tool print: trust the printer's currently-feeding slot.
+        // Two AMS slots can share the same tray_info_idx (e.g. two spools of
+        // the same Bambu PLA), in which case step 2 below would deterministically
+        // pick the lower-numbered slot even if the user is feeding from a
+        // different one — that's exactly the bug this branch prevents.
+        if (single_tool_print) {
+            if (_state.active_tray >= 0 && _state.active_tray < 16) {
+                return _state.active_tray;
+            }
+            if (_state.active_tray == 254 && _state.has_vt_tray) return 254;
+            // active_tray unknown — fall through to slicer-derived steps.
+        }
         // 1. .bbl mapping
         if (tool_idx < (int)bblAmsMapping.size()) {
             int v = bblAmsMapping[tool_idx];
@@ -2131,6 +2218,19 @@ void BambuPrinter::_handleGcodeStateTransition(const String& prev, const String&
         _progressCommittedPct = 0;
         _analysisNextRetryAt  = 0;
         _analysisAttempts     = 0;
+        // Invalidate the previous job's analysis. Without this, a
+        // re-analysis that fails (e.g. path resolution couldn't find
+        // the new job's 3mf) leaves _lastAnalysis pointing at the
+        // PRIOR print's grams + tray mapping — every incremental and
+        // terminal commit then bills the wrong spool with the wrong
+        // mass. _runRemoteAnalysis itself resets the struct on entry,
+        // but only if it's actually invoked; we want stale data gone
+        // even if the spawn or path-resolve never reaches that point.
+        // _analysisInProgress check below ensures we don't yank the
+        // struct out from under an analysis that's mid-write.
+        if (!_analysisInProgress) {
+            _lastAnalysis = GcodeAnalysis{};
+        }
         if (_cfg.track_print_consume && !_analysisInProgress) {
             Serial.printf("[Bambu %s] print started — queuing background analysis\n",
                           _cfg.serial.c_str());
