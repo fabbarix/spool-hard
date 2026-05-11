@@ -126,6 +126,33 @@ bool spawnPSRAMFallbackTask(TaskFunction_t fn, void* arg, const char* name,
 // PsramJsonAllocator moved to psram_json_alloc.{h,cpp} so the WS
 // broadcast path on the web_server side can share the same instance.
 
+void GcodeAnalysis::reset() {
+    valid          = false;
+    started_ms     = 0;
+    finished_ms    = 0;
+    path           = String();
+    error          = String();
+    total_grams    = 0.f;
+    total_mm       = 0.f;
+    tool_count     = 0;
+    for (auto& t : tools) {
+        t.tool_idx = -1;
+        t.grams    = 0.f;
+        t.mm       = 0.f;
+        t.ams_unit = -1;
+        t.slot_id  = -1;
+        t.spool_id = String();
+        t.material = String();
+        t.color    = String();
+    }
+    has_pct_table  = false;
+    memset(grams_at_pct, 0, sizeof(grams_at_pct));
+    progress_bytes       = 0;
+    progress_total_bytes = 0;
+    running_grams        = 0.f;
+    running_mm           = 0.f;
+}
+
 namespace {
 // Fallback nozzle temps per material. Used when a SpoolRecord has no
 // user-entered nozzle_temp_min/max — the printer needs non-zero values or it
@@ -1214,8 +1241,10 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
     // The web /analysis endpoint reads _analysisInProgress first, so it
     // sees "still running" for the whole window we're mutating these
     // fields — no torn reads in practice.
+    // reset() zeroes in place so we don't materialise the ~6.5 KiB
+    // GcodeAnalysis temporary on this task's stack.
     GcodeAnalysis& result = _lastAnalysis;
-    result = GcodeAnalysis{};
+    result.reset();
     result.started_ms = millis();
     // Surface the resolved path below; if requestedPath was empty we
     // overwrite this once we know what we're actually fetching.
@@ -2228,8 +2257,12 @@ void BambuPrinter::_handleGcodeStateTransition(const String& prev, const String&
         // even if the spawn or path-resolve never reaches that point.
         // _analysisInProgress check below ensures we don't yank the
         // struct out from under an analysis that's mid-write.
+        // reset() zeroes in place — `*this = GcodeAnalysis{}` would
+        // build a ~6.5 KiB temporary on this stack frame and overflow
+        // the Arduino loopTask (8 KiB) on the first MQTT pushall after
+        // a fresh Bambu connect.
         if (!_analysisInProgress) {
-            _lastAnalysis = GcodeAnalysis{};
+            _lastAnalysis.reset();
         }
         if (_cfg.track_print_consume && !_analysisInProgress) {
             Serial.printf("[Bambu %s] print started — queuing background analysis\n",

@@ -102,6 +102,14 @@ struct GcodeAnalysis {
     volatile uint32_t progress_total_bytes  = 0;
     volatile float    running_grams         = 0.f;
     volatile float    running_mm            = 0.f;
+
+    // In-place reset. `*this = GcodeAnalysis{}` materialises a ~6.5 KiB
+    // temporary on the caller's stack (grams_at_pct alone is 6.4 KiB),
+    // which overflows the Arduino loopTask's 8 KiB stack when the first
+    // MQTT pushall after a fresh Bambu connect drives a gcode_state
+    // transition through _handleGcodeStateTransition — bootlooped the
+    // console as soon as the printer turned on. Zero in place instead.
+    void reset();
 };
 
 struct PrinterState {
