@@ -45,11 +45,12 @@ public:
     //   1. showUpdating()          — OTA / frontend upload in progress
     //   2. transient burst playing — ack* above
     //   3. showNfcActivity()       — tag read/write in flight
-    //   4. showWeightStable()      — stable load on scale
-    //   5. showConsoleConnected()  — console paired, everything green
-    //   6. showWifiOnly()          — on WiFi, console absent
-    //   7. showApMode()            — no credentials, provisioning portal up
-    //   8. showOffline()           — booting, connecting, dropped link
+    //   4. showUncalibrated()      — load cell has no calibration table
+    //   5. showWeightStable()      — stable load on scale
+    //   6. showConsoleConnected()  — console paired, everything green
+    //   7. showWifiOnly()          — on WiFi, console absent
+    //   8. showApMode()            — no credentials, provisioning portal up
+    //   9. showOffline()           — booting, connecting, dropped link
     //
     // Every non-transient state is a single solid colour or a single
     // tempo at a single hue — the user only has to recognise the colour,
@@ -72,6 +73,12 @@ public:
     // ackTagRead() to confirm a successful parse.
     void showNfcActivity()      { solid(0,   40,  120); }        // dark-blue solid
     void showUpdating()         { pulse(200, 90,  0, 2000); }   // amber slow pulse
+    // Magenta 1 Hz flash. Distinct hue (no other state uses purple) and
+    // a slower tempo than AP-mode's 400 ms red flash — reads as "device
+    // configuration missing, operator action required" rather than as a
+    // network fault. Held continuously while no calibration points are
+    // stored in NVS.
+    void showUncalibrated()     { flash(200, 0,   200, 1000); }  // magenta slow flash
 
 private:
     enum class Mode { Off, Solid, Flash, Pulse, Burst };

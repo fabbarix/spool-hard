@@ -58,6 +58,13 @@ public:
     // rounding, sampling etc. all take effect live instead of requiring
     // a device restart.
     void onConfigChanged(std::function<void()> cb) { _onConfigChanged = std::move(cb); }
+    // Fires when the user clicks a "Test" button in the LED legend panel.
+    // `state` is the catalog id (see led_legend in web_server.cpp);
+    // `ms` is the hold duration. main.cpp wires this to its LED test
+    // override which pins the requested pattern over normal arbitration.
+    void onLedTest(std::function<void(const String&, uint32_t)> cb) {
+        _onLedTest = std::move(cb);
+    }
 
 private:
     AsyncWebServer  _server{80};
@@ -106,4 +113,5 @@ private:
     std::function<void()>            _onClearCal;
     std::function<long()>            _onCaptureRaw;
     std::function<void()>            _onConfigChanged;
+    std::function<void(const String&, uint32_t)> _onLedTest;
 };

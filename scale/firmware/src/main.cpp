@@ -413,9 +413,68 @@ static void sendNfcEvent_unused() {
     }
 }
 
+// LED test override. Set by the /api/led-test handler; updateLed() honours
+// it for up to LED_TEST_MS, pinning the requested pattern over every steady
+// state except OTA (which is a real in-flight operation the user can't
+// preempt for a UI demo). Loads on AsyncTCP, drains on loopTask.
+enum class LedTestState : uint8_t {
+    None = 0,
+    Offline, ApMode, WifiOnly, ConsoleConnected,
+    WeightUnstable, WeightStable, NfcActivity,
+    Updating, Uncalibrated,
+    AckTagRead, AckCaptureOk, AckCaptureFail,
+};
+static std::atomic<uint8_t>  g_ledTestState{(uint8_t)LedTestState::None};
+static std::atomic<uint32_t> g_ledTestUntil{0};
+
+// Run a `show*` once per tick for the held duration of the test. Returns
+// true if a test pattern is currently being driven (caller should skip
+// the normal arbitration).
+static bool _drivLedTest() {
+    uint32_t until = g_ledTestUntil.load(std::memory_order_acquire);
+    if (until == 0) return false;
+    if ((int32_t)(millis() - until) >= 0) {
+        // Window expired — clear and let the next tick fall through to
+        // normal arbitration so the LED snaps back without a frame of
+        // off in between.
+        g_ledTestUntil.store(0, std::memory_order_release);
+        g_ledTestState.store((uint8_t)LedTestState::None,
+                             std::memory_order_release);
+        return false;
+    }
+    auto st = (LedTestState)g_ledTestState.load(std::memory_order_acquire);
+    switch (st) {
+        case LedTestState::Offline:          g_led.showOffline();          break;
+        case LedTestState::ApMode:           g_led.showApMode();           break;
+        case LedTestState::WifiOnly:         g_led.showWifiOnly();         break;
+        case LedTestState::ConsoleConnected: g_led.showConsoleConnected(); break;
+        case LedTestState::WeightUnstable:   g_led.showWeightUnstable();   break;
+        case LedTestState::WeightStable:     g_led.showWeightStable();     break;
+        case LedTestState::NfcActivity:      g_led.showNfcActivity();      break;
+        case LedTestState::Updating:         g_led.showUpdating();         break;
+        case LedTestState::Uncalibrated:     g_led.showUncalibrated();     break;
+        // Bursts self-clear after ~330 ms; re-fire whenever the LED has
+        // gone idle so the pattern loops visibly for the whole test
+        // window instead of flashing once and going dark.
+        case LedTestState::AckTagRead:
+            if (!g_led.isBusy()) g_led.ackTagRead();
+            break;
+        case LedTestState::AckCaptureOk:
+            if (!g_led.isBusy()) g_led.ackCaptureOk();
+            break;
+        case LedTestState::AckCaptureFail:
+            if (!g_led.isBusy()) g_led.ackCaptureFail();
+            break;
+        case LedTestState::None:
+        default:
+            return false;
+    }
+    return true;
+}
+
 // LED priority (highest first), see rgb_led.h for the full palette:
-//   updating > burst > NFC activity > stable weight >
-//   console connected > WiFi only > AP mode > offline
+//   updating > test-override > burst > NFC activity > uncalibrated >
+//   weight > console connected > WiFi only > AP mode > offline
 static void updateLed() {
     // OTA flow pins the amber slow pulse; let it run undisturbed.
     if (g_pendingOta.load() || otaTaskInFlight()) return;
@@ -425,6 +484,11 @@ static void updateLed() {
         g_led.showUpdating();
         return;
     }
+    // Test override — placed here so the legend's "Test for 5 s" button
+    // wins over every steady state below but never over an in-flight
+    // OTA / firmware upload.
+    if (_drivLedTest()) return;
+
     // Transient bursts (tag-read ack, capture ok/fail) self-clear — leave
     // them be so the pattern plays through to completion.
     if (g_led.isBusy()) return;
@@ -435,6 +499,16 @@ static void updateLed() {
     if (ts == TagStatus::FoundTagNowReading ||
         ts == TagStatus::FoundTagNowWriting) {
         g_led.showNfcActivity();
+        return;
+    }
+
+    // Uncalibrated takes precedence over the network ladder: a paired,
+    // online scale that can't weigh is useless for its primary job, so
+    // surface it loudly. Sits below NFC/weight (which can only fire when
+    // calibrated anyway) and below transient acks so calibration captures
+    // still flash their burst through.
+    if (!g_scale.isCalibrated()) {
+        g_led.showUncalibrated();
         return;
     }
 
@@ -530,6 +604,32 @@ void setup() {
             ScaleToConsole::send(ScaleToConsole::Type::ScaleVersion, doc);
         }
     });
+    g_web.onLedTest([](const String& id, uint32_t ms) {
+        // Map the catalog id (see /api/led-legend in web_server.cpp) to
+        // the test override enum. Unknown ids are dropped; updateLed()
+        // then keeps the normal arbitration. All `show*` and `ack*`
+        // calls happen from loopTask inside `_drivLedTest` — this
+        // callback only flips two atomics, so g_led itself stays in a
+        // single-writer regime even though the callback runs on
+        // AsyncTCP.
+        LedTestState st = LedTestState::None;
+        if (id == "offline")                st = LedTestState::Offline;
+        else if (id == "ap_mode")           st = LedTestState::ApMode;
+        else if (id == "wifi_only")         st = LedTestState::WifiOnly;
+        else if (id == "console_connected") st = LedTestState::ConsoleConnected;
+        else if (id == "weight_unstable")   st = LedTestState::WeightUnstable;
+        else if (id == "weight_stable")     st = LedTestState::WeightStable;
+        else if (id == "nfc_activity")      st = LedTestState::NfcActivity;
+        else if (id == "updating")          st = LedTestState::Updating;
+        else if (id == "uncalibrated")      st = LedTestState::Uncalibrated;
+        else if (id == "ack_tag_read")      st = LedTestState::AckTagRead;
+        else if (id == "ack_capture_ok")    st = LedTestState::AckCaptureOk;
+        else if (id == "ack_capture_fail")  st = LedTestState::AckCaptureFail;
+        if (st == LedTestState::None) return;
+        g_ledTestState.store((uint8_t)st, std::memory_order_release);
+        g_ledTestUntil.store(millis() + ms, std::memory_order_release);
+    });
+
     g_web.onUploadStarted([](const char* /*type*/) {
         g_led.showUpdating();
         g_uploadActiveUntil.store(millis() + UPLOAD_LIVENESS_MS);

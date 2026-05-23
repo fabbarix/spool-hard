@@ -404,6 +404,71 @@ void ScaleWebServer::_setupRoutes() {
         req->send(200, "application/json", "{\"ok\":true}");
     });
 
+    // ── LED legend / test ────────────────────────────────────
+    // Catalog is the single source of truth for the UI swatches AND for
+    // the trigger validation below. Each entry mirrors a `show*`/`ack*`
+    // method in rgb_led.h, keyed by `id` — main.cpp's LED test override
+    // maps the id back to the right call.
+    _server.on("/api/led-legend", HTTP_GET, [](AsyncWebServerRequest* req) {
+        // No auth — purely informational. The trigger below IS auth-gated.
+        AsyncResponseStream* s = req->beginResponseStream("application/json");
+        s->print(R"json({"states":[)json"
+                 R"json({"id":"updating","label":"Updating","kind":"pulse",)json"
+                 R"json("color":"#c85a00","period_ms":2000,)json"
+                 R"json("desc":"OTA or direct firmware/SPIFFS upload in flight."},)json"
+                 R"json({"id":"nfc_activity","label":"NFC Activity","kind":"solid",)json"
+                 R"json("color":"#002878",)json"
+                 R"json("desc":"Tag read/write in flight — hold the tag steady."},)json"
+                 R"json({"id":"uncalibrated","label":"Uncalibrated","kind":"flash",)json"
+                 R"json("color":"#c800c8","period_ms":1000,)json"
+                 R"json("desc":"No calibration points stored — scale cannot report weight. Run tare + add cal point."},)json"
+                 R"json({"id":"weight_unstable","label":"Weight Settling","kind":"flash",)json"
+                 R"json("color":"#14645a","period_ms":250,)json"
+                 R"json("desc":"Load on platform, reading not yet stable."},)json"
+                 R"json({"id":"weight_stable","label":"Weight Stable","kind":"solid",)json"
+                 R"json("color":"#14645a",)json"
+                 R"json("desc":"Load on platform, reading has stabilised."},)json"
+                 R"json({"id":"console_connected","label":"Console Paired","kind":"solid",)json"
+                 R"json("color":"#007800",)json"
+                 R"json("desc":"Paired with the console over WebSocket."},)json"
+                 R"json({"id":"wifi_only","label":"WiFi Only","kind":"solid",)json"
+                 R"json("color":"#c85a00",)json"
+                 R"json("desc":"On WiFi but the console is not yet paired."},)json"
+                 R"json({"id":"ap_mode","label":"Provisioning (AP)","kind":"flash",)json"
+                 R"json("color":"#ff0000","period_ms":400,)json"
+                 R"json("desc":"Provisioning portal up — no WiFi credentials configured."},)json"
+                 R"json({"id":"offline","label":"Offline","kind":"solid",)json"
+                 R"json("color":"#ff0000",)json"
+                 R"json("desc":"Booting, connecting, or post-drop reconnect."},)json"
+                 R"json({"id":"ack_tag_read","label":"Tag Read Ack","kind":"burst",)json"
+                 R"json("color":"#0050ff",)json"
+                 R"json("desc":"Successful NFC tag parse — fires once per read."},)json"
+                 R"json({"id":"ack_capture_ok","label":"Capture OK","kind":"burst",)json"
+                 R"json("color":"#00b400",)json"
+                 R"json("desc":"Console accepted a button-press weight capture."},)json"
+                 R"json({"id":"ack_capture_fail","label":"Capture Failed","kind":"burst",)json"
+                 R"json("color":"#c85a00",)json"
+                 R"json("desc":"Button-press capture rejected or timed out."}]})json");
+        req->send(s);
+    });
+
+    _server.on("/api/led-test", HTTP_POST, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        if (!req->hasParam("state")) {
+            req->send(400, "application/json",
+                      "{\"error\":\"missing state\"}");
+            return;
+        }
+        String state = req->getParam("state")->value();
+        uint32_t ms = 5000;
+        if (req->hasParam("ms")) {
+            long v = req->getParam("ms")->value().toInt();
+            if (v > 0 && v <= 30000) ms = (uint32_t)v;
+        }
+        if (_onLedTest) _onLedTest(state, ms);
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
+
     // ── Firmware info ────────────────────────────────────────
 
     _server.on("/api/firmware-info", HTTP_GET, [this](AsyncWebServerRequest* req) {
@@ -581,6 +646,9 @@ void ScaleWebServer::_setupRoutes() {
     // ── Static SPA from SPIFFS (must be after API routes) ────
 
     _server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+        Serial.printf("[HTTP] GET / (explicit handler) gz=%d html=%d\n",
+                      SPIFFS.exists("/index.html.gz"),
+                      SPIFFS.exists("/index.html"));
         if (SPIFFS.exists("/index.html.gz")) {
             auto* resp = req->beginResponse(SPIFFS, "/index.html.gz", "text/html");
             resp->addHeader("Content-Encoding", "gzip");
@@ -591,11 +659,14 @@ void ScaleWebServer::_setupRoutes() {
     });
 
     _server.serveStatic("/", SPIFFS, "/")
+           .setDefaultFile("index.html")
            .setCacheControl("max-age=86400");
 
     // SPA fallback: non-API GET requests serve index.html for client-side routing
     // (history API paths like /configuration, /dashboard)
     _server.onNotFound([](AsyncWebServerRequest* req) {
+        Serial.printf("[HTTP] 404-fallback %s %s\n",
+                      req->methodToString(), req->url().c_str());
         if (req->method() == HTTP_GET &&
             !req->url().startsWith("/api/") &&
             !req->url().startsWith("/captive/")) {

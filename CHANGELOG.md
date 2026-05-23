@@ -8,6 +8,28 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.12.0] - 2026-05-23
+
+Scale: surface "uncalibrated" as its own LED state and expose
+the full LED palette to the operator.
+
+- feat(led): new `showUncalibrated()` state — magenta 1 Hz
+  flash, held continuously while the load cell has no
+  calibration points stored. Takes priority over the network
+  ladder so a paired-but-uncalibrated scale reads as "needs
+  config" rather than "looks fine". Sits below NFC and weight
+  overlays so live calibration captures still flash their
+  burst through.
+- feat(api): `GET /api/led-legend` returns a JSON catalog of
+  every LED state (id, label, kind, color, period, description).
+  `POST /api/led-test?state=<id>&ms=<duration>` pins the
+  requested pattern over normal arbitration for up to 30 s
+  via a single-writer atomic-flag handoff to `loopTask`.
+- feat(config UI): new LED Legend section under Setup. Renders
+  the catalog with CSS animations that match the firmware
+  patterns (flash/pulse/burst) and a per-row "Test" button
+  that fires the pattern on the physical LED for 5 s.
+
 ## [0.11.7] - 2026-05-23
 
 Console: Bambu printer SSDP discovery — listen on the channel

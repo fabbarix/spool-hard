@@ -8,6 +8,7 @@ import { OtaSection } from '../components/config/OtaSection';
 import { DirectUploadSection } from '../components/config/DirectUploadSection';
 import { BackupRestoreSection } from '../components/config/BackupRestoreSection';
 import { DeviceControlSection } from '../components/config/DeviceControlSection';
+import { LedLegendSection } from '../components/config/LedLegendSection';
 import { DebugSection } from '../components/config/DebugSection';
 
 type ConfigTab = 'setup' | 'scale' | 'security' | 'device' | 'debug';
@@ -82,6 +83,7 @@ export function ConfigPage() {
             <OtaSection />
             <DirectUploadSection />
             <BackupRestoreSection />
+            <LedLegendSection />
             <DeviceControlSection />
           </div>
         )}
