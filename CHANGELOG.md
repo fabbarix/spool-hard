@@ -8,6 +8,34 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.11.7] - 2026-05-23
+
+Console: Bambu printer SSDP discovery — listen on the channel
+printers actually use, surface discovered ones in the UI.
+
+- fix(discovery): add a UDP/2021 broadcast listener. Earlier
+  code only listened on multicast 239.255.255.250:1990/1900;
+  observed traffic and `inindev/bambu-bridge` both show
+  X1/P1/H2D/O1S broadcasting their NOTIFY frame to
+  255.255.255.255:2021 instead, so configured printers reached
+  on a fresh DHCP lease couldn't be re-discovered. The existing
+  on-announce → BambuManager wiring now picks up IP changes
+  via this new channel.
+- fix(ssdp): `SsdpListener::begin` gained a `joinMulticast`
+  flag so the broadcast path uses `AsyncUDP::listen()` instead
+  of `listenMulticast()` and `sendMSearch` targets
+  255.255.255.255 in that mode.
+- feat(discovery): parse `DevName.bambu.com` and
+  `DevModel.bambu.com` from the NOTIFY frame. The user-set
+  printer name (e.g. "Bambozzo") and model code (e.g. "O1S",
+  "X1C") are now exposed on `/api/discovery/printers`.
+- feat(config UI): the Printers tab now shows a dedicated
+  "Discovered on network" list of unconfigured printers above
+  the Add-Printer button. Each row has its own Add button that
+  pre-fills the form with the printer's name, serial, and IP,
+  leaving only the access code to enter. Replaces the older
+  flow that hid the discovered list inside the Add panel.
+
 ## [0.11.0] - 2026-05-09
 
 Catch-up release rolling up everything since v0.7.0. Headline fix:

@@ -3,7 +3,8 @@ import { useQuery } from '@tanstack/react-query';
 export interface DiscoveredPrinter {
   serial: string;
   ip: string;
-  model: string;
+  model: string;        // e.g. "O1S", "X1C", "H2D" — from DevModel.bambu.com
+  name: string;         // user-set printer name — from DevName.bambu.com
   last_seen_ago: number;   // ms
   configured: boolean;
 }

@@ -6,10 +6,13 @@
 // packets subscribes to these singletons via SsdpListener::subscribe(cb)
 // instead of trying to open its own socket.
 //
-// Port 1990 catches the SpoolHard scale and Bambu X1/X1C/H2D.
-// Port 1900 catches Bambu P1P (which uses standard UPnP).
+// Port 1990 (multicast)  — SpoolHard scale's NOTIFY frames.
+// Port 1900 (multicast)  — standard UPnP traffic on the LAN.
+// Port 2021 (broadcast)  — Bambu printers' periodic discovery NOTIFY frames
+//                          (X1/P1/H2D/O1S all broadcast to 255.255.255.255).
 extern SsdpListener g_ssdp_1990;
 extern SsdpListener g_ssdp_1900;
+extern SsdpListener g_ssdp_bambu_2021;
 
 // Call once after WiFi comes up. Safe to call repeatedly; idempotent.
 void ssdp_hub_begin();

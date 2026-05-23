@@ -44,6 +44,20 @@ export function PrintersSection() {
     }
   };
 
+  // Pre-fill the Add form from a discovered printer and open it. The
+  // access code never appears in the SSDP broadcast, so the user still
+  // has to type or scan that one field.
+  const startAddFromDiscovered = (d: DiscoveredPrinter) => {
+    setForm({
+      name:        d.name || d.model || d.serial,
+      serial:      d.serial,
+      ip:          d.ip,
+      access_code: '',
+    });
+    setError(null);
+    setAdding(true);
+  };
+
   return (
     <SectionCard
       title="Bambu Lab Printers"
@@ -57,11 +71,12 @@ export function PrintersSection() {
         )}
       </div>
 
+      {!adding && !atLimit && (
+        <DiscoveredUnconfigured onAdd={startAddFromDiscovered} />
+      )}
+
       {adding ? (
         <div className="mt-4 p-3 rounded-md border border-surface-border bg-surface-input space-y-3">
-          <DiscoveredList
-            onPick={(d) => setForm((f) => ({ ...f, serial: d.serial, ip: d.ip, name: f.name || d.model || d.serial }))}
-          />
           <InputField
             label="Name"
             value={form.name}
@@ -127,39 +142,42 @@ export function PrintersSection() {
   );
 }
 
-function DiscoveredList({ onPick }: { onPick: (d: DiscoveredPrinter) => void }) {
+// Show every Bambu printer the LAN announces (via the on-wire NOTIFY on
+// UDP/2021 broadcast) that the user hasn't paired yet. Each row has its
+// own Add button that drops the discovery details into the form and
+// jumps the user to access-code entry — much more discoverable than
+// hiding the list inside an "Add printer" panel they have to open first.
+function DiscoveredUnconfigured({ onAdd }: { onAdd: (d: DiscoveredPrinter) => void }) {
   const { data, isLoading } = useDiscoveredPrinters();
   if (isLoading) return null;
-  if (!data || data.length === 0) {
-    return (
-      <div className="text-xs text-text-muted">
-        No printers discovered on the LAN yet — they broadcast every ~30 s. You can still enter one manually below.
-      </div>
-    );
-  }
+  const unconfigured = (data ?? []).filter((d) => !d.configured);
+  if (unconfigured.length === 0) return null;
   return (
-    <div>
-      <div className="text-xs text-text-muted mb-2">Discovered on network — tap to fill</div>
+    <div className="mt-4 p-3 rounded-md border border-surface-border bg-surface-input">
+      <div className="text-xs text-text-muted mb-2 uppercase tracking-wider">
+        Discovered on network
+      </div>
       <div className="space-y-1.5">
-        {data.map((d) => (
-          <button
+        {unconfigured.map((d) => (
+          <div
             key={d.serial}
-            type="button"
-            onClick={() => onPick(d)}
-            disabled={d.configured}
-            className={`w-full text-left p-2 rounded border text-xs font-mono transition-colors ${
-              d.configured
-                ? 'border-surface-border bg-surface-card/40 text-text-muted cursor-not-allowed'
-                : 'border-surface-border bg-surface-card hover:border-brand-500 hover:text-brand-400 cursor-pointer'
-            }`}
+            className="flex items-center gap-2 p-2 rounded border border-surface-border bg-surface-card"
           >
-            <div className="flex items-center gap-2">
-              <span className="text-text-primary truncate flex-1">{d.serial}</span>
-              <span className="text-text-muted">{d.ip}</span>
-              {d.configured && <span className="text-[10px] uppercase tracking-wider text-text-muted">configured</span>}
+            <div className="flex-1 min-w-0 text-xs font-mono">
+              <div className="text-text-primary truncate">
+                {d.name || d.serial}
+              </div>
+              <div className="text-text-muted truncate">
+                {[d.model, d.name ? d.serial : null, d.ip].filter(Boolean).join(' · ')}
+              </div>
             </div>
-            {d.model && <div className="text-text-muted truncate">{d.model}</div>}
-          </button>
+            <Button onClick={() => onAdd(d)}>
+              <span className="inline-flex items-center gap-1.5">
+                <Plus size={14} />
+                Add
+              </span>
+            </Button>
+          </div>
         ))}
       </div>
     </div>

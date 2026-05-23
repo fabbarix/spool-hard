@@ -3364,6 +3364,7 @@ static void serializeDiscoveryPrinters(JsonDocument& doc) {
         row["serial"]        = e.serial;
         row["ip"]            = e.ip.toString();
         row["model"]         = e.model;
+        row["name"]          = e.name;
         row["last_seen_ago"] = (int)(now - e.last_seen_ms);
         row["configured"]    = g_printers_cfg.find(e.serial) != nullptr;
     }

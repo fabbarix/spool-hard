@@ -19,7 +19,8 @@ public:
     struct Entry {
         String    serial;        // from USN
         IPAddress ip;            // from Location
-        String    model;         // optional hint, e.g. "3DPrinter-X1-Carbon"
+        String    model;         // from DevModel.bambu.com, e.g. "O1S", "X1C", "H2D"
+        String    name;          // from DevName.bambu.com — the user-set printer name
         uint32_t  last_seen_ms;
     };
 

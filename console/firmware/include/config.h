@@ -174,13 +174,23 @@
 #define SSDP_MCAST_OCT_B     255
 #define SSDP_MCAST_OCT_C     255
 #define SSDP_MCAST_OCT_D     250
-// Bambu's wiki (https://wiki.bambulab.com/en/general/printer-network-ports) and
-// community forum confirm their printers use NON-standard SSDP ports:
-//   X1 / X1C / H2D → 1990   (same port the SpoolHard scale uses)
-//   P1P            → 1900
-// We listen on both so any Bambu on the LAN is caught.
-#define SSDP_PORT            1990              // SpoolHard scale + Bambu X1/H2D
-#define SSDP_PORT_UPNP       1900              // Bambu P1P (standard UPnP)
+// We run three discovery sockets:
+//   :1990 multicast 239.255.255.250 — SpoolHard scale's NOTIFY (and P1P
+//                                     fallback if any are out there).
+//   :1900 multicast 239.255.255.250 — standard UPnP (kept for back-compat).
+//   :2021 broadcast 255.255.255.255 — Bambu X1 / P1 / H2D / O1S etc. These
+//                                     printers broadcast an SSDP-shaped
+//                                     NOTIFY frame on UDP/2021 every ~30 s
+//                                     (urn:bambulab-com:device:3dprinter).
+//                                     Confirmed against inindev/bambu-bridge
+//                                     and packet-captured from an O1S/H2S.
+//                                     Earlier code listened on multicast
+//                                     239.255.255.250:1990 for Bambu — that
+//                                     was wrong (printers never send there),
+//                                     which is why discovery was empty.
+#define SSDP_PORT            1990              // SpoolHard scale (multicast)
+#define SSDP_PORT_UPNP       1900              // standard UPnP (multicast)
+#define BAMBU_BCAST_PORT     2021              // Bambu printers (broadcast)
 #define CONSOLE_SSDP_URN     "urn:spoolhard-io:device:console"
 #define SCALE_SSDP_URN       "urn:spoolhard-io:device:spoolscale"
 #define BAMBU_SSDP_URN_TAG   "bambulab"        // substring match on NT
