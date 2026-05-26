@@ -31,6 +31,24 @@ extern ScaleLink g_scale;   // defined in main.cpp
 extern SpoolStore g_store;   // defined in main.cpp
 // g_printers_cfg is already declared in printer_config.h.
 
+// Bambu publishes 4-byte tag UIDs over MQTT as 16 hex chars padded with
+// the constant suffix `00000100` (bytes 00 00 01 00). The console's
+// PN532 scans the raw 4-byte UID and stores it as 8 hex chars, so the
+// padded form never matches SpoolStore::findByTagId and AMS-slot
+// weights silently render as "—". Strip the suffix on ingest so the
+// match works end-to-end. 7-byte UIDs (NTAG2xx) are emitted as 14 hex
+// chars by both sides and pass through unchanged. True 8-byte UIDs
+// (rare) that happen to share the suffix would be misread as 4-byte,
+// but we haven't seen any in the wild and the alternative — fuzzy
+// prefix lookup in the store — makes the store's contract worse.
+static String _normalizeBambuTagUid(const String& raw) {
+    if (raw.length() != 16) return raw;
+    String tail = raw.substring(8);
+    tail.toUpperCase();
+    if (tail == "00000100") return raw.substring(0, 8);
+    return raw;
+}
+
 // Static hook invoked once per successful PendingAms claim.
 BambuPrinter::SpoolAssignedCb BambuPrinter::s_onSpoolAssigned;
 
@@ -534,7 +552,7 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
         tr.tray_sub_brands  = vt["tray_sub_brands"]  | "";
         tr.tray_color       = vt["tray_color"]       | "";
         tr.tray_info_idx    = vt["tray_info_idx"]    | "";
-        tr.tag_uid          = vt["tag_uid"]          | "";
+        tr.tag_uid          = _normalizeBambuTagUid(vt["tag_uid"] | "");
         if (vt["nozzle_temp_min"].is<const char*>()) tr.nozzle_min_c = atoi(vt["nozzle_temp_min"].as<const char*>());
         if (vt["nozzle_temp_max"].is<const char*>()) tr.nozzle_max_c = atoi(vt["nozzle_temp_max"].as<const char*>());
         if (vt["remain"].is<int>())   tr.remain_pct = vt["remain"];
@@ -809,7 +827,7 @@ void BambuPrinter::_parseAms(const JsonObjectConst& amsObj, PrinterState& out) {
             tr.tray_sub_brands  = tray["tray_sub_brands"]  | "";
             tr.tray_color       = tray["tray_color"]       | "";
             tr.tray_info_idx    = tray["tray_info_idx"]    | "";
-            tr.tag_uid          = tray["tag_uid"]          | "";
+            tr.tag_uid          = _normalizeBambuTagUid(tray["tag_uid"] | "");
             if (tray["nozzle_temp_min"].is<const char*>()) tr.nozzle_min_c = atoi(tray["nozzle_temp_min"].as<const char*>());
             if (tray["nozzle_temp_max"].is<const char*>()) tr.nozzle_max_c = atoi(tray["nozzle_temp_max"].as<const char*>());
             if (tray["remain"].is<int>())   tr.remain_pct = tray["remain"];
@@ -1029,9 +1047,20 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
     // so the user can confirm the right per-(printer,nozzle) profile is
     // being used. Pressure-advance / max-volumetric-speed payloads will
     // hook in here once we plumb their MQTT commands.
+    //
+    // While we have the linked FilamentRecord in hand, also remember its
+    // `filament_id` (Bambu's tray_info_idx, e.g. "Pdb99855") so we can
+    // fall back to it when the spool's own `slicer_filament` is empty.
+    // The spool's value gets populated lazily by `_importTrayInfoIntoSpool`
+    // on first AMS load, but a brand-new spool linked via "Pick from
+    // library" doesn't have it yet — and the printer needs an explicit
+    // tray_info_idx in the very first publish to load the right preset
+    // instead of keeping the slot's stale value.
+    String filamentDbFilamentId;
     if (rec.setting_id.length()) {
         FilamentRecord fr;
         if (g_user_filaments.findById(rec.setting_id, fr)) {
+            filamentDbFilamentId = fr.filament_id;
             float n = _state.nozzle_count > 0 ? _state.nozzle_diameters[0] : 0.f;
             FilamentVariant fv;
             if (fr.resolveVariant(_state.model_code, n, fv)) {
@@ -1053,6 +1082,15 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
             }
         }
     }
+    // Push priority: prefer the spool's own slicer_filament (set by the
+    // last AMS auto-import for this physical spool), fall back to the
+    // linked FilamentRecord's filament_id (set by the user via the
+    // dashboard's "Link to filament" affordance on an unmatched AMS
+    // slot, or by a future cloud-sync that carries the field). Empty
+    // string is allowed — the printer just keeps whatever idx it
+    // already has bound to the slot.
+    String trayInfoIdx = rec.slicer_filament.length() ? rec.slicer_filament
+                                                      : filamentDbFilamentId;
 
     // Bambu expects RGBA. Pad RRGGBB → RRGGBBFF (fully opaque) if the
     // record only stored six hex chars, which is the SpoolHard
@@ -1073,7 +1111,7 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
     print["ams_id"]          = ams_unit;
     print["tray_id"]         = slot_id;       // within-AMS slot (newer firmware variant)
     print["slot_id"]         = slot_id;
-    print["tray_info_idx"]   = rec.slicer_filament;  // may be "" — printer keeps old idx
+    print["tray_info_idx"]   = trayInfoIdx;  // may be "" — printer keeps old idx
     print["tray_color"]      = color;
     print["nozzle_temp_min"] = tmin;
     print["nozzle_temp_max"] = tmax;

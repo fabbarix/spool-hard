@@ -1,5 +1,5 @@
 import { useId, useMemo, useState } from 'react';
-import { Pin, Gauge, ExternalLink, Sparkles, Loader2, Thermometer, Wind } from 'lucide-react';
+import { Pin, Gauge, ExternalLink, Sparkles, Loader2, Thermometer, Wind, Link2 } from 'lucide-react';
 import { Card } from '@spoolhard/ui/components/Card';
 import { Button } from '@spoolhard/ui/components/Button';
 import { StatusDot } from '@spoolhard/ui/components/StatusDot';
@@ -13,7 +13,10 @@ import {
   type Printer,
 } from '../../hooks/usePrinters';
 import { useSpools, type SpoolRecord } from '../../hooks/useSpools';
+import { useUserFilaments, type UserFilament } from '../../hooks/useUserFilaments';
+import { useFilamentsDb } from '../../hooks/useFilamentsDb';
 import { AmsSlotPicker } from './AmsSlotPicker';
+import { LinkFilamentDialog } from './LinkFilamentDialog';
 
 export function PrintersPanel() {
   const { data: printers } = usePrinters();
@@ -26,6 +29,29 @@ export function PrintersPanel() {
     spools?.rows?.forEach((r) => m.set(r.id, r));
     return m;
   }, [spools?.rows]);
+  // User-filaments index by filament_id (== Bambu's tray_info_idx). Used
+  // by each AmsSlotCard to detect "unmatched but linkable" slots — a
+  // slot reporting tray_info_idx that no filament-DB row claims yet.
+  // The Link-to-filament affordance lets the user associate the slot's
+  // preset code with an existing filament row in one click.
+  const { data: userFilaments } = useUserFilaments();
+  const filamentByFilamentId = useMemo(() => {
+    const m = new Map<string, UserFilament>();
+    userFilaments?.rows?.forEach((f) => {
+      if (f.filament_id) m.set(f.filament_id, f);
+    });
+    return m;
+  }, [userFilaments?.rows]);
+  // Stock filament catalog (Bambu's built-in `GFB00`, `GFG00`, …). These
+  // are already meaningful in the slicer — no need to ask the user to
+  // associate them with anything. Used purely to suppress the "Link to
+  // filament" prompt for known stock codes.
+  const { data: stockFilaments } = useFilamentsDb();
+  const stockFilamentIds = useMemo(() => {
+    const s = new Set<string>();
+    stockFilaments?.entries?.forEach((e) => { if (e.filament_id) s.add(e.filament_id); });
+    return s;
+  }, [stockFilaments?.entries]);
 
   if (!printers || printers.length === 0) {
     return (
@@ -40,13 +66,26 @@ export function PrintersPanel() {
   return (
     <Card title={`Printers (${printers.length})`}>
       <div className="space-y-4">
-        {printers.map((p) => <PrinterRow key={p.serial} p={p} spoolById={spoolById} />)}
+        {printers.map((p) => (
+          <PrinterRow
+            key={p.serial}
+            p={p}
+            spoolById={spoolById}
+            filamentByFilamentId={filamentByFilamentId}
+            stockFilamentIds={stockFilamentIds}
+          />
+        ))}
       </div>
     </Card>
   );
 }
 
-function PrinterRow({ p, spoolById }: { p: Printer; spoolById: Map<string, SpoolRecord> }) {
+function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds }: {
+  p: Printer;
+  spoolById: Map<string, SpoolRecord>;
+  filamentByFilamentId: Map<string, UserFilament>;
+  stockFilamentIds: Set<string>;
+}) {
   const s = p.state;
   const linkStatus: 'connected' | 'connecting' | 'disconnected' =
     s.link === 'connected' ? 'connected' : s.link === 'connecting' ? 'connecting' : 'disconnected';
@@ -107,6 +146,8 @@ function PrinterRow({ p, spoolById }: { p: Printer; spoolById: Map<string, Spool
                   activeTray={s.active_tray}
                   serial={p.serial}
                   spoolById={spoolById}
+                  filamentByFilamentId={filamentByFilamentId}
+                  stockFilamentIds={stockFilamentIds}
                 />
               ))}
               {s.vt_tray && (
@@ -117,6 +158,8 @@ function PrinterRow({ p, spoolById }: { p: Printer; spoolById: Map<string, Spool
                     serial={p.serial}
                     amsUnit={254}
                     spool={s.vt_tray.spool_id ? spoolById.get(s.vt_tray.spool_id) : undefined}
+                    filamentByFilamentId={filamentByFilamentId}
+                    stockFilamentIds={stockFilamentIds}
                     label="External"
                     external
                   />
@@ -133,12 +176,14 @@ function PrinterRow({ p, spoolById }: { p: Printer; spoolById: Map<string, Spool
   );
 }
 
-function AmsUnitBlock({ u, unitNumber, activeTray, serial, spoolById }: {
+function AmsUnitBlock({ u, unitNumber, activeTray, serial, spoolById, filamentByFilamentId, stockFilamentIds }: {
   u: AmsUnit;
   unitNumber: number;
   activeTray: number | undefined;
   serial: string;
   spoolById: Map<string, SpoolRecord>;
+  filamentByFilamentId: Map<string, UserFilament>;
+  stockFilamentIds: Set<string>;
 }) {
   return (
     <div>
@@ -152,6 +197,8 @@ function AmsUnitBlock({ u, unitNumber, activeTray, serial, spoolById }: {
             serial={serial}
             amsUnit={u.id}
             spool={t.spool_id ? spoolById.get(t.spool_id) : undefined}
+            filamentByFilamentId={filamentByFilamentId}
+            stockFilamentIds={stockFilamentIds}
             label={`AMS ${unitNumber}·${t.id + 1}`}
           />
         ))}
@@ -251,16 +298,32 @@ function DryingChip({ d }: { d: NonNullable<AmsUnit['drying']> }) {
   );
 }
 
-function AmsSlotCard({ t, active, serial, amsUnit, spool, label, external }: {
+function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, stockFilamentIds, label, external }: {
   t: AmsTray;
   active: boolean;
   serial: string;
   amsUnit: number;
   spool: SpoolRecord | undefined;
+  filamentByFilamentId: Map<string, UserFilament>;
+  stockFilamentIds: Set<string>;
   label: string;
   external?: boolean;
 }) {
   const [picking, setPicking] = useState(false);
+  const [linking, setLinking] = useState(false);
+  // "Unmatched preset" = the AMS reports a non-empty tray_info_idx that
+  // neither the user-filaments DB nor the stock-filament library claims.
+  // Stock codes (`GFB00` etc.) are already meaningful in the slicer — no
+  // user action needed. Custom preset codes (`P…`) without a library
+  // row are the case we want to surface: clicking Link sets the chosen
+  // user-filament row's filament_id to this slot's value, so subsequent
+  // pushes for spools linked to that filament ship the right
+  // tray_info_idx on first AMS load.
+  const unmatchedPreset =
+    !!t.tray_info_idx &&
+    t.tray_info_idx !== '0' &&
+    !filamentByFilamentId.has(t.tray_info_idx) &&
+    !stockFilamentIds.has(t.tray_info_idx);
   // Colour source priority: AMS-reported tray_color wins when it's known
   // and non-zero — that's the ground truth of what's physically loaded
   // right now (RFID read, or what the user set on the printer's panel).
@@ -312,11 +375,11 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, label, external }: {
   ].filter(Boolean).join(' · ');
 
   return (
-    <>
+    <div className="flex flex-col">
       <button
         type="button"
         onClick={() => setPicking(true)}
-        className={`group relative overflow-hidden rounded-md border text-left transition-all hover:border-brand-400/60 h-full flex flex-col ${active ? 'border-brand-500 ring-1 ring-brand-500/30' : 'border-surface-border'} ${isEmpty ? 'bg-surface-card/40' : 'bg-surface-card'}`}
+        className={`group relative overflow-hidden rounded-md border text-left transition-all hover:border-brand-400/60 flex-1 flex flex-col ${active ? 'border-brand-500 ring-1 ring-brand-500/30' : 'border-surface-border'} ${isEmpty ? 'bg-surface-card/40' : 'bg-surface-card'}`}
         title={title}
       >
         {/* Color swatch — dominates the card when populated, leaving a
@@ -372,6 +435,22 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, label, external }: {
           </div>
         </div>
       </button>
+      {/* "Unmatched preset" affordance — fires only when the AMS is
+          reporting a tray_info_idx that no filament-DB row claims yet.
+          Lives BELOW the main card button (not nested in it — that would
+          be invalid HTML and break click isolation) so the user can
+          click it without also opening the spool reassign picker. */}
+      {unmatchedPreset && (
+        <button
+          type="button"
+          onClick={() => setLinking(true)}
+          className="mt-1 text-[10px] text-text-muted hover:text-brand-400 inline-flex items-center gap-1 font-mono truncate"
+          title={`This AMS slot reports preset ${t.tray_info_idx}, but no filament in your library claims it. Click to associate.`}
+        >
+          <Link2 size={10} />
+          Link <span className="text-text-primary">{t.tray_info_idx}</span> to a filament…
+        </button>
+      )}
       {picking && (
         <AmsSlotPicker
           serial={serial}
@@ -382,7 +461,16 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, label, external }: {
           onClose={() => setPicking(false)}
         />
       )}
-    </>
+      {linking && (
+        <LinkFilamentDialog
+          trayInfoIdx={t.tray_info_idx}
+          material={t.material}
+          color={t.color}
+          slotLabel={label}
+          onClose={() => setLinking(false)}
+        />
+      )}
+    </div>
   );
 }
 

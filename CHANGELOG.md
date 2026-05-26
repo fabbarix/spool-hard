@@ -8,6 +8,58 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.12.3] - 2026-05-26
+
+Console: link spools and AMS slots to Bambu's slicer presets
+end-to-end, plus push user filaments back to Bambu Cloud.
+
+- fix(bambu): normalize Bambu's MQTT tag_uid suffix. Bambu
+  publishes 4-byte tag UIDs as 16 hex chars padded with the
+  constant tail `00000100`; the console's PN532 stores the
+  raw 4-byte UID (8 hex chars), so `SpoolStore::findByTagId`
+  never matched and AMS slot weights silently rendered as
+  "—". The MQTT ingest paths in `bambu_printer.cpp` now strip
+  the documented suffix on the way in. 7-byte (NTAG2xx) UIDs
+  are unchanged.
+- feat(dashboard): "Link to filament" affordance on AMS slot
+  cards that report a `tray_info_idx` no filament-DB row
+  claims yet — the most common case for custom Studio presets
+  that came in from Bambu Cloud sync without a `filament_id`.
+  Click → modal lists user-filament rows filtered by material;
+  pick one and the chosen row's `filament_id` is set to the
+  slot's preset code. Stock Bambu codes (`GF…`) are
+  recognised against the bundled filament library and
+  suppress the affordance. Future spools linked to that
+  filament then ship the right `tray_info_idx` on their
+  first AMS load.
+- feat(bambu): `_publishAmsFilamentSetting` falls back to the
+  linked filament's `filament_id` when the spool's own
+  `slicer_filament` is empty. Closes the "wrong-settings
+  window" on a freshly-paired spool that's never been in an
+  AMS slot before — the moment the user picks the filament
+  preset in the wizard, the very first MQTT push ships the
+  right `tray_info_idx` without waiting for an auto-import
+  round-trip.
+- fix(bambu-cloud): rewrite the user-filament cloud-push
+  payload to match Bambu's actual stored format. Per-
+  extruder numeric fields (`nozzle_temperature`,
+  `nozzle_temperature_initial_layer`,
+  `nozzle_temperature_range_low/high`,
+  `filament_max_volumetric_speed`, `pressure_advance`) ship
+  as N-element comma-joined strings; `filament_extruder_variant`
+  ships as semicolon-joined with each segment escape-quoted;
+  identity strings (`filament_vendor`, `filament_type`,
+  `filament_settings_id`, `compatible_printers`) ship as
+  single escape-quoted strings. Also adds `inherits`,
+  `from:"User"`, in-setting `version:"2.6.0.2"`, and
+  `compatible_printers` (parsed from `cloud_inherits` when
+  the variant didn't capture printer_model + nozzle_diameter
+  during sync). Skips `enable_pressure_advance:"1"` when all
+  stored PA values are zero. Previously the cloud rejected
+  every push with HTTP 422 "Invalid input parameters"; now
+  multi-extruder presets like "Tinmorry PETG-CF" push
+  cleanly.
+
 ## [0.12.0] - 2026-05-23
 
 Scale: surface "uncalibrated" as its own LED state and expose

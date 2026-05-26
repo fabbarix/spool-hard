@@ -496,71 +496,159 @@ Result fetchOne(const String& token, BambuCloudAuth::Region region,
 // filament, then POST it. Used by createOne to emit one cloud preset
 // per variant. Group identity (vendor, density, range_low/high) is
 // repeated across every sibling preset so each is self-contained.
+// Parse "<base> @BBL <printer> [<nozzle> nozzle]" out of an `inherits`
+// string so we can fill name suffix / compatible_printers when the
+// variant didn't carry printer_model + nozzle_diameter (current cloud
+// sync drops those). Returns false if no @BBL/@Bambu Lab marker.
+static bool _parseInheritsPrinter(const String& inherits, String& model, float& nozzle) {
+    int idx = inherits.indexOf(" @BBL ");
+    int markerLen = 6;
+    if (idx < 0) { idx = inherits.indexOf(" @Bambu Lab "); markerLen = 12; }
+    if (idx < 0) return false;
+    String rest = inherits.substring(idx + markerLen);
+    rest.trim();
+    int sp = rest.indexOf(' ');
+    if (sp < 0) {
+        model  = rest;
+        nozzle = 0.4f;   // default — most common
+        return true;
+    }
+    model = rest.substring(0, sp);
+    String tail = rest.substring(sp + 1);
+    tail.trim();
+    float n = tail.toFloat();
+    nozzle = (n > 0.f) ? n : 0.4f;
+    return true;
+}
+
+static String _humanizePrinterModel(const String& code) {
+    if (code == "X1C")      return "X1 Carbon";
+    if (code == "A1mini")   return "A1 mini";
+    return code;   // X1, P1S, P1P, H2S, H2D, A1 — all match Bambu's "Bambu Lab <code>" naming verbatim
+}
+
 static Result createOneVariant(const String& token, BambuCloudAuth::Region region,
                                const FilamentRecord& in, const FilamentVariant& fv,
                                String& newCloudIdOut, Diag* diagOut) {
     JsonDocument body;
     body["type"]    = "filament";
-    // Bambu's name convention: "<filament> @<printer> <nozzle> nozzle"
-    String printerHuman = fv.printer_model;
-    if (printerHuman == "X1C")    printerHuman = "X1 Carbon";
-    else if (printerHuman == "A1mini") printerHuman = "A1 mini";
-    String suffix;
-    if (fv.printer_model.length() && fv.nozzle_diameter > 0.f) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f", fv.nozzle_diameter);
-        suffix = " @Bambu Lab " + printerHuman + " " + String(buf) + " nozzle";
+    // Bambu's cloud preset names follow "<filament> @Bambu Lab <printer>
+    // <nozzle> nozzle". If the variant didn't capture printer_model /
+    // nozzle_diameter (current cloud sync drops them — see the
+    // user-filaments hook docs), fall back to parsing them out of
+    // `cloud_inherits`. That's the parent preset's name and always
+    // includes the @BBL <printer> suffix.
+    String printerModel = fv.printer_model;
+    float  nozzleDiam   = fv.nozzle_diameter;
+    if (printerModel.isEmpty() || nozzleDiam <= 0.f) {
+        String pm; float pn;
+        if (_parseInheritsPrinter(in.cloud_inherits, pm, pn)) {
+            if (printerModel.isEmpty()) printerModel = pm;
+            if (nozzleDiam <= 0.f)      nozzleDiam   = pn;
+        }
     }
+    String printerHuman = _humanizePrinterModel(printerModel);
+
+    String suffix, compatPrinter;
+    if (printerHuman.length() && nozzleDiam > 0.f) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.1f", nozzleDiam);
+        suffix        = " @Bambu Lab " + printerHuman + " " + String(buf) + " nozzle";
+        compatPrinter = "Bambu Lab "   + printerHuman + " " + String(buf) + " nozzle";
+    }
+
     body["name"]    = in.name + suffix;
-    body["version"] = "2.0.0.0";
+    body["version"] = "2.0.0.0";   // envelope version
     body["base_id"] = in.base_id;
     JsonObject setting = body["setting"].to<JsonObject>();
+
+    // Bambu's stored format uses *string-encoded* values throughout —
+    // single scalars as plain strings ("1.24"), multi-extruder numerics
+    // as comma-joined strings ("42,48"), multi-extruder string lists as
+    // semicolon-joined with each segment wrapped in escaped quotes
+    // (`"a";"b"`), and identity-ish strings (vendor, type, settings_id,
+    // compatible_printers) as single escape-quoted strings. Arrays-of-
+    // strings (what we had been sending) are rejected with 422. Helpers
+    // below produce each shape so the call sites stay readable.
+    const size_t nExtruders = fv.extruder_variants.empty() ? 1 : fv.extruder_variants.size();
+    auto joinCommaRepeat = [&](const String& v) {
+        String out;
+        for (size_t i = 0; i < nExtruders; ++i) { if (i) out += ","; out += v; }
+        return out;
+    };
+    auto joinCommaFloats = [&](const std::vector<float>& src, int dp) {
+        // Pad short stored arrays by repeating the last value — Bambu
+        // rejects mismatched widths and silent NaN/0 fills.
+        String out;
+        for (size_t i = 0; i < nExtruders; ++i) {
+            float v = i < src.size() ? src[i] : (src.empty() ? 0.f : src.back());
+            if (i) out += ",";
+            out += String(v, dp);
+        }
+        return out;
+    };
+    auto quote = [](const String& s) { return "\"" + s + "\""; };
+
+    // Provenance / inheritance markers — Bambu Studio sends all three.
+    if (in.cloud_inherits.length())
+        setting["inherits"] = in.cloud_inherits;
+    setting["from"]    = "User";
+    setting["version"] = "2.6.0.2";   // slicer-profile schema version (in-setting)
+
+    // Identity strings — escape-quoted in Bambu's stored format.
+    setting["filament_settings_id"] = quote(in.name + suffix);
     if (in.filament_vendor.length())
-        setting["filament_vendor"] = "\"" + in.filament_vendor + "\"";
+        setting["filament_vendor"] = quote(in.filament_vendor);
     if (in.filament_type.length())
-        setting["filament_type"] = "\"" + in.filament_type + "\"";
-    if (in.nozzle_temp_min > 0) {
-        JsonArray a = setting["nozzle_temperature_range_low"].to<JsonArray>();
-        a.add(String(in.nozzle_temp_min));
-    }
-    if (in.nozzle_temp_max > 0) {
-        JsonArray a = setting["nozzle_temperature_range_high"].to<JsonArray>();
-        a.add(String(in.nozzle_temp_max));
-    }
+        setting["filament_type"]   = quote(in.filament_type);
+
+    // Operational range — single scalars, plain strings (not quoted).
+    // Bambu stores these per-extruder too, even though the value is
+    // the same on every extruder — comma-fanned out to N copies.
+    if (in.nozzle_temp_min > 0)
+        setting["nozzle_temperature_range_low"]  = joinCommaRepeat(String(in.nozzle_temp_min));
+    if (in.nozzle_temp_max > 0)
+        setting["nozzle_temperature_range_high"] = joinCommaRepeat(String(in.nozzle_temp_max));
     if (fv.nozzle_temp_print > 0 || in.nozzle_temp_max > 0) {
         int nt = fv.nozzle_temp_print > 0 ? fv.nozzle_temp_print : in.nozzle_temp_max;
         int ni = fv.nozzle_temp_initial_layer > 0 ? fv.nozzle_temp_initial_layer : nt;
-        JsonArray a = setting["nozzle_temperature"].to<JsonArray>();
-        a.add(String(nt));
-        JsonArray b = setting["nozzle_temperature_initial_layer"].to<JsonArray>();
-        b.add(String(ni));
+        setting["nozzle_temperature"]               = joinCommaRepeat(String(nt));
+        setting["nozzle_temperature_initial_layer"] = joinCommaRepeat(String(ni));
     }
     if (in.density > 0.f)
         setting["filament_density"] = String(in.density, 3);
-    if (!fv.max_volumetric_speed.empty()) {
-        JsonArray a = setting["filament_max_volumetric_speed"].to<JsonArray>();
-        for (float v : fv.max_volumetric_speed) a.add(String(v, 2));
-    }
-    if (!fv.pressure_advance.empty()) {
-        JsonArray a = setting["pressure_advance"].to<JsonArray>();
-        for (float v : fv.pressure_advance) a.add(String(v, 3));
+
+    // Per-extruder numeric arrays.
+    if (!fv.max_volumetric_speed.empty())
+        setting["filament_max_volumetric_speed"] = joinCommaFloats(fv.max_volumetric_speed, 2);
+
+    // PA: only emit `enable_pressure_advance: "1"` when at least one
+    // stored value is non-zero — sending the enable flag together with
+    // all-zero values is internally inconsistent and Bambu has been
+    // observed rejecting it. When PA isn't enabled we skip both fields
+    // and let the cloud apply the parent preset's defaults.
+    bool paEnabled = false;
+    for (float v : fv.pressure_advance) if (v > 0.f) { paEnabled = true; break; }
+    if (paEnabled) {
+        setting["pressure_advance"]        = joinCommaFloats(fv.pressure_advance, 3);
         setting["enable_pressure_advance"] = "1";
     }
+
+    // Per-extruder string lists — semicolon-joined, each segment quoted.
     if (!fv.extruder_variants.empty()) {
-        // Cloud expects the `;`-joined "<v0>;<v1>" form.
         String joined;
         for (size_t i = 0; i < fv.extruder_variants.size(); ++i) {
             if (i) joined += ";";
-            joined += fv.extruder_variants[i];
+            joined += quote(fv.extruder_variants[i]);
         }
         setting["filament_extruder_variant"] = joined;
     }
-    if (fv.printer_model.length() && fv.nozzle_diameter > 0.f) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f", fv.nozzle_diameter);
-        JsonArray cp = setting["compatible_printers"].to<JsonArray>();
-        cp.add(String("Bambu Lab ") + printerHuman + " " + String(buf) + " nozzle");
-    }
+
+    // Compatible printers — single quoted string. Required for
+    // printer-specific filaments; without it the cloud 422s.
+    if (compatPrinter.length())
+        setting["compatible_printers"] = quote(compatPrinter);
+
     setting["updated_time"] = String((uint32_t)time(nullptr));
 
     String bodyStr;
