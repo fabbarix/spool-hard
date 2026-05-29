@@ -5,6 +5,7 @@
 #include <lvgl.h>
 #include <LovyanGFX.hpp>
 #include <esp_heap_caps.h>
+#include <Preferences.h>
 #include "spoolhard/serial_mirror.h"
 
 // ── LovyanGFX board definition for the WT32-SC01-Plus ────────
@@ -264,6 +265,18 @@ void ConsoleDisplay::setSleepTimeout(uint32_t seconds) {
 }
 
 uint32_t ConsoleDisplay::sleepTimeout() { return s_sleep_timeout_ms / 1000u; }
+
+void ConsoleDisplay::setAndPersistSleepTimeout(uint32_t seconds) {
+    // Clamp upper bound — more than an hour idle makes the feature useless
+    // and would mask a forgotten "never sleep". Mirrors the bound the web
+    // handler used to enforce inline before this became shared.
+    if (seconds > 3600) seconds = 3600;
+    Preferences p;
+    p.begin(NVS_NS_DISPLAY, false);
+    p.putUInt(NVS_KEY_DISP_SLEEP_S, seconds);
+    p.end();
+    setSleepTimeout(seconds);   // applies immediately + wakes screen
+}
 
 void ConsoleDisplay::wake() {
     s_last_interaction_ms = millis();

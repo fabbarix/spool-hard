@@ -66,6 +66,9 @@ public:
     // onSeen callbacks. Edge-only.
     void pushDiscoveryPrinters();
     void pushDiscoveryScales();
+    // Display sleep-timeout — fired after a change from the web POST handler
+    // or the on-device config screen so other open clients reflect it.
+    void pushDisplayConfig();
     // Filaments DB metadata — fired after upload/delete of the SD-side
     // filaments.jsonl. Edge-only.
     void pushFilamentsInfo();

@@ -115,6 +115,11 @@ static lv_obj_t* s_lbl_ip         = nullptr;
 static lv_obj_t*       s_ota_banner       = nullptr;
 static lv_obj_t*       s_ota_banner_label = nullptr;
 static ui_ota_tap_cb_t s_ota_banner_cb    = nullptr;
+// Transparent clickable strip over the home footer (hostname/version/ip).
+// Tapping opens the device-config screen. Fires `s_devcfg_open_cb`, which
+// main.cpp wires to ui_show_device_config(...) with the current identity.
+static lv_obj_t*           s_footer_hit     = nullptr;
+static ui_devcfg_open_cb_t s_devcfg_open_cb = nullptr;
 // Hostname line is split in two so the WiFi glyph can be coloured by link
 // state (green/yellow/orange/grey) while the name itself stays white.
 static lv_obj_t* s_lbl_wifi_icon  = nullptr;   // coloured WiFi symbol
@@ -422,12 +427,30 @@ static void build_home() {
     lv_obj_align_to(s_lbl_hostname, s_lbl_wifi_icon,
                     LV_ALIGN_OUT_RIGHT_MID, 8, 0);
 
-    lv_obj_t* foot = make_label(s_home, "V " FW_VERSION,
+    // Gear glyph prefix hints that the footer is tappable → device config.
+    lv_obj_t* foot = make_label(s_home, LV_SYMBOL_SETTINGS "  V " FW_VERSION,
                                 COL_TEXT_MUTED, &spoolhard_mont_14);
     lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -6);
 
     s_lbl_ip = make_label(s_home, "—", COL_TEXT, &spoolhard_mont_14);
     lv_obj_align(s_lbl_ip, LV_ALIGN_BOTTOM_RIGHT, -12, -6);
+
+    // Transparent hit-strip across the whole footer. Created BEFORE the OTA
+    // banner below so the banner (when an update is pending) sits on top and
+    // keeps its own tap behaviour; when the banner is hidden this strip
+    // receives footer taps and opens device-config. The footer labels under
+    // it aren't clickable, so there's no tap conflict.
+    s_footer_hit = lv_obj_create(s_home);
+    lv_obj_set_pos(s_footer_hit, 0, 284);
+    lv_obj_set_size(s_footer_hit, 480, 36);
+    lv_obj_set_style_bg_opa(s_footer_hit, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_footer_hit, 0, 0);
+    lv_obj_set_style_pad_all(s_footer_hit, 0, 0);
+    lv_obj_clear_flag(s_footer_hit, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_footer_hit, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_footer_hit, [](lv_event_t*) {
+        if (s_devcfg_open_cb) s_devcfg_open_cb();
+    }, LV_EVENT_CLICKED, nullptr);
 
     // OTA banner — hidden until main.cpp asks us to show it. Sits across
     // the bottom of the screen, OVER the footer text (which becomes
@@ -645,6 +668,280 @@ static void build_ota() {
 
     s_lbl_ota_pct = make_label(s_ota, "0%", COL_TEXT, &spoolhard_mont_22);
     lv_obj_align(s_lbl_ota_pct, LV_ALIGN_CENTER, 0, 40);
+}
+
+// ── Reusable confirm screen ─────────────────────────────────
+// A single full-screen "Are you sure?" used by the device-config screen
+// for restart + apply-update. ui_show_confirm() captures whatever screen
+// is currently active and restores it on Cancel; Confirm runs the stored
+// callback (which owns its own post-confirm navigation — reboot, OTA
+// progress screen, etc.). Matches the existing weight-confirm idiom
+// rather than introducing an overlay/msgbox pattern.
+static lv_obj_t* s_confirm           = nullptr;
+static lv_obj_t* s_lbl_confirm_title = nullptr;
+static lv_obj_t* s_lbl_confirm_body  = nullptr;
+static lv_obj_t* s_btn_confirm_ok    = nullptr;
+static lv_obj_t* s_lbl_confirm_ok    = nullptr;
+static lv_obj_t* s_confirm_prev      = nullptr;   // screen to restore on cancel
+static ui_confirm_cb_t s_confirm_cb  = nullptr;
+
+static void build_confirm() {
+    s_confirm = lv_obj_create(nullptr);
+    style_screen(s_confirm);
+
+    s_lbl_confirm_title = make_label(s_confirm, "", COL_BRAND, &spoolhard_mont_28);
+    lv_obj_align(s_lbl_confirm_title, LV_ALIGN_TOP_MID, 0, 40);
+
+    s_lbl_confirm_body = make_label(s_confirm, "", COL_TEXT, &spoolhard_mont_18);
+    lv_obj_set_width(s_lbl_confirm_body, 420);
+    lv_obj_set_style_text_align(s_lbl_confirm_body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lbl_confirm_body, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_lbl_confirm_body, LV_ALIGN_CENTER, 0, -10);
+
+    // Cancel (left, secondary) — restores the captured screen.
+    lv_obj_t* cancel = lv_btn_create(s_confirm);
+    lv_obj_set_size(cancel, 200, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 20, -20);
+    lv_obj_set_style_radius(cancel, 10, 0);
+    lv_obj_set_style_bg_color(cancel, COL_CARD, 0);
+    lv_obj_set_style_border_color(cancel, COL_TEXT_MUTED, 0);
+    lv_obj_set_style_border_width(cancel, 1, 0);
+    lv_obj_add_event_cb(cancel, [](lv_event_t*) {
+        lv_lock();
+        if (s_confirm_prev) lv_screen_load(s_confirm_prev);
+        lv_unlock();
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* cancelLbl = make_label(cancel, "Cancel", COL_TEXT, &spoolhard_mont_18);
+    lv_obj_center(cancelLbl);
+
+    // Confirm (right, primary/brand) — runs the stored callback.
+    s_btn_confirm_ok = lv_btn_create(s_confirm);
+    lv_obj_set_size(s_btn_confirm_ok, 200, 50);
+    lv_obj_align(s_btn_confirm_ok, LV_ALIGN_BOTTOM_RIGHT, -20, -20);
+    lv_obj_set_style_radius(s_btn_confirm_ok, 10, 0);
+    lv_obj_set_style_bg_color(s_btn_confirm_ok, COL_BRAND, 0);
+    lv_obj_set_style_border_width(s_btn_confirm_ok, 0, 0);
+    lv_obj_add_event_cb(s_btn_confirm_ok, [](lv_event_t*) {
+        ui_confirm_cb_t cb = s_confirm_cb;
+        // The callback owns navigation (reboot / OTA screen). If it returns
+        // without navigating away, fall back to the captured screen so we
+        // never strand the user on the confirm screen.
+        if (cb) cb();
+        lv_lock();
+        if (lv_screen_active() == s_confirm && s_confirm_prev) {
+            lv_screen_load(s_confirm_prev);
+        }
+        lv_unlock();
+    }, LV_EVENT_CLICKED, nullptr);
+    s_lbl_confirm_ok = make_label(s_btn_confirm_ok, "Confirm", COL_BODY, &spoolhard_mont_18);
+    lv_obj_center(s_lbl_confirm_ok);
+}
+
+// ── Device config screen (Settings / Info tabs) ─────────────
+// Single screen, fixed header (title + segment buttons + close), two
+// child containers toggled via LV_OBJ_FLAG_HIDDEN. Reached by tapping the
+// home footer. Settings hosts sleep-timeout presets + update/restart
+// actions; Info is a read-only device status panel.
+static lv_obj_t* s_devcfg              = nullptr;
+static lv_obj_t* s_devcfg_set_cont     = nullptr;
+static lv_obj_t* s_devcfg_info_cont    = nullptr;
+static lv_obj_t* s_btn_devcfg_tab_set  = nullptr;
+static lv_obj_t* s_btn_devcfg_tab_info = nullptr;
+static lv_obj_t* s_devcfg_sleep_chip[6] = {nullptr};
+static lv_obj_t* s_lbl_devcfg_sleep_cur = nullptr;
+static lv_obj_t* s_lbl_devcfg_status    = nullptr;
+static lv_obj_t* s_lbl_devcfg_check     = nullptr;
+static lv_obj_t* s_btn_devcfg_apply_con = nullptr;
+static lv_obj_t* s_lbl_devcfg_apply_con = nullptr;
+static lv_obj_t* s_btn_devcfg_apply_scl = nullptr;
+static lv_obj_t* s_lbl_devcfg_apply_scl = nullptr;
+static lv_obj_t* s_lbl_devcfg_host  = nullptr;
+static lv_obj_t* s_lbl_devcfg_ip    = nullptr;
+static lv_obj_t* s_lbl_devcfg_fw    = nullptr;
+static lv_obj_t* s_lbl_devcfg_fe    = nullptr;
+static lv_obj_t* s_lbl_devcfg_heap  = nullptr;
+static lv_obj_t* s_lbl_devcfg_scale = nullptr;
+static devcfg_action_cb_t s_devcfg_action_cb = nullptr;
+static devcfg_sleep_cb_t  s_devcfg_sleep_cb  = nullptr;
+static const uint32_t s_devcfg_sleep_presets[6] = {0, 30, 60, 120, 300, 900};
+static const char* const s_devcfg_sleep_labels[6] = {"Never","30s","1m","2m","5m","15m"};
+
+static void devcfg_select_tab(bool settings) {
+    if (!s_devcfg_set_cont) return;
+    if (settings) {
+        lv_obj_clear_flag(s_devcfg_set_cont,  LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag  (s_devcfg_info_cont, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag  (s_devcfg_set_cont,  LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_devcfg_info_cont, LV_OBJ_FLAG_HIDDEN);
+    }
+    // Active tab button takes the brand fill; inactive falls back to card.
+    lv_obj_set_style_bg_color(s_btn_devcfg_tab_set,
+                              settings ? COL_BRAND : COL_CARD, 0);
+    lv_obj_set_style_bg_color(s_btn_devcfg_tab_info,
+                              settings ? COL_CARD : COL_BRAND, 0);
+    // Recolor the labels to track the fill — dark text (COL_BODY) on the
+    // brand-yellow active fill, light text (COL_TEXT) on the dark card
+    // fill. Without this the inactive button keeps its creation-time colour
+    // and the Settings label (created dark for the brand bg) renders
+    // dark-on-dark when Info is the active tab.
+    lv_obj_t* ls = lv_obj_get_child(s_btn_devcfg_tab_set, 0);
+    lv_obj_t* li = lv_obj_get_child(s_btn_devcfg_tab_info, 0);
+    if (ls) lv_obj_set_style_text_color(ls, settings ? COL_BODY : COL_TEXT, 0);
+    if (li) lv_obj_set_style_text_color(li, settings ? COL_TEXT : COL_BODY, 0);
+    // Border tracks the fill too: none on the brand-filled active button,
+    // a light muted outline on the dark inactive one so it reads as a
+    // button against the body. (Set per-state here because the buttons are
+    // created with a fixed border that wouldn't otherwise update on toggle.)
+    lv_obj_set_style_border_width(s_btn_devcfg_tab_set,  settings ? 0 : 1, 0);
+    lv_obj_set_style_border_width(s_btn_devcfg_tab_info, settings ? 1 : 0, 0);
+}
+
+// Header segment/close button factory.
+static lv_obj_t* devcfg_header_btn(const char* text, int w, lv_event_cb_t cb,
+                                   bool primary) {
+    lv_obj_t* b = lv_btn_create(s_devcfg);
+    lv_obj_set_size(b, w, 34);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_bg_color(b, primary ? COL_BRAND : COL_CARD, 0);
+    lv_obj_set_style_border_color(b, COL_TEXT_MUTED, 0);
+    lv_obj_set_style_border_width(b, primary ? 0 : 1, 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* l = make_label(b, text, primary ? COL_BODY : COL_TEXT, &spoolhard_mont_16);
+    lv_obj_center(l);
+    return b;
+}
+
+// A full-width action button inside the settings container; returns the
+// button (label out-param so callers can update it later).
+static lv_obj_t* devcfg_action_btn(lv_obj_t* parent, const char* text, bool primary,
+                                   int x, int y, int w, devcfg_btn_t action,
+                                   lv_obj_t** lblOut) {
+    lv_obj_t* b = lv_btn_create(parent);
+    lv_obj_set_pos(b, x, y);
+    lv_obj_set_size(b, w, 44);
+    lv_obj_set_style_radius(b, 10, 0);
+    lv_obj_set_style_bg_color(b, primary ? COL_BRAND : COL_CARD, 0);
+    lv_obj_set_style_border_color(b, COL_TEXT_MUTED, 0);
+    lv_obj_set_style_border_width(b, primary ? 0 : 1, 0);
+    lv_obj_add_event_cb(b, [](lv_event_t* e) {
+        devcfg_btn_t a = (devcfg_btn_t)(intptr_t)lv_event_get_user_data(e);
+        if (s_devcfg_action_cb) s_devcfg_action_cb(a);
+    }, LV_EVENT_CLICKED, (void*)(intptr_t)action);
+    lv_obj_t* l = make_label(b, text, primary ? COL_BODY : COL_TEXT, &spoolhard_mont_16);
+    lv_obj_center(l);
+    if (lblOut) *lblOut = l;
+    return b;
+}
+
+static void build_devcfg() {
+    s_devcfg = lv_obj_create(nullptr);
+    style_screen(s_devcfg);
+
+    // Header: title (left), segment buttons (centre), close (right).
+    lv_obj_t* title = make_label(s_devcfg, "Device", COL_BRAND, &spoolhard_mont_22);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 12);
+
+    s_btn_devcfg_tab_set = devcfg_header_btn("Settings", 92, [](lv_event_t*) {
+        lv_lock(); devcfg_select_tab(true); lv_unlock();
+    }, true);
+    lv_obj_align(s_btn_devcfg_tab_set, LV_ALIGN_TOP_MID, -48, 8);
+
+    s_btn_devcfg_tab_info = devcfg_header_btn("Info", 70, [](lv_event_t*) {
+        lv_lock(); devcfg_select_tab(false); lv_unlock();
+    }, false);
+    lv_obj_align(s_btn_devcfg_tab_info, LV_ALIGN_TOP_MID, 52, 8);
+
+    lv_obj_t* closeBtn = devcfg_header_btn(LV_SYMBOL_CLOSE, 48, [](lv_event_t*) {
+        ui_show_home();
+    }, false);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -12, 8);
+
+    // ── Settings container ──────────────────────────────────
+    s_devcfg_set_cont = lv_obj_create(s_devcfg);
+    lv_obj_set_pos(s_devcfg_set_cont, 0, 52);
+    lv_obj_set_size(s_devcfg_set_cont, 480, 268);
+    lv_obj_set_style_bg_opa(s_devcfg_set_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_devcfg_set_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_devcfg_set_cont, 12, 0);
+    lv_obj_clear_flag(s_devcfg_set_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* sleepLbl = make_label(s_devcfg_set_cont, "Sleep after",
+                                    COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_align(sleepLbl, LV_ALIGN_TOP_LEFT, 0, 0);
+    s_lbl_devcfg_sleep_cur = make_label(s_devcfg_set_cont, "",
+                                        COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_align(s_lbl_devcfg_sleep_cur, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+    // Six preset chips in one row across the 456px content width.
+    const int chipW = 72, chipGap = 4;
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t* chip = lv_btn_create(s_devcfg_set_cont);
+        lv_obj_set_size(chip, chipW, 40);
+        lv_obj_set_pos(chip, i * (chipW + chipGap), 22);
+        lv_obj_set_style_radius(chip, 8, 0);
+        lv_obj_set_style_bg_color(chip, COL_CARD, 0);
+        lv_obj_set_style_border_color(chip, COL_BORDER, 0);
+        lv_obj_set_style_border_width(chip, 1, 0);
+        lv_obj_add_event_cb(chip, [](lv_event_t* e) {
+            uint32_t secs = (uint32_t)(intptr_t)lv_event_get_user_data(e);
+            if (s_devcfg_sleep_cb) s_devcfg_sleep_cb(secs);
+        }, LV_EVENT_CLICKED, (void*)(intptr_t)s_devcfg_sleep_presets[i]);
+        lv_obj_t* l = make_label(chip, s_devcfg_sleep_labels[i], COL_TEXT, &spoolhard_mont_14);
+        lv_obj_center(l);
+        s_devcfg_sleep_chip[i] = chip;
+    }
+
+    // OTA status line.
+    s_lbl_devcfg_status = make_label(s_devcfg_set_cont, "",
+                                     COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_align(s_lbl_devcfg_status, LV_ALIGN_TOP_LEFT, 0, 72);
+    lv_obj_set_width(s_lbl_devcfg_status, 456);
+    lv_label_set_long_mode(s_lbl_devcfg_status, LV_LABEL_LONG_DOT);
+
+    // Action buttons. Check (left) + Restart (right) on one row; the two
+    // Apply buttons stack below, hidden until their device has an update.
+    devcfg_action_btn(s_devcfg_set_cont, "Check for updates", false,
+                      0, 96, 224, DEVCFG_BTN_CHECK_UPDATES, &s_lbl_devcfg_check);
+    devcfg_action_btn(s_devcfg_set_cont, "Restart", false,
+                      232, 96, 224, DEVCFG_BTN_RESTART, nullptr);
+    s_btn_devcfg_apply_con = devcfg_action_btn(s_devcfg_set_cont, "Apply update", true,
+                      0, 148, 456, DEVCFG_BTN_APPLY_CONSOLE, &s_lbl_devcfg_apply_con);
+    lv_obj_add_flag(s_btn_devcfg_apply_con, LV_OBJ_FLAG_HIDDEN);
+    s_btn_devcfg_apply_scl = devcfg_action_btn(s_devcfg_set_cont, "Apply scale update", true,
+                      0, 200, 456, DEVCFG_BTN_APPLY_SCALE, &s_lbl_devcfg_apply_scl);
+    lv_obj_add_flag(s_btn_devcfg_apply_scl, LV_OBJ_FLAG_HIDDEN);
+
+    // ── Info container ──────────────────────────────────────
+    s_devcfg_info_cont = lv_obj_create(s_devcfg);
+    lv_obj_set_pos(s_devcfg_info_cont, 0, 52);
+    lv_obj_set_size(s_devcfg_info_cont, 480, 268);
+    lv_obj_set_style_bg_opa(s_devcfg_info_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_devcfg_info_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_devcfg_info_cont, 12, 0);
+    lv_obj_clear_flag(s_devcfg_info_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    struct { const char* key; lv_obj_t** val; } rows[] = {
+        {"Host",     &s_lbl_devcfg_host},
+        {"IP",       &s_lbl_devcfg_ip},
+        {"Firmware", &s_lbl_devcfg_fw},
+        {"Frontend", &s_lbl_devcfg_fe},
+        {"Free heap",&s_lbl_devcfg_heap},
+        {"Scale",    &s_lbl_devcfg_scale},
+    };
+    for (int i = 0; i < (int)(sizeof(rows)/sizeof(rows[0])); i++) {
+        int y = i * 34;
+        lv_obj_t* k = make_label(s_devcfg_info_cont, rows[i].key,
+                                 COL_TEXT_MUTED, &spoolhard_mont_16);
+        lv_obj_align(k, LV_ALIGN_TOP_LEFT, 0, y);
+        lv_obj_t* v = make_label(s_devcfg_info_cont, "—", COL_TEXT, &spoolhard_mont_16);
+        lv_obj_align(v, LV_ALIGN_TOP_LEFT, 140, y);
+        lv_obj_set_width(v, 304);
+        lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
+        *rows[i].val = v;
+    }
+
+    devcfg_select_tab(true);   // default to Settings
 }
 
 // Full slot-detail screen — reached by tapping a tile on the home AMS
@@ -1053,6 +1350,8 @@ void ui_init() {
     build_onboarding();
     build_home();
     build_ota();
+    build_confirm();
+    build_devcfg();
     build_spool();
     build_weight_confirm();
     build_slot_detail();
@@ -1066,6 +1365,132 @@ void ui_init() {
 void ui_show_splash()     { lv_lock(); lv_screen_load(s_splash);   lv_unlock(); }
 void ui_show_onboarding() { lv_lock(); lv_screen_load(s_onboard);  lv_unlock(); }
 void ui_show_home()       { lv_lock(); lv_screen_load(s_home);     lv_unlock(); }
+
+void ui_show_confirm(const char* title, const char* body,
+                     const char* confirmLabel, ui_confirm_cb_t onConfirm) {
+    lv_lock();
+    s_confirm_prev = lv_screen_active();
+    s_confirm_cb   = onConfirm;
+    lv_label_set_text(s_lbl_confirm_title, title ? title : "Are you sure?");
+    lv_label_set_text(s_lbl_confirm_body,  body  ? body  : "");
+    lv_label_set_text(s_lbl_confirm_ok,    confirmLabel ? confirmLabel : "Confirm");
+    lv_screen_load(s_confirm);
+    lv_unlock();
+}
+
+// ── Device config screen public API ─────────────────────────
+
+void ui_set_devcfg_action_callback(devcfg_action_cb_t cb) { s_devcfg_action_cb = cb; }
+void ui_set_devcfg_sleep_callback (devcfg_sleep_cb_t  cb) { s_devcfg_sleep_cb  = cb; }
+void ui_set_devcfg_open_callback  (ui_devcfg_open_cb_t cb) { s_devcfg_open_cb   = cb; }
+
+void ui_show_device_config(const char* hostname, const char* ip,
+                           const char* fw_version, const char* fe_version,
+                           bool startOnInfo) {
+    lv_lock();
+    lv_label_set_text(s_lbl_devcfg_host, hostname && *hostname ? hostname : "—");
+    lv_label_set_text(s_lbl_devcfg_ip,   ip       && *ip       ? ip       : "—");
+    lv_label_set_text(s_lbl_devcfg_fw,   fw_version ? fw_version : "—");
+    lv_label_set_text(s_lbl_devcfg_fe,   fe_version ? fe_version : "—");
+    devcfg_select_tab(!startOnInfo);
+    lv_screen_load(s_devcfg);
+    lv_unlock();
+}
+
+bool ui_devcfg_visible() {
+    return lv_screen_active() == s_devcfg;
+}
+
+void ui_set_devcfg_live(const UiDevcfgLive& live) {
+    if (!s_devcfg) return;
+    lv_lock();
+
+    // Sleep-preset highlight: brand-fill the chip whose value matches the
+    // current applied timeout; show "Current: N s" when none matches (a
+    // value set via the web's custom field that has no chip).
+    bool matched = false;
+    for (int i = 0; i < 6; i++) {
+        bool on = (s_devcfg_sleep_presets[i] == live.sleep_timeout_s);
+        if (on) matched = true;
+        lv_obj_set_style_bg_color(s_devcfg_sleep_chip[i], on ? COL_BRAND : COL_CARD, 0);
+        lv_obj_t* l = lv_obj_get_child(s_devcfg_sleep_chip[i], 0);
+        if (l) lv_obj_set_style_text_color(l, on ? COL_BODY : COL_TEXT, 0);
+    }
+    if (matched) {
+        lv_label_set_text(s_lbl_devcfg_sleep_cur, "");
+    } else {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "Current: %u s", (unsigned)live.sleep_timeout_s);
+        lv_label_set_text(s_lbl_devcfg_sleep_cur, buf);
+    }
+
+    // Check button label reflects in-flight state.
+    if (s_lbl_devcfg_check)
+        lv_label_set_text(s_lbl_devcfg_check,
+                          live.ota_checking ? "Checking…" : "Check for updates");
+
+    // OTA status line.
+    if (live.ota_checking) {
+        lv_label_set_text(s_lbl_devcfg_status, "Checking for updates…");
+    } else if (live.console_update || live.scale_update) {
+        lv_label_set_text(s_lbl_devcfg_status, "Update available");
+    } else if (live.check_status && strcmp(live.check_status, "ok") == 0) {
+        if (live.check_age_s < 0) {
+            lv_label_set_text(s_lbl_devcfg_status, "Up to date");
+        } else if (live.check_age_s < 60) {
+            lv_label_set_text(s_lbl_devcfg_status,
+                              "Up to date  " LV_SYMBOL_BULLET "  checked just now");
+        } else {
+            char buf[56];
+            snprintf(buf, sizeof(buf),
+                     "Up to date  " LV_SYMBOL_BULLET "  checked %d min ago",
+                     live.check_age_s / 60);
+            lv_label_set_text(s_lbl_devcfg_status, buf);
+        }
+    } else if (live.check_status && *live.check_status) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Check failed: %s", live.check_status);
+        lv_label_set_text(s_lbl_devcfg_status, buf);
+    } else {
+        lv_label_set_text(s_lbl_devcfg_status, "");
+    }
+
+    // Conditional Apply buttons.
+    if (live.console_update) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "Apply update %s",
+                 live.console_latest && *live.console_latest ? live.console_latest : "");
+        lv_label_set_text(s_lbl_devcfg_apply_con, buf);
+        lv_obj_clear_flag(s_btn_devcfg_apply_con, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_btn_devcfg_apply_con, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (live.scale_update) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Apply scale update %s",
+                 live.scale_latest && *live.scale_latest ? live.scale_latest : "");
+        lv_label_set_text(s_lbl_devcfg_apply_scl, buf);
+        lv_obj_clear_flag(s_btn_devcfg_apply_scl, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_btn_devcfg_apply_scl, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Info-tab live fields.
+    char hbuf[24];
+    snprintf(hbuf, sizeof(hbuf), "%u K", (unsigned)(live.free_heap_b / 1024));
+    lv_label_set_text(s_lbl_devcfg_heap, hbuf);
+    if (live.scale_linked) {
+        char sbuf[48];
+        snprintf(sbuf, sizeof(sbuf), "Linked%s%s",
+                 live.scale_version && *live.scale_version ? "  " LV_SYMBOL_BULLET "  v" : "",
+                 live.scale_version && *live.scale_version ? live.scale_version : "");
+        lv_label_set_text(s_lbl_devcfg_scale, sbuf);
+    } else {
+        lv_label_set_text(s_lbl_devcfg_scale, "Not linked");
+    }
+
+    lv_unlock();
+}
 
 void ui_set_ota_banner(bool show, const char* text) {
     if (!s_ota_banner) return;  // build_home hasn't run yet (boot race)

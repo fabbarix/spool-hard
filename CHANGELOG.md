@@ -8,6 +8,43 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.12.6] - 2026-05-29
+
+Console: on-device config screen on the LCD.
+
+- feat(lcd): new Device screen reached by tapping the home
+  footer strip (gear glyph hints tappability). Two tabs
+  toggled by a header segment control:
+  - **Settings**: display sleep-timeout presets (Never / 30s /
+    1m / 2m / 5m / 15m, with a "Current: N s" readout for a
+    web-set custom value); "Check for updates" (kicks both the
+    console and the paired scale); a push-driven status line
+    (Checking… / Update available / Up to date / Check
+    failed); conditional "Apply update" (console) and "Apply
+    scale update" buttons that appear only when that device
+    has a pending update; and "Restart". Apply + Restart go
+    through a confirm dialog.
+  - **Info**: read-only host / IP / firmware / frontend / free
+    heap / scale link + version.
+- feat(lcd): reusable `ui_show_confirm()` full-screen confirm
+  (captures + restores the prior screen on cancel).
+- feat(lcd): applying a scale update from the console mirrors
+  the scale's self-flash progress onto the shared OTA screen
+  and routes back to the Info tab once the scale reconnects on
+  the new version.
+- refactor(display): `setAndPersistSleepTimeout()` shared by
+  the web `/api/display-config` handler and the LCD so the
+  clamp + NVS keys can't drift; a new `state.display_config`
+  WS broadcast keeps an open web client in sync when the value
+  is changed on the device (and vice versa).
+- fix(dashboard): suppress the "Link to filament" affordance
+  while the user-filaments + stock-filaments queries are still
+  in flight. On dashboard reload the printer state is push-
+  cached and renders immediately, but the library queries fire
+  a tick later — populated slots briefly read as "unmatched"
+  before the libraries arrive, causing the link prompt to
+  flash. Now gated on a `librariesReady` flag.
+
 ## [0.12.3] - 2026-05-26
 
 Console: link spools and AMS slots to Bambu's slicer presets

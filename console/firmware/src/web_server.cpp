@@ -346,6 +346,13 @@ void ConsoleWebServer::pushOtaStatus() {
     broadcastState("ota", doc);
 }
 
+void ConsoleWebServer::pushDisplayConfig() {
+    if (_ws.count() == 0) return;
+    JsonDocument doc;
+    doc["sleep_timeout_s"] = (uint32_t)ConsoleDisplay::sleepTimeout();
+    broadcastState("display_config", doc);
+}
+
 void ConsoleWebServer::pushDiscoveryPrinters() {
     if (_ws.count() == 0) return;
     // Push helper's local doc — route through the PSRAM allocator so
@@ -3434,15 +3441,14 @@ void ConsoleWebServer::_handleDisplayConfigPost(AsyncWebServerRequest* req, uint
         return;
     }
     uint32_t s = doc["sleep_timeout_s"].as<uint32_t>();
-    // Clamp to a sensible upper bound — more than an hour of idle makes the
-    // feature useless and would mask a forgotten "never sleep" setting.
-    if (s > 3600) s = 3600;
+    // Clamp + NVS-write + apply all happen in the shared helper so the
+    // on-device config screen and this handler can't drift.
+    ConsoleDisplay::setAndPersistSleepTimeout(s);
+    s = ConsoleDisplay::sleepTimeout();   // read back the clamped value
 
-    Preferences p;
-    p.begin(NVS_NS_DISPLAY, false);
-    p.putUInt(NVS_KEY_DISP_SLEEP_S, s);
-    p.end();
-    ConsoleDisplay::setSleepTimeout(s);   // applies immediately + wakes screen
+    // Push the new value so any other open client (and a future LCD config
+    // screen) reflects the change without a manual refetch.
+    pushDisplayConfig();
 
     JsonDocument resp;
     resp["ok"] = true;

@@ -10,6 +10,15 @@ void ui_init();
 void ui_show_splash();
 void ui_show_onboarding();
 void ui_show_home();
+
+// Reusable full-screen "Are you sure?" confirm. Captures whatever screen
+// is active when called and restores it on Cancel. Confirm runs `onConfirm`,
+// which owns its own post-confirm navigation (reboot, OTA progress screen,
+// …); if it returns without navigating away, the captured screen is
+// restored. Used by the device-config screen for restart + apply-update.
+typedef void (*ui_confirm_cb_t)(void);
+void ui_show_confirm(const char* title, const char* body,
+                     const char* confirmLabel, ui_confirm_cb_t onConfirm);
 // Drive the on-device "Updating ..." screen. `title` is the bold heading
 // (e.g. "Updating Firmware" / "Updating Frontend"), `version` the smaller
 // label below it (filename until the version marker is parsed, then
@@ -331,3 +340,60 @@ void ui_set_calibration_capture_callback(ui_calibration_capture_cb_t cb);
 // arrive while step 2 was already visible.
 typedef void (*ui_calibration_step_enter_cb_t)(void);
 void ui_set_calibration_capture_enter_callback(ui_calibration_step_enter_cb_t cb);
+
+// ── Device config screen (Settings / Info tabs) ────────────────
+// Reached by tapping the home footer strip. Two tabs toggled by header
+// buttons: Settings (sleep-timeout presets + update/restart actions) and
+// Info (read-only device status). Tap-only — no text entry.
+
+// Settings-tab action buttons. Sleep presets carry their value via the
+// dedicated sleep callback, so they're not in this enum.
+typedef enum {
+    DEVCFG_BTN_CHECK_UPDATES = 1,   // check BOTH console + paired scale
+    DEVCFG_BTN_APPLY_CONSOLE = 2,   // apply console update (→ confirm → OTA)
+    DEVCFG_BTN_APPLY_SCALE   = 3,   // apply scale update   (→ confirm → OTA)
+    DEVCFG_BTN_RESTART       = 4,   // restart console      (→ confirm)
+} devcfg_btn_t;
+typedef void (*devcfg_action_cb_t)(devcfg_btn_t action);
+void ui_set_devcfg_action_callback(devcfg_action_cb_t cb);
+
+// Fired when a sleep-timeout preset chip is tapped. `seconds` is the
+// preset (0 = never). main.cpp calls
+// ConsoleDisplay::setAndPersistSleepTimeout(seconds) + pushDisplayConfig().
+typedef void (*devcfg_sleep_cb_t)(uint32_t seconds);
+void ui_set_devcfg_sleep_callback(devcfg_sleep_cb_t cb);
+
+// Fired when the user taps the home footer strip. main.cpp responds by
+// gathering the current identity and calling ui_show_device_config(...).
+typedef void (*ui_devcfg_open_cb_t)(void);
+void ui_set_devcfg_open_callback(ui_devcfg_open_cb_t cb);
+
+// Open the screen. Static identity fields (stable while open) are passed
+// once here; live fields arrive via ui_set_devcfg_live(). `startOnInfo`
+// opens directly on the Info tab (used when routing back after a scale
+// update completes so the user sees the new scale version); false opens
+// on Settings.
+void ui_show_device_config(const char* hostname, const char* ip,
+                           const char* fw_version, const char* fe_version,
+                           bool startOnInfo);
+// True while the device-config screen is the active LVGL screen — main.cpp
+// gates the ~1 Hz live push behind it.
+bool ui_devcfg_visible();
+
+// Live state pushed ~1 Hz from main.cpp's loop while ui_devcfg_visible().
+// Drives the sleep-preset highlight, heap/scale Info rows, the OTA status
+// line, and the conditional Apply buttons.
+struct UiDevcfgLive {
+    uint32_t    free_heap_b;        // ESP.getFreeHeap()
+    bool        scale_linked;
+    const char* scale_version;      // "" when unknown / not linked
+    uint32_t    sleep_timeout_s;    // current applied value (chip highlight)
+    bool        ota_checking;       // checkInFlight on console or scale
+    bool        console_update;     // console firmware/frontend pending
+    const char* console_latest;     // version string for the Apply button
+    bool        scale_update;       // scale pending AND scale linked
+    const char* scale_latest;
+    const char* check_status;       // "" | "ok" | "network" | "http_error" | "parse_error"
+    int         check_age_s;        // seconds since last check, -1 = never
+};
+void ui_set_devcfg_live(const UiDevcfgLive& live);

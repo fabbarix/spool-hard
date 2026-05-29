@@ -28,6 +28,7 @@ const STATE_TO_QUERY: Record<string, readonly unknown[]> = {
   'state.wifi_status':         ['wifi-status'],
   'state.discovery_printers':  ['discovery-printers'],
   'state.discovery_scales':    ['discovery-scales'],
+  'state.display_config':      ['display-config'],
   'state.filaments_info':      ['filaments-db-info'],
   'state.cloud_public_cache':  ['bambu-cloud-public-cache'],
 };

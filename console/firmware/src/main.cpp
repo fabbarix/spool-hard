@@ -46,6 +46,12 @@ StockFilamentsStore      g_stock_filaments;  // extern-visible for web_server + 
 
 static bool    g_pendingOta = false;
 static bool    g_showedHome = false;
+// Armed when the user taps "Apply scale update" on the device-config
+// screen. While set, loop() mirrors the scale's self-flash progress onto
+// the s_ota screen and, once the scale reconnects on the new version,
+// routes back to device-config's Info tab. The console-side apply path
+// reuses g_pendingOta (the console just reboots, so it needs no routing).
+static bool    g_scaleOtaActive = false;
 
 // Spool-detail screen state. Set when a known tag is scanned on either the
 // on-device PN532 or via the scale. Used by:
@@ -354,6 +360,60 @@ void setup() {
     });
     g_web.onOtaRequested([]() { g_pendingOta = true; });
     ui_set_ota_banner_callback(_onOtaBannerTap);
+
+    // ── Device-config screen (tap home footer) ───────────────
+    // Open: gather current identity and hand it to the screen (opens on
+    // Settings). Live fields are pushed ~1 Hz from loop() while visible.
+    ui_set_devcfg_open_callback([]() {
+        String host = g_wifi.getDeviceName();
+        host.toLowerCase(); host.replace(' ', '-');
+        if (host.length()) host += ".local";
+        String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString()
+                                                     : String("—");
+        ui_show_device_config(host.c_str(), ip.c_str(), FW_VERSION, FE_VERSION,
+                              /*startOnInfo=*/false);
+    });
+
+    // Sleep-preset tap → shared persist helper + push so an open web client
+    // reflects it too.
+    ui_set_devcfg_sleep_callback([](uint32_t seconds) {
+        ConsoleDisplay::setAndPersistSleepTimeout(seconds);
+        g_web.pushDisplayConfig();
+    });
+
+    // Settings-tab actions. Check kicks BOTH devices; the two apply paths
+    // route through ui_show_confirm; restart confirms then reboots.
+    ui_set_devcfg_action_callback([](devcfg_btn_t action) {
+        switch (action) {
+            case DEVCFG_BTN_CHECK_UPDATES:
+                g_ota_checker.kickNow();
+                if (g_scale.isConnected()) g_scale.requestScaleOtaCheck();
+                break;
+            case DEVCFG_BTN_APPLY_CONSOLE: {
+                auto cp = g_ota_checker.pending();
+                String body = "Flash console to " + cp.firmware_latest +
+                              " and restart?";
+                ui_show_confirm("Update console", body.c_str(), "Update", []() {
+                    g_pendingOta = true;   // loop() runs the console OTA → reboot
+                });
+                break;
+            }
+            case DEVCFG_BTN_APPLY_SCALE: {
+                const auto& sp = g_scale.scaleOtaPending();
+                String body = "Flash scale to " + sp.firmware_latest +
+                              "? The scale will restart.";
+                ui_show_confirm("Update scale", body.c_str(), "Update", []() {
+                    g_scale.requestScaleOtaUpdate();
+                    g_scaleOtaActive = true;   // arm progress mirror + routing
+                });
+                break;
+            }
+            case DEVCFG_BTN_RESTART:
+                ui_show_confirm("Restart", "Restart the console now?",
+                                "Restart", []() { delay(200); ESP.restart(); });
+                break;
+        }
+    });
 
     // After the new-spool wizard saves a record, mirror the existing-tag
     // rescan flow: open the spool-detail screen + arm PendingAms so the
@@ -1238,6 +1298,30 @@ void loop() {
         LAT_STEP("home_foot", _refreshHomeFooter());
         LAT_STEP("ota_banner", _refreshOtaBanner());
 
+        // Device-config live push — only while the screen is up. Sources
+        // every field from its owning module (OTA checker, scale link)
+        // so ui.cpp stays presentation-only.
+        if (ui_devcfg_visible()) {
+            auto cp = g_ota_checker.pending();
+            const auto& sp = g_scale.scaleOtaPending();
+            bool scaleLinked  = g_scale.isConnected();
+            uint32_t ts = g_ota_checker.lastCheckTs();
+            UiDevcfgLive live{};
+            live.free_heap_b     = ESP.getFreeHeap();
+            live.scale_linked    = scaleLinked;
+            live.scale_version   = g_scale.scaleFirmwareVersion().c_str();
+            live.sleep_timeout_s = ConsoleDisplay::sleepTimeout();
+            live.ota_checking    = g_ota_checker.checkInFlight();
+            live.console_update  = cp.firmware || cp.frontend;
+            live.console_latest  = cp.firmware_latest.c_str();
+            live.scale_update    = scaleLinked && sp.valid &&
+                                   (sp.firmware_update || sp.frontend_update);
+            live.scale_latest    = sp.firmware_latest.c_str();
+            live.check_status    = g_ota_checker.lastStatus().c_str();
+            live.check_age_s     = (ts == 0) ? -1 : (int)(time(nullptr) - ts);
+            ui_set_devcfg_live(live);
+        }
+
         // Push the slow-changing infra resources. Each push helper is
         // rate-gated inside broadcastState (5–30 s gates) so a 1 Hz
         // call here yields the right effective cadence per resource:
@@ -1333,6 +1417,50 @@ void loop() {
     if (!g_showedHome && g_wifi.getState() == WifiState::Connected) {
         ui_show_home();
         g_showedHome = true;
+    }
+
+    // Scale-OTA progress mirror + completion routing — armed by the LCD
+    // "Apply scale update" confirm. The scale flashes itself and pushes
+    // percent frames over the link until it reboots; mirror those onto the
+    // shared s_ota screen, then route back to device-config's Info tab once
+    // the scale reconnects on the new version. Bounded by an overall
+    // timeout so a scale that never starts / never returns can't strand us.
+    if (g_scaleOtaActive) {
+        static bool     s_scaleSawProgress = false;
+        static int      s_lastScalePct     = -1;
+        static uint32_t s_scaleArmedAt     = 0;
+        if (s_scaleArmedAt == 0) s_scaleArmedAt = millis();
+        const auto& sf = g_scale.scaleOtaInFlight();
+        bool timedOut = (millis() - s_scaleArmedAt) > 180000;
+        auto disarm = [&]() {
+            g_scaleOtaActive = false; s_scaleSawProgress = false;
+            s_lastScalePct = -1; s_scaleArmedAt = 0;
+        };
+        if (sf.valid && !timedOut) {
+            s_scaleSawProgress = true;
+            if (sf.percent != s_lastScalePct) {
+                s_lastScalePct = sf.percent;
+                ConsoleDisplay::wake();
+                ui_show_ota_progress(sf.percent, "Updating scale",
+                                     sf.kind.length() ? sf.kind.c_str() : "");
+            }
+        } else if (s_scaleSawProgress && g_scale.isConnected()) {
+            // Flashed → rebooted → reconnected. Land on Info to show the
+            // bumped scale version.
+            disarm();
+            String host = g_wifi.getDeviceName();
+            host.toLowerCase(); host.replace(' ', '-');
+            if (host.length()) host += ".local";
+            String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString()
+                                                         : String("—");
+            ui_show_device_config(host.c_str(), ip.c_str(), FW_VERSION, FE_VERSION,
+                                  /*startOnInfo=*/true);
+        } else if (timedOut) {
+            // Never started, or the scale didn't come back in time — bail to
+            // home rather than leave a stale progress screen up.
+            disarm();
+            ui_show_home();
+        }
     }
 
     // Pending OTA triggered via web API.

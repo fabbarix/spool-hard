@@ -20,6 +20,12 @@ public:
     static void     setSleepTimeout(uint32_t seconds);
     static uint32_t sleepTimeout();       // current setting, seconds
 
+    // Clamp to [0, 3600], persist to NVS, and apply immediately. The single
+    // source of truth shared by the web `/api/display-config` POST handler
+    // and the on-device config screen, so the clamp bound + NVS keys can't
+    // drift between the two write paths.
+    static void setAndPersistSleepTimeout(uint32_t seconds);
+
     // Force the screen back on and reset the idle counter. Useful when the
     // firmware itself wants to surface something to the user (OTA progress,
     // error screen, etc.) AND it represents a bounded event the user should

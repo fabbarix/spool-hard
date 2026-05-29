@@ -52,6 +52,13 @@ export function PrintersPanel() {
     stockFilaments?.entries?.forEach((e) => { if (e.filament_id) s.add(e.filament_id); });
     return s;
   }, [stockFilaments?.entries]);
+  // Both lookups resolved (success OR an explicit empty result). Until
+  // this lands, AmsSlotCard suppresses the "Link to filament" affordance
+  // — otherwise on dashboard reload, react-query has cached printer state
+  // ready to render but hasn't completed the filament-DB fetches yet, so
+  // every populated slot briefly reads as "unmatched" before the
+  // libraries arrive and the prompts hide.
+  const librariesReady = userFilaments !== undefined && stockFilaments !== undefined;
 
   if (!printers || printers.length === 0) {
     return (
@@ -73,6 +80,7 @@ export function PrintersPanel() {
             spoolById={spoolById}
             filamentByFilamentId={filamentByFilamentId}
             stockFilamentIds={stockFilamentIds}
+            librariesReady={librariesReady}
           />
         ))}
       </div>
@@ -80,11 +88,12 @@ export function PrintersPanel() {
   );
 }
 
-function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds }: {
+function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds, librariesReady }: {
   p: Printer;
   spoolById: Map<string, SpoolRecord>;
   filamentByFilamentId: Map<string, UserFilament>;
   stockFilamentIds: Set<string>;
+  librariesReady: boolean;
 }) {
   const s = p.state;
   const linkStatus: 'connected' | 'connecting' | 'disconnected' =
@@ -148,6 +157,7 @@ function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds }: {
                   spoolById={spoolById}
                   filamentByFilamentId={filamentByFilamentId}
                   stockFilamentIds={stockFilamentIds}
+                  librariesReady={librariesReady}
                 />
               ))}
               {s.vt_tray && (
@@ -160,6 +170,7 @@ function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds }: {
                     spool={s.vt_tray.spool_id ? spoolById.get(s.vt_tray.spool_id) : undefined}
                     filamentByFilamentId={filamentByFilamentId}
                     stockFilamentIds={stockFilamentIds}
+                    librariesReady={librariesReady}
                     label="External"
                     external
                   />
@@ -176,7 +187,7 @@ function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds }: {
   );
 }
 
-function AmsUnitBlock({ u, unitNumber, activeTray, serial, spoolById, filamentByFilamentId, stockFilamentIds }: {
+function AmsUnitBlock({ u, unitNumber, activeTray, serial, spoolById, filamentByFilamentId, stockFilamentIds, librariesReady }: {
   u: AmsUnit;
   unitNumber: number;
   activeTray: number | undefined;
@@ -184,6 +195,7 @@ function AmsUnitBlock({ u, unitNumber, activeTray, serial, spoolById, filamentBy
   spoolById: Map<string, SpoolRecord>;
   filamentByFilamentId: Map<string, UserFilament>;
   stockFilamentIds: Set<string>;
+  librariesReady: boolean;
 }) {
   return (
     <div>
@@ -199,6 +211,7 @@ function AmsUnitBlock({ u, unitNumber, activeTray, serial, spoolById, filamentBy
             spool={t.spool_id ? spoolById.get(t.spool_id) : undefined}
             filamentByFilamentId={filamentByFilamentId}
             stockFilamentIds={stockFilamentIds}
+            librariesReady={librariesReady}
             label={`AMS ${unitNumber}·${t.id + 1}`}
           />
         ))}
@@ -298,7 +311,7 @@ function DryingChip({ d }: { d: NonNullable<AmsUnit['drying']> }) {
   );
 }
 
-function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, stockFilamentIds, label, external }: {
+function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, stockFilamentIds, librariesReady, label, external }: {
   t: AmsTray;
   active: boolean;
   serial: string;
@@ -306,6 +319,7 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
   spool: SpoolRecord | undefined;
   filamentByFilamentId: Map<string, UserFilament>;
   stockFilamentIds: Set<string>;
+  librariesReady: boolean;
   label: string;
   external?: boolean;
 }) {
@@ -319,7 +333,13 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
   // user-filament row's filament_id to this slot's value, so subsequent
   // pushes for spools linked to that filament ship the right
   // tray_info_idx on first AMS load.
+  //
+  // `librariesReady` gates the whole check — on dashboard reload the
+  // printer state lands first (push-cached), the library queries fire a
+  // tick later, and we'd otherwise flash the affordance on every
+  // populated slot before the libraries hide it again.
   const unmatchedPreset =
+    librariesReady &&
     !!t.tray_info_idx &&
     t.tray_info_idx !== '0' &&
     !filamentByFilamentId.has(t.tray_info_idx) &&
