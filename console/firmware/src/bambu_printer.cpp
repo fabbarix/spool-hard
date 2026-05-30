@@ -2006,7 +2006,30 @@ static void _analyseTaskTrampoline(void* arg) {
     vTaskDelete(nullptr);
 }
 
+// Minimum free INTERNAL DRAM required before launching gcode analysis.
+// The analyzer's own big buffers are PSRAM-backed, but the analysis runs
+// FTPS (TLS control + data channels) concurrently with the live MQTT-TLS
+// link and WS pushes — and lwIP pbufs, mbedtls per-record working memory,
+// and transient Strings all need internal DRAM. Mid-print that working set
+// has been observed driving free internal DRAM to ~5 KB and OOM-panicking
+// (which then triggers a boot rollback). Gating here turns that crash into
+// a deferral: the existing 30 s retry loop picks it up once DRAM recovers.
+// Idle free internal is ~50 KB; 38 KB leaves room for the analysis working
+// set without firing on normal fluctuation.
+static constexpr size_t ANALYSIS_MIN_FREE_INTERNAL = 38 * 1024;
+
 bool BambuPrinter::startAnalyseTask(const String& path) {
+    size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (freeInternal < ANALYSIS_MIN_FREE_INTERNAL) {
+        // Defer rather than risk an OOM-panic. Arm the retry directly so the
+        // RUNNING-edge auto-trigger (which doesn't re-arm on its own) still
+        // gets picked up by _maybeRetryAnalysis once memory frees up.
+        _analysisNextRetryAt = millis() + 30000;
+        dlog("Bambu", "%s analysis deferred — free internal DRAM %u < %u, retry in 30s",
+             _cfg.serial.c_str(), (unsigned)freeInternal,
+             (unsigned)ANALYSIS_MIN_FREE_INTERNAL);
+        return false;
+    }
     auto* ctx = new AnalyseTaskCtx{this, path};
     bool ok = spawnPSRAMFallbackTask(_analyseTaskTrampoline, ctx, "ana",
                                      /*core*/0, /*priority*/1, s_analyseSlot);

@@ -1,10 +1,13 @@
 #include "spoolhard/ws_buffer_pool.h"
+#include <esp_heap_caps.h>
+#include <soc/soc_memory_types.h>   // esp_ptr_external_ram
 
 WsBufferPool g_wsBufPool;
 
 void WsBufferPool::begin(size_t count, size_t initial_capacity) {
     if (_mtx) return;   // idempotent
     _mtx = xSemaphoreCreateMutex();
+    _initialCap = initial_capacity;
     _slots.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         auto buf = std::make_shared<std::vector<uint8_t>>();
@@ -43,6 +46,36 @@ size_t WsBufferPool::freeSlots() {
     if (xSemaphoreTake(_mtx, pdMS_TO_TICKS(20)) != pdTRUE) return 0;
     size_t n = 0;
     for (auto& s : _slots) if (s.use_count() == 1) ++n;
+    xSemaphoreGive(_mtx);
+    return n;
+}
+
+size_t WsBufferPool::maxCapacity() {
+    if (!_mtx) return 0;
+    if (xSemaphoreTake(_mtx, pdMS_TO_TICKS(20)) != pdTRUE) return 0;
+    size_t m = 0;
+    for (auto& s : _slots) if (s && s->capacity() > m) m = s->capacity();
+    xSemaphoreGive(_mtx);
+    return m;
+}
+
+size_t WsBufferPool::grownSlots() {
+    if (!_mtx) return 0;
+    if (xSemaphoreTake(_mtx, pdMS_TO_TICKS(20)) != pdTRUE) return 0;
+    size_t n = 0;
+    for (auto& s : _slots) if (s && s->capacity() > _initialCap) ++n;
+    xSemaphoreGive(_mtx);
+    return n;
+}
+
+size_t WsBufferPool::psramSlots() {
+    if (!_mtx) return 0;
+    if (xSemaphoreTake(_mtx, pdMS_TO_TICKS(20)) != pdTRUE) return 0;
+    size_t n = 0;
+    // data() on a reserved-but-empty vector still points at the backing
+    // allocation, so this is valid even before any frame is serialized in.
+    for (auto& s : _slots)
+        if (s && s->capacity() > 0 && esp_ptr_external_ram(s->data())) ++n;
     xSemaphoreGive(_mtx);
     return n;
 }

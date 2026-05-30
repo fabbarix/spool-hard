@@ -8,6 +8,36 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.12.7] - 2026-05-30
+
+Console: stop mid-print OOM rollbacks; instrument the heap.
+
+Internal DRAM (not PSRAM) is the device's scarce heap — it idles ~51 KB
+and was observed dropping to ~5 KB during gcode analysis on a running
+print, OOM-panicking and triggering a boot rollback (which is why
+several OTAs earlier "didn't take"). PSRAM sits ~98% free.
+
+The fix is the analysis gate. The instrumentation added here disproved
+the original hypothesis that the WS broadcast pool (8×8 KB) and MQTT
+buffer (32 KB) were eating internal DRAM: `ws_pool_psram` reports 8/8
+slots already in PSRAM, and shrinking the MQTT buffer left idle
+internal free_heap unchanged — both are >4 KB so CONFIG_SPIRAM_USE_MALLOC
+already places them in PSRAM. The real pressure is the flood of sub-4 KB
+internal allocations during analysis (lwIP pbufs, mbedtls records, FTPS
+working set), which the gate sidesteps.
+
+- fix(bambu): pre-flight internal-DRAM gate on gcode analysis. If free
+  internal DRAM is below 38 KB when a print starts, defer the analysis
+  and let the existing 30 s retry pick it up once memory recovers,
+  instead of launching the FTPS+MQTT+WS working set into an OOM-panic.
+  Converts the crash into a graceful retry. (This is the load-bearing
+  change.)
+- feat(ws-pool): high-water + placement instrumentation in
+  /api/firmware-info (`ws_pool_max_cap`, `ws_pool_grown`,
+  `ws_pool_psram`). `max_cap` 8192 / `grown` 0 confirms broadcast
+  frames never exceed the 8 KB reserve, and `ws_pool_psram` 8/8
+  confirms the pool already lives in PSRAM.
+
 ## [0.12.6] - 2026-05-29
 
 Console: on-device config screen on the LCD.

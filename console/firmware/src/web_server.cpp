@@ -1610,6 +1610,10 @@ static void serializeFirmwareInfo(JsonDocument& doc) {
     // dropped silently when free hits 0.
     doc["ws_pool_total"]    = (uint32_t)g_wsBufPool.totalSlots();
     doc["ws_pool_free"]     = (uint32_t)g_wsBufPool.freeSlots();
+    // High-water + placement instrumentation (lever C / D4 verification).
+    doc["ws_pool_max_cap"]  = (uint32_t)g_wsBufPool.maxCapacity();
+    doc["ws_pool_grown"]    = (uint32_t)g_wsBufPool.grownSlots();
+    doc["ws_pool_psram"]    = (uint32_t)g_wsBufPool.psramSlots();
     doc["sd_mounted"]   = g_sd.isMounted();
     doc["sd_total"]     = (double)g_sd.totalBytes();
     doc["sd_used"]      = (double)g_sd.usedBytes();

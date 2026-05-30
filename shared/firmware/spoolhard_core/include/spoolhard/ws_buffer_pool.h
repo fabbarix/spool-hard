@@ -52,10 +52,24 @@ public:
     size_t totalSlots() const { return _slots.size(); }
     size_t freeSlots();
 
+    // High-water instrumentation (lever C). Vectors only ever grow, so a
+    // slot's current capacity() is the largest frame it has ever held —
+    // scanning all slots tells us the real max frame size and how many
+    // slots ever had to grow past `initial_capacity`. That's the data
+    // needed to right-size the pool (cut initial_capacity / slot count)
+    // without guessing. `psramSlots` reports how many slots' backing
+    // store currently lives in PSRAM — ground-truth for whether the
+    // operator-new override (lever D4) actually moved these buffers off
+    // internal DRAM. Computed on demand under the mutex (few slots, cheap).
+    size_t maxCapacity();    // largest capacity() across all slots, bytes
+    size_t grownSlots();     // slots whose capacity() exceeds initial_capacity
+    size_t psramSlots();     // slots whose backing store is in external RAM
+
 private:
     std::vector<AsyncWebSocketSharedBuffer> _slots;
     SemaphoreHandle_t _mtx = nullptr;
     size_t _next = 0;
+    size_t _initialCap = 0;
 };
 
 extern WsBufferPool g_wsBufPool;
