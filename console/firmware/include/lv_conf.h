@@ -22,11 +22,15 @@
 /*=========================
  * Memory settings
  *=========================*/
-/* Let LVGL allocate from PSRAM via a custom allocator registered at boot. */
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CLIB
+/* Route the LVGL widget/style heap to PSRAM. CUSTOM selects the
+ * lv_*_core implementations in src/lvgl_psram_mem.cpp (PSRAM-preferred
+ * heap_caps allocs with internal-DRAM fallback). The draw buffers are
+ * separate and already PSRAM (display.cpp). STRING/SPRINTF stay CLIB —
+ * they operate on caller-provided buffers and never allocate. */
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CUSTOM
 #define LV_USE_STDLIB_STRING    LV_STDLIB_CLIB
 #define LV_USE_STDLIB_SPRINTF   LV_STDLIB_CLIB
-#define LV_MEM_SIZE             (128 * 1024)  /* 128 kB internal pool */
+/* LV_MEM_SIZE only applies to LV_STDLIB_BUILTIN — unused here. */
 
 /*====================
  * HAL settings

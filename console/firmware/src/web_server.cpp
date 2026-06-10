@@ -14,6 +14,7 @@
 #include "spoolhard/psram_json_alloc.h"
 #include "spoolhard/ws_buffer_pool.h"
 #include "spoolhard/auth.h"
+#include "spoolhard/deferred_reboot.h"
 #include "spoolhard/common_routes.h"
 #include "scale_link.h"
 #include "scale_secrets.h"
@@ -585,14 +586,30 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleCurrentLog(req);
     });
+    // Rotated tail of the previous (or a very long current) session.
+    // current.log is deleted on every clean boot, so after a non-crash
+    // wedge + reset this is the only remotely reachable history.
+    _server.on("/api/logs/previous", HTTP_GET, [](AsyncWebServerRequest* req) {
+        if (!SpoolhardAuth::requireAuth(req)) return;
+        if (!CrashLogger::isAvailable()) {
+            req->send(503, "application/json",
+                      "{\"error\":\"log persistence unavailable (no SD card?)\"}");
+            return;
+        }
+        const char* path = CrashLogger::prevLogPath();
+        if (!SD.exists(path)) {
+            req->send(204, "text/plain", "");
+            return;
+        }
+        req->send(SD, path, "text/plain");
+    });
 
     // /api/restart is registered above by SpoolhardCommonRoutes::registerAll.
     // Legacy alias for older clients that POST to /api/reset-device.
     _server.on("/api/reset-device", HTTP_POST, [](AsyncWebServerRequest* req) {
         if (!SpoolhardAuth::requireAuth(req)) return;
         req->send(200, "application/json", "{\"status\":\"resetting\"}");
-        delay(500);
-        ESP.restart();
+        spoolhardDeferredReboot();
     });
 
     _server.on("/api/test-key", HTTP_GET, [](AsyncWebServerRequest* req) {
@@ -672,12 +689,11 @@ void ConsoleWebServer::_setupRoutes() {
             if (!rep.first_error.isEmpty()) resp["first_error"] = rep.first_error;
             String body; serializeJson(resp, body);
             req->send(ok ? 200 : 500, "application/json", body);
-            // Reboot ~1s later so the response actually flushes. Skip
+            // Reboot out-of-band so the response actually flushes. Skip
             // reboot if nothing landed (e.g. zero-key file) so the user
-            // can investigate without losing the console. Same
-            // delay-then-restart pattern as the upload routes above.
+            // can investigate without losing the console.
             if (ok && (rep.nvs_keys_set || rep.files_written)) {
-                delay(1000); ESP.restart();
+                spoolhardDeferredReboot();
             }
         },
         nullptr,
@@ -1032,7 +1048,7 @@ void ConsoleWebServer::_setupRoutes() {
             }
             Serial.println("[Upload] Firmware accepted — rebooting");
             req->send(200, "application/json", "{\"ok\":true}");
-            delay(1000); ESP.restart();
+            spoolhardDeferredReboot();
         },
         [this](AsyncWebServerRequest* req, const String& filename, size_t index,
            uint8_t* data, size_t len, bool final) {
@@ -1122,7 +1138,7 @@ void ConsoleWebServer::_setupRoutes() {
             }
             Serial.println("[Upload] Frontend accepted — rebooting");
             req->send(200, "application/json", "{\"ok\":true}");
-            delay(1000); ESP.restart();
+            spoolhardDeferredReboot();
         },
         [this](AsyncWebServerRequest* req, const String& filename, size_t index,
            uint8_t* data, size_t len, bool final) {

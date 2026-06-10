@@ -5,6 +5,7 @@
 #include "spoolhard/psram_json_alloc.h"
 #include "spoolhard/ws_buffer_pool.h"
 #include "spoolhard/auth.h"
+#include "spoolhard/deferred_reboot.h"
 #include "spoolhard/common_routes.h"
 #include "load_cell.h"
 #include "console_channel.h"
@@ -253,8 +254,7 @@ void ScaleWebServer::_setupRoutes() {
     _server.on("/api/reset-device", HTTP_POST, [](AsyncWebServerRequest* req) {
         if (!SpoolhardAuth::requireAuth(req)) return;
         req->send(200, "application/json", "{\"status\":\"resetting\"}");
-        delay(500);
-        ESP.restart();
+        spoolhardDeferredReboot();
     });
 
     // ── Crash log retrieval ────────────────────────────────────
@@ -284,10 +284,19 @@ void ScaleWebServer::_setupRoutes() {
             while (f) {
                 String name = f.name();
                 if (name.startsWith("crash_") && name.endsWith(".txt")) {
-                    int seq = name.substring(6, name.length() - 4).toInt();
-                    JsonObject o = arr.add<JsonObject>();
-                    o["seq"]   = seq;
-                    o["bytes"] = (uint32_t)f.size();
+                    // Only promoted crash files are crash_<digits>.txt.
+                    // panic_persist's crash_pending.txt / crash_seq.txt
+                    // also match the prefix — toInt() would list them as
+                    // a phantom seq 0 whose download then 404s.
+                    String seqStr = name.substring(6, name.length() - 4);
+                    bool numeric = seqStr.length() > 0;
+                    for (size_t i = 0; numeric && i < seqStr.length(); ++i)
+                        if (!isDigit(seqStr[i])) numeric = false;
+                    if (numeric) {
+                        JsonObject o = arr.add<JsonObject>();
+                        o["seq"]   = (int)seqStr.toInt();
+                        o["bytes"] = (uint32_t)f.size();
+                    }
                 }
                 f = root.openNextFile();
             }
@@ -525,7 +534,7 @@ void ScaleWebServer::_setupRoutes() {
             String body; serializeJson(resp, body);
             req->send(ok ? 200 : 500, "application/json", body);
             if (ok && (rep.nvs_keys_set || rep.files_written)) {
-                delay(1000); ESP.restart();
+                spoolhardDeferredReboot();
             }
         },
         nullptr,
@@ -549,7 +558,7 @@ void ScaleWebServer::_setupRoutes() {
             bool ok = !Update.hasError();
             req->send(ok ? 200 : 500, "application/json",
                       ok ? "{\"ok\":true}" : "{\"ok\":false}");
-            if (ok) { delay(1000); ESP.restart(); }
+            if (ok) spoolhardDeferredReboot();
         },
         [this](AsyncWebServerRequest* req, const String& filename, size_t index,
            uint8_t* data, size_t len, bool final) {
@@ -602,7 +611,7 @@ void ScaleWebServer::_setupRoutes() {
             bool ok = !Update.hasError();
             req->send(ok ? 200 : 500, "application/json",
                       ok ? "{\"ok\":true}" : "{\"ok\":false}");
-            if (ok) { delay(1000); ESP.restart(); }
+            if (ok) spoolhardDeferredReboot();
         },
         [this](AsyncWebServerRequest* req, const String& filename, size_t index,
            uint8_t* data, size_t len, bool final) {

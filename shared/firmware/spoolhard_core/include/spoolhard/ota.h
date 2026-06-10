@@ -115,10 +115,17 @@ private:
     OtaManifest   _lastManifest;
     volatile bool _checkInFlight      = false;
     volatile bool _forceNext          = false;
+    // Set by _runCheck when results need persisting to NVS. The save
+    // happens on the next update() tick from the caller's (internal-
+    // stack) task: _runCheck runs on a PSRAM stack, and NVS access —
+    // reads included — enters cache-disabled flash windows that fault
+    // on a PSRAM stack (see spoolhard/psram_task.h).
+    volatile bool _persistPending     = false;
     uint32_t      _bootMs             = 0;
+    uint32_t      _dramGateRetryMs    = 0;   // next millis() a gated check may retry
 
     static void _runCheckTask(void* arg);
-    void        _runCheck();
+    void        _runCheck(const OtaConfig& cfg);
 };
 
 extern OtaChecker g_ota_checker;

@@ -201,6 +201,13 @@ void setup() {
     // and PubSubClient both lose their connections.
     mbedtls_install_psram_alloc();
 
+    // Lower the plain-malloc PSRAM spill threshold from the framework
+    // default of 16 KB to 4 KB: any malloc/new of ≥4 KB (HTTPClient
+    // bodies, large Strings, parser scratch) goes to PSRAM instead of
+    // internal DRAM. Allocations that genuinely need internal/DMA memory
+    // request it explicitly via heap_caps_* and are unaffected.
+    heap_caps_malloc_extmem_enable(4096);
+
     // Filesystems
     if (!SPIFFS.begin(true)) {
         Serial.println("[Main] SPIFFS mount failed");

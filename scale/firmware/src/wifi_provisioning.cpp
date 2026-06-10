@@ -112,8 +112,9 @@ void WifiProvisioning::update() {
     if (_state == WifiState::Connecting) {
         if (WiFi.status() == WL_CONNECTED) {
             _stopAP();
-            _state          = WifiState::Connected;
-            _everConnected  = true;
+            _state           = WifiState::Connected;
+            _everConnected   = true;
+            _linkDownSinceMs = 0;
             String actualBssid = WiFi.BSSIDstr();
             Serial.printf("[WiFi] Connected: %s (BSSID %s, ch %d, %d dBm)\n",
                           WiFi.localIP().toString().c_str(),
@@ -194,6 +195,7 @@ void WifiProvisioning::update() {
             _state          = WifiState::Connecting;
             _connectStarted = millis();
             _lastReconnectKickMs = millis();   // grace period before first kick
+            _linkDownSinceMs     = millis();
             return;
         }
         _ssdp.loop();
@@ -222,6 +224,17 @@ void WifiProvisioning::update() {
                 delay(50);
                 WiFi.begin(ssid.c_str(), pass.c_str());
             }
+        }
+        // Down-too-long failsafe: if neither the driver nor the kicker
+        // recovered the link in 10 min, the WiFi stack is in a state we
+        // can't fix from here — reboot. A clean SW reset (visible as
+        // reset=sw in the next boot's log) reconnects in seconds;
+        // staying down requires a human with a power plug.
+        if (_linkDownSinceMs &&
+            millis() - _linkDownSinceMs > 10UL * 60UL * 1000UL) {
+            Serial.println("[WiFi] Link down >10 min despite reconnect kicks — restarting");
+            delay(100);
+            ESP.restart();
         }
     }
 }

@@ -25,6 +25,7 @@
 #include "spoolhard/ws_buffer_pool.h"
 #include "spoolhard/panic_persist.h"
 #include <SPIFFS.h>
+#include <esp_task_wdt.h>
 #include <atomic>
 
 // Mirror everything printed to Serial into the in-RAM ring log so
@@ -698,6 +699,19 @@ void setup() {
     // WiFi is up and the configured interval elapses.
     g_ota_checker.begin();
 
+    // Watch the coordinator loop with the task WDT. The scale has been
+    // observed fully wedged (off-network, needs a power cycle) with no
+    // panic evidence — if loopTask ever hangs, the WiFi reconnect kicker
+    // in g_wifi.update() stops running and the device is unreachable
+    // until someone pulls the plug. A WDT panic instead resets us AND
+    // panic_persist promotes the ring-log tail, so we get a post-mortem.
+    // 60 s is far above any legitimate stall (worst observed LoopLat is
+    // <1 s; SPIFFS GC worst-case is seconds) but converts a forever-hang
+    // into a recovery. Note this re-init also stretches the timeout for
+    // AsyncTCP's task, which adds itself to the same WDT.
+    esp_task_wdt_init(60, /*panic=*/true);
+    esp_task_wdt_add(nullptr);   // nullptr = calling task (loopTask)
+
     Serial.println("[Main] Init complete");
 }
 
@@ -718,6 +732,7 @@ void setup() {
 
 void loop() {
     uint32_t __loop_t0 = millis();
+    esp_task_wdt_reset();
     // WiFi provisioning state machine
     LAT_STEP("wifi", g_wifi.update());
 

@@ -8,6 +8,8 @@
 #include <Update.h>
 #include <mbedtls/sha256.h>
 #include <time.h>
+#include <esp_heap_caps.h>
+#include "spoolhard/psram_task.h"
 
 // NVS schema — canonical names. Both products use the same namespace
 // + keys, so the shared lib hardcodes them rather than parameterising.
@@ -195,8 +197,34 @@ void OtaChecker::begin() {
                   cfg.last_check_ts, cfg.last_check_status.c_str());
 }
 
+namespace {
+// One reusable PSRAM stack for the periodic version check. ota_run's
+// task deliberately does NOT use this: it calls Update.write(), and
+// flash writes are fatal from a PSRAM stack (cache-disabled windows).
+SpoolhardPsramTaskSlot s_checkTaskSlot;
+struct OtaCheckCtx { OtaChecker* self; OtaConfig cfg; };
+}  // namespace
+
 void OtaChecker::update() {
     if (_checkInFlight) return;
+
+    // Persist the previous check's results here, on the caller's
+    // internal-stack task — _runCheck can't touch NVS from its PSRAM
+    // stack (see ota.h). _checkInFlight is already false, so the task
+    // is done mutating the fields we read.
+    if (_persistPending) {
+        _persistPending = false;
+        OtaConfig cfg; cfg.load();
+        cfg.last_check_ts     = _lastCheckTs;
+        cfg.last_check_status = _lastStatus;
+        if (_lastManifest.valid) {
+            cfg.last_known_fw = _lastManifest.firmware_version;
+            cfg.last_known_fe = _lastManifest.has_frontend
+                                    ? _lastManifest.frontend_version : String();
+        }
+        cfg.save();
+    }
+
     if (WiFi.status() != WL_CONNECTED) return;
 
     OtaConfig cfg; cfg.load();
@@ -227,24 +255,50 @@ void OtaChecker::update() {
     }
     if (!forceAllowed && !firstAfterBoot && !dueByInterval) return;
 
+    // Internal-DRAM gate. The TLS handshake below allocates its working
+    // memory (mbedtls record buffers, lwIP pbufs, 8 KB task stack) from
+    // internal DRAM. Sessions with ~41 KB free have been observed
+    // OOM-panicking the moment the first-after-boot check fired, putting
+    // the console into a ~70 s panic→reboot loop. Same pattern as the
+    // gcode-analysis gate: defer instead of crash, retry once a minute.
+    constexpr size_t kCheckMinFreeInternal = 50 * 1024;
+    size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (freeInternal < kCheckMinFreeInternal) {
+        if ((int32_t)(now - _dramGateRetryMs) < 0) return;
+        _dramGateRetryMs = now + 60UL * 1000UL;
+        Serial.printf("[OTA] check deferred — free internal DRAM %u < %u, retry in 60s\n",
+                      (unsigned)freeInternal, (unsigned)kCheckMinFreeInternal);
+        return;
+    }
+
     _forceNext = false;
     _lastCheckSessionMs = now;
     _checkInFlight = true;
     Serial.println("[OTA] check starting");
     // Pinned to core 0 so the LVGL task on core 1 stays smooth during
     // the HTTPS round-trip. 8 KB stack is enough for HTTPClient +
-    // mbedtls handshake; we don't decode big payloads here.
-    xTaskCreatePinnedToCore(_runCheckTask, "ota_check", 8192,
-                            this, 1, nullptr, 0);
+    // mbedtls handshake; we don't decode big payloads here. The stack
+    // goes to PSRAM when available — the check fires exactly when TLS
+    // is about to spike internal-DRAM demand, so don't add to it. The
+    // cfg snapshot rides along because _runCheck must not read NVS
+    // from a PSRAM stack.
+    auto* ctx = new OtaCheckCtx{this, cfg};
+    if (!spoolhardSpawnPsramTask(_runCheckTask, ctx, "ota_check", 8192,
+                                 /*priority*/1, /*core*/0, s_checkTaskSlot)) {
+        delete ctx;
+        _checkInFlight = false;
+    }
 }
 
 void OtaChecker::_runCheckTask(void* arg) {
-    static_cast<OtaChecker*>(arg)->_runCheck();
+    auto* ctx = static_cast<OtaCheckCtx*>(arg);
+    ctx->self->_runCheck(ctx->cfg);
+    delete ctx;
+    s_checkTaskSlot.busy = false;   // no-op if we ran on the fallback stack
     vTaskDelete(nullptr);
 }
 
-void OtaChecker::_runCheck() {
-    OtaConfig cfg; cfg.load();
+void OtaChecker::_runCheck(const OtaConfig& cfg) {
     String status;
     OtaManifest m = otaFetchManifest(cfg, &status);
 
@@ -259,13 +313,7 @@ void OtaChecker::_runCheck() {
         _lastCheckTs = (uint32_t)t;
     }
 
-    cfg.last_check_ts     = _lastCheckTs;
-    cfg.last_check_status = _lastStatus;
-    if (m.valid) {
-        cfg.last_known_fw = m.firmware_version;
-        cfg.last_known_fe = m.has_frontend ? m.frontend_version : String();
-    }
-    cfg.save();
+    _persistPending = true;   // NVS save happens on the next update() tick
 
     if (m.valid) {
         Serial.printf("[OTA] check ok: fw=%s fe=%s\n",

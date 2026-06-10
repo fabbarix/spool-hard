@@ -15,13 +15,15 @@ Vite/React config UI at `*/frontend/`, and a `VERSION` file.
 ## Flashing
 
 See **[FLASHING.md](./FLASHING.md)** for the exact commands. TL;DR:
+**both devices flash over WiFi OTA** — neither is USB-attached.
 
-- Console: USB-attached on `/dev/ttyACM0` → `pio run -t upload` from
-  `console/firmware/`.
-- Scale: OTA via
-  `POST http://<scale-hostname>.local/api/upload/firmware?key=<KEY>`
-  with the `.bin` from `scale/firmware/.pio/build/esp32-s3/`. Default
-  hostname after fresh provisioning is `spoolhard-scale.local`.
+- Console (`spuletto.local` / 192.168.20.153): multipart POST to
+  `/api/upload/firmware` + `/api/upload/spiffs` with `?key=$SPULETTO_KEY`,
+  bins from `console/firmware/.pio/build/esp32-s3/`.
+- Scale (`scalinata.local` / 192.168.20.154): same endpoints with
+  `?key=$SCALINATA_KEY`, bins from `scale/firmware/.pio/build/esp32-s3/`.
+- CAUTION: whatever enumerates as `/dev/ttyACM0` (CH343 UART adapter) is
+  some OTHER ESP32-S3 board, NOT the console or scale. Don't flash it.
 
 ## Protocol
 
@@ -111,9 +113,21 @@ the headers are `#include`d).
   `handleDeviceName{Get,Post}`. Shared NVS schema: namespace `wifi_cfg`
   with keys `ssid`, `pass`, `device_name`, `fixed_key`.
 - `spoolhard/common_routes.h` / `src/common_routes.cpp` — `registerAll(server)`
-  installs `/api/restart` + `/api/logs`. Both products call this once
-  in `_setupRoutes`. (`/api/logs/current` is product-specific because
-  the console serves SD-persisted output; the scale doesn't have one.)
+  installs `/api/restart` + `/api/logs` + `/api/heap` (heap_caps stats
+  for DRAM-budget work). Both products call this once in `_setupRoutes`.
+  (`/api/logs/current` + `/api/logs/previous` are console-specific —
+  SD-persisted output.) NB: the esp32async fork's default route matcher
+  is prefix-style; `/api/logs` uses `AsyncURIMatcher::exact()` so it
+  doesn't shadow those sub-routes. Register specific-before-generic.
+- `spoolhard/deferred_reboot.h` / `src/deferred_reboot.cpp` —
+  `spoolhardDeferredReboot()`: reboot from a detached task so an
+  AsyncWebServer handler's queued response actually flushes first.
+  Never `delay()+ESP.restart()` inline in a handler.
+- `spoolhard/psram_task.h` / `src/psram_task.cpp` — one-shot task
+  spawner that would prefer a PSRAM stack, but the PSRAM path is
+  compiled out: this framework's sdkconfig lacks
+  `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` and FreeRTOS PANICS on
+  external stack buffers without it. Read the header before touching.
 - `spoolhard/panic_persist.h` / `src/panic_persist.cpp` — best-effort
   crash-log persistence without an esp_core_dump partition. On boot,
   if `esp_reset_reason()` indicates panic/WDT/brownout AND a pending

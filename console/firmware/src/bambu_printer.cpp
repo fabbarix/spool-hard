@@ -114,6 +114,15 @@ bool spawnPSRAMFallbackTask(TaskFunction_t fn, void* arg, const char* name,
     BaseType_t rc = xTaskCreatePinnedToCore(fn, name, TASK_STACK_BYTES,
                                             arg, priority, nullptr, core_id);
     if (rc == pdPASS) return true;
+#if !CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    // PSRAM task stacks are NOT permitted by this framework build:
+    // xTaskCreateStatic's portVALID_STACK_MEM assert panics on an
+    // external-RAM stack buffer. This fallback was a latent panic that
+    // had simply never been exercised (see spoolhard/psram_task.h).
+    Serial.printf("[Task %s] internal-heap stack alloc failed (PSRAM "
+                  "stacks unsupported by sdkconfig)\n", name);
+    return false;
+#else
     Serial.printf("[Task %s] internal-heap stack alloc failed; trying PSRAM\n", name);
     if (slot.busy) {
         Serial.printf("[Task %s] PSRAM slot already in use — caller will retry\n", name);
@@ -138,6 +147,7 @@ bool spawnPSRAMFallbackTask(TaskFunction_t fn, void* arg, const char* name,
     }
     Serial.printf("[Task %s] running on PSRAM stack\n", name);
     return true;
+#endif
 }
 
 }  // namespace

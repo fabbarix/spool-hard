@@ -1,5 +1,6 @@
 #include "wifi_provisioning.h"
 #include "config.h"
+#include "crash_logger.h"
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
@@ -98,7 +99,9 @@ void WifiProvisioning::update() {
     if (_state == WifiState::Connecting) {
         if (WiFi.status() == WL_CONNECTED) {
             _stopAP();
-            _state = WifiState::Connected;
+            _state           = WifiState::Connected;
+            _everConnected   = true;
+            _linkDownSinceMs = 0;
             String actualBssid = WiFi.BSSIDstr();
             Serial.printf("[WiFi] Connected: %s (BSSID %s, ch %d, %d dBm)\n",
                           WiFi.localIP().toString().c_str(),
@@ -136,13 +139,63 @@ void WifiProvisioning::update() {
                 WiFi.begin(ssid.c_str(), pass.c_str());
                 _connectStarted = millis();
             }
-        } else if (!_pinnedActive && millis() - _connectStarted > CONNECT_TIMEOUT_MS) {
-            // Plain-SSID connect timed out — back to provisioning.
-            // Pinned-fallback is gated separately so its 60 s window
-            // runs before this kicks in.
-            Serial.println("[WiFi] Connection timed out — starting provisioning AP");
+        } else if (!_everConnected && !_pinnedActive &&
+                   millis() - _connectStarted > CONNECT_TIMEOUT_MS) {
+            // Plain-SSID INITIAL connect timed out — back to provisioning.
+            // Gated on !_everConnected (like the scale): after a mid-session
+            // drop we must keep retrying the known-good credentials, not
+            // dump a working install into provisioning mode.
+            Serial.println("[WiFi] Initial connect timed out — starting provisioning AP");
             _state = WifiState::Failed;
             _startAP();
+        }
+        // fall through to the post-drop kicker below
+    }
+
+    if (_state == WifiState::Connected) {
+        // Detect a dropped STA link — ported from the scale. The console
+        // previously had NO transition out of Connected: if the AP glitched
+        // and the driver's auto-reconnect wedged, the console sat invisible
+        // on the network for days (observed Jun 2026) until a power cycle.
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[WiFi] Link dropped — tearing down mDNS, awaiting auto-reconnect");
+            MDNS.end();
+            _state               = WifiState::Connecting;
+            _connectStarted      = millis();
+            _lastReconnectKickMs = millis();   // grace period before first kick
+            _linkDownSinceMs     = millis();
+            return;
+        }
+    }
+
+    // Post-drop reconnect kicker — ported from the scale. The driver's
+    // setAutoReconnect(true) usually recovers alone, but gets stuck in
+    // some scenarios (radio briefly in AP_STA mode, AP back on another
+    // channel). Every ~30 s in Connecting we explicitly re-begin().
+    if (_state == WifiState::Connecting && _everConnected) {
+        if (millis() - _lastReconnectKickMs >= 30000) {
+            _lastReconnectKickMs = millis();
+            Preferences prefs;
+            prefs.begin(NVS_NS_WIFI, true);
+            String ssid = prefs.getString(NVS_KEY_SSID, "");
+            String pass = prefs.getString(NVS_KEY_PASS, "");
+            prefs.end();
+            if (!ssid.isEmpty()) {
+                Serial.println("[WiFi] Driver auto-reconnect appears stuck — explicit re-begin()");
+                WiFi.disconnect();
+                delay(50);
+                WiFi.begin(ssid.c_str(), pass.c_str());
+            }
+        }
+        // Down-too-long failsafe: if neither the driver nor the kicker
+        // recovered the link in 10 min, the WiFi stack is in a state we
+        // can't fix from here — reboot. A clean SW reset reconnects in
+        // ~10 s; staying down requires a human with a power plug.
+        if (_linkDownSinceMs &&
+            millis() - _linkDownSinceMs > 10UL * 60UL * 1000UL) {
+            Serial.println("[WiFi] Link down >10 min despite reconnect kicks — restarting");
+            CrashLogger::flush();   // make sure the reason reaches the SD log
+            ESP.restart();
         }
     }
 }

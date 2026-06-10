@@ -244,6 +244,13 @@ void begin() {
         } else {
             Serial.println("[CrashLog] crash reset detected but no previous log to preserve");
         }
+    } else if (SD.exists(kCurrentPath)) {
+        // Clean reboot — rotate instead of delete so the previous
+        // session stays reachable at /api/logs/previous. A wedge that
+        // ends in a manual power cycle is a clean POWERON boot; without
+        // this the only evidence of what went wrong is destroyed here.
+        if (SD.exists(kPrevPath)) SD.remove(kPrevPath);
+        SD.rename(kCurrentPath, kPrevPath);
     }
 
     _resetCurrentLog(reason);
@@ -345,5 +352,6 @@ size_t removeAll() {
 }
 
 const char* currentLogPath() { return kCurrentPath; }
+const char* prevLogPath()    { return kPrevPath; }
 
 }  // namespace CrashLogger

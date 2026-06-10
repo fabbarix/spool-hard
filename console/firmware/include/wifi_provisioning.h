@@ -39,6 +39,14 @@ private:
     bool   _pinnedActive = false;
     static constexpr unsigned long PINNED_FALLBACK_MS = 60000;
 
+    // Post-drop recovery state — mirrors the scale. _everConnected gates
+    // the provisioning-AP fallback to the initial connect only; the kick
+    // timestamp paces the explicit re-begin(); _linkDownSinceMs feeds the
+    // down-too-long reboot failsafe.
+    bool          _everConnected       = false;
+    unsigned long _lastReconnectKickMs = 0;
+    unsigned long _linkDownSinceMs     = 0;
+
     void _startAP();
     void _stopAP();
     void _startConnect(const String& ssid, const String& pass);

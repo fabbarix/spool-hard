@@ -23,10 +23,16 @@ void registerRestart(AsyncWebServer& server);
 // route.
 void registerLogs(AsyncWebServer& server);
 
+// GET /api/heap — auth-gated. Internal + PSRAM heap_caps stats plus
+// per-task stack high-water marks (when configUSE_TRACE_FACILITY is
+// on). The measurement source for DRAM-budget work.
+void registerHeap(AsyncWebServer& server);
+
 // Convenience: register all of the above in one call.
 inline void registerAll(AsyncWebServer& server) {
     registerRestart(server);
     registerLogs(server);
+    registerHeap(server);
 }
 
 }  // namespace SpoolhardCommonRoutes

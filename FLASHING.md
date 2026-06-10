@@ -31,6 +31,11 @@ cd scale/firmware   && pio run -t buildfs
 
 ## Console — USB/serial
 
+> **Current bench setup (2026-06): the console is NOT USB-attached.** The
+> `/dev/ttyACM0` that enumerates on the dev box is a CH343 UART adapter
+> wired to an unrelated ESP32-S3 — flashing it does NOT flash the console.
+> Use the OTA path below (`spuletto.local` / 192.168.20.153).
+
 The console (default mDNS: spoolhard-console.local) is an ESP32-S3 devkit that exposes a USB JTAG/serial
 debug port. When plugged in it enumerates as `/dev/ttyACM0`.
 

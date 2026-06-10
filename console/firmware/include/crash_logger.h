@@ -53,5 +53,6 @@ size_t                  removeAll();
 // Path to the currently-being-written log. Useful for /api/logs/current
 // (live tail of the on-disk log, separate from the in-memory ring).
 const char* currentLogPath();
+const char* prevLogPath();   // rotated current.log.1 — survives clean reboots
 
 }  // namespace CrashLogger

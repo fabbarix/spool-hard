@@ -40,6 +40,9 @@ private:
     // does the heavy lifting; this is just a fallback that fires every
     // ~30 s when the driver gets stuck.
     unsigned long _lastReconnectKickMs = 0;
+    // millis() when the Connected→Connecting drop was detected; 0 while
+    // up. Feeds the down-too-long reboot failsafe.
+    unsigned long _linkDownSinceMs     = 0;
     String _deviceName;
 
     // Mesh-pinning state. `_pinnedBssid` is the user-saved value from NVS,
