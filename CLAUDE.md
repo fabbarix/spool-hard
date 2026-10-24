@@ -337,3 +337,8 @@ enum lives at `*/firmware/src/protocol.h`").
   triangle in the home footer (`ui_set_dev_mode_warning`, called from
   `_refreshDevModeWarning` only when the name list changes); tap shows a
   one-line explanation card, tap again to close.
+- `POST /api/printers` MERGES onto the stored record by serial
+  (`PrinterConfig::fromJson` only overwrites fields present in the body), so the
+  Config page's partial save (name/serial/ip/access_code) keeps ams_overrides,
+  dev_mode, auto_restore_k, track_print_consume. `?dry=1` returns the would-be
+  merged record (secret masked) without saving or reloading.

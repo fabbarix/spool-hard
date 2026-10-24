@@ -3061,9 +3061,23 @@ void ConsoleWebServer::_handlePrinterPost(AsyncWebServerRequest* req, uint8_t* d
         req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
         return;
     }
+    // MERGE onto the stored record (by serial): the Config page posts only
+    // name/serial/ip/access_code and must not wipe ams_overrides, dev_mode,
+    // auto_restore_k, track_print_consume. Fields present in the body win.
     PrinterConfig p;
+    if (doc["serial"].is<const char*>()) {
+        if (const PrinterConfig* ex = g_printers_cfg.find(doc["serial"].as<String>())) p = *ex;
+    }
     if (!p.fromJson(doc)) {
         req->send(400, "application/json", "{\"error\":\"serial + access_code required\"}");
+        return;
+    }
+    // ?dry=1: return the would-be merged record (secrets masked), save nothing.
+    if (req->hasParam("dry")) {
+        JsonDocument out;
+        p.toJson(out, /*include_secret*/ false);
+        String s; serializeJson(out, s);
+        req->send(200, "application/json", s);
         return;
     }
     if (g_printers_cfg.list().size() >= BAMBU_MAX_PRINTERS && !g_printers_cfg.find(p.serial)) {

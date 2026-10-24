@@ -31,9 +31,12 @@ void PrinterConfig::toJson(JsonDocument& doc, bool include_secret) const {
 }
 
 bool PrinterConfig::fromJson(const JsonDocument& doc) {
-    name        = doc["name"]        | "";
-    serial      = doc["serial"]      | "";
-    ip          = doc["ip"]          | "";
+    // Merge semantics: only fields present in `doc` overwrite; everything
+    // else keeps its current value (callers seed `*this` with the stored
+    // record, so a partial POST /api/printers can't wipe ams_overrides etc.).
+    if (doc["name"].is<const char*>())   name   = doc["name"].as<String>();
+    if (doc["serial"].is<const char*>()) serial = doc["serial"].as<String>();
+    if (doc["ip"].is<const char*>())     ip     = doc["ip"].as<String>();
     if (doc["access_code"].is<const char*>()) {
         access_code = doc["access_code"].as<String>();
     }
@@ -93,9 +96,12 @@ bool PrinterConfig::migrateAmsOverrides() {
     }
     if (stray.empty()) return false;
     for (const String& k : stray) {
-        String v = o[k.c_str()].as<String>();
+        const char* vp = o[k.c_str()] | "";
+        String v = vp;
         o.remove(k.c_str());
-        if (!o["254:0"].is<const char*>() && v.length()) o["254:0"] = v;
+        const char* ex = o["254:0"] | "";
+        if (!*ex && v.length()) o["254:0"] = v;
+        else if (!*ex) o.remove("254:0");   // never leave a null/empty entry
     }
     ams_overrides_json = "";
     if (o.size()) serializeJson(d, ams_overrides_json);
