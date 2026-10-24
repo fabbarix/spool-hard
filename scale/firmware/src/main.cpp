@@ -559,12 +559,12 @@ void setup() {
     // reason was crashy. Surfaces via the /api/crashes route below.
     PanicPersist::begin();
 
-    // Pre-allocate the WS broadcast pool BEFORE any code path that might
-    // emit a state.* push (web server start, console connect callback).
-    // 8 slots × 8 KB each — covers every envelope shape the scale sends
-    // with margin. Slots live in DRAM (vector<uint8_t>) but are reused
-    // forever after; no per-broadcast allocation under steady state.
-    g_wsBufPool.begin(/*count*/ 8, /*initial_capacity*/ 8192);
+    // WS broadcast pool, LAZY: no DRAM is reserved at boot (scale has no
+    // PSRAM). Slots (up to 8 x 8 KB) are allocated on first push to a
+    // connected browser and released by maintain() (from
+    // g_web.cleanupClients(), 1 Hz) once no tab is open. The scale<->console
+    // link (/ws/console) does not use this pool.
+    g_wsBufPool.begin(/*count*/ 8, /*initial_capacity*/ 8192, /*lazy*/ true);
 
     g_led.begin();
     g_led.showOffline();   // red solid until WiFi + console catch up

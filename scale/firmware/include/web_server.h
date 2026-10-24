@@ -17,7 +17,7 @@ public:
     // Without this, zombie tabs accumulate after page reloads or network
     // changes — each pinning up to 32 queued message buffers in heap.
     // Same pattern as ConsoleChannel; called once a second from main.
-    void cleanupClients() { _ws.cleanupClients(); }
+    void cleanupClients();
 
     // Live count of /ws clients — exposed so the main loop can skip the
     // 2 Hz raw_sample JsonDocument allocation when nobody is watching.
