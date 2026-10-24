@@ -31,7 +31,8 @@ SpoolTag               s_snap_tag;
 uint32_t               s_snap_gen = 0xFFFFFFFFu;    // task-private
 
 void _publishSnapshot() {
-    s_status.store(g_nfc.getStatus(), std::memory_order_release);
+    // Tag first, status last: a reader that sees a new status via
+    // snapshot() then never pairs it with an older tag.
     // Tag holds Strings: copy under the mutex, and only when it changed.
     uint32_t gen = g_nfc.tagGeneration();
     if (gen != s_snap_gen && s_tag_mtx &&
@@ -40,6 +41,7 @@ void _publishSnapshot() {
         xSemaphoreGive(s_tag_mtx);
         s_snap_gen = gen;
     }
+    s_status.store(g_nfc.getStatus(), std::memory_order_release);
 }
 
 void _drainCommands() {
