@@ -8,6 +8,77 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.13.0] - 2026-10-24
+
+A reliability, memory and UI release: the scale's NFC heap-corruption
+bugs, several remote-crash and data-loss paths in the web API, verified
+frontend uploads, live spool weights in the web UI, external-spool
+assignment on H2S, and a redesigned dashboard — with ~220 KB less flash
+and a lot more free RAM on both devices.
+
+**Behaviour changes — read before updating**
+- **Printer control needs Developer Mode.** Newer Bambu firmware (seen on
+  H2S) rejects unsigned LAN control commands ("mqtt message verify
+  failed"). Without LAN Only + Developer Mode, SpoolHard still reads
+  status and tracks consumption but can't push filament / K-value
+  settings to the printer. The console now detects this, shows a notice
+  with a Retry button, and shows a reminder banner (web) and warning
+  icon (LCD) while a printer *is* in Developer Mode.
+- **Frontend uploads are verified:** `POST /api/upload/spiffs` now
+  answers `202 {"status":"verifying"}`; the real result is at
+  `GET /api/upload/spiffs/status` and the device reboots only after
+  `ok`. A wrong-product image is rejected before anything is erased; a
+  failed or corrupted upload leaves an empty frontend to re-upload
+  instead of a silently broken one.
+- All `/api` routes are exact-match; malformed or over-long ids now get
+  404. Backups are `.tar` files (since 0.12.14).
+
+**Fixes**
+- External spool: assigning a spool to the external holder from the
+  dashboard was saved under the wrong slot and never took effect (no
+  weight tracking, generic filament shown). Fixed, existing entries are
+  migrated, and there's a new "Assign scanned spool to External" action
+  for printers whose external holder can't detect a spool swap (H2S).
+- Saving a printer in Config no longer wipes its AMS/external spool
+  assignments and flags.
+- The web UI now shows the same live remaining weight as the LCD
+  (last weighing − filament used since) in the Spools list, spool
+  detail, slot picker and tray cards, updating during prints without a
+  reload.
+- Scale: fixed heap corruption on NFC scans of tags with URLs/NDEF
+  payloads, a per-tick tag copy at 100 Hz, torn calibration reads, and
+  tag writes that ignored the target tag / capacity.
+- Web API: removed a long-URL stack-overflow crash (regex routing),
+  per-id routes that returned the whole list, `/api/restart/<anything>`
+  rebooting the device, and an over-long id reaching a delete-all
+  route; request size is now capped.
+- Printer command replies are read and logged (rejections are no
+  longer reported as success). Console OTA no longer stalls the main
+  loop; SSDP handling no longer risks the UDP task's stack; several
+  startup mutex races fixed; deleting a spool now clears its tag index.
+- `index.html` is no longer cached for a day after a frontend update.
+
+**Performance / memory** (measured on the devices vs 0.12.14)
+- Console: flash 2.45 → 2.26 MB; free internal RAM 119 → ~145 KB,
+  minimum 81 → ~112 KB.
+- Scale: flash 1.56 → 1.34 MB; free internal RAM ~102 → ~140 KB at
+  boot, minimum during the boot update check 11.5 → ~123 KB (WebSocket
+  buffers now allocated only while a browser is connected).
+- Allocation-free logging and gcode analysis (analysis results
+  identical on a real print), spool-store cache, LCD redraws skipped
+  when nothing changed, quieter logs (status chatter once a minute),
+  far fewer flash writes from crash-log persistence.
+- Web: first-load JavaScript 127 → 83 KB gzipped; fonts are bundled
+  (no Google Fonts requests, works on an offline LAN).
+
+**UI**
+- Phone bottom tab bar; printer-first dashboard with device stats
+  collapsed; clearer tray cards (real black swatches, no bogus 0%,
+  obvious active slot, full-width external card); Spools page search,
+  filters, remaining-weight bars and delete with Undo; settings grouped
+  consistently on console and scale; readable contrast, focus outlines
+  and screen-reader labels; type-to-confirm factory reset.
+
 ## [0.12.15] - 2026-10-24
 
 Spool database compaction and two small build fixes.
