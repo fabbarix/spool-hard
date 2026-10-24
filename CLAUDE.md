@@ -178,6 +178,18 @@ the headers are `#include`d).
   has it). The opt-in is off: the path has never run in the field and
   external-stack tasks must not write flash. Read the header before
   touching.
+- `spoolhard/spiffs_upload.h` / `src/spiffs_upload.cpp` — `SpiffsUpload::`
+  integrity-checked raw write of the SPIFFS partition, used by both
+  `/api/upload/spiffs` handlers and the frontend step of `otaRun`. Size
+  comes from the partition table; `begin()` takes an FS lock
+  (`tryLockFs()/unlockFs()`: `PanicPersist::tick`, scale `/tags_in_store.txt`
+  writer back off) and `SPIFFS.end()`s; every `Update.write` return is
+  checked; `finish()` spawns a task that does Update.end, optional client
+  sha256 (`?sha256=` / `X-Sha256`), tail erase, flash-readback hash, remount
+  + read every file, and on ANY failure formats SPIFFS. 20 s stall timer
+  recovers abandoned uploads. HTTP contract: POST answers 202 `verifying`,
+  poll `GET /api/upload/spiffs/status`; device reboots after `ok`. First 4 KB are staged so a wrong-product marker is rejected before the partition is erased; uploads are identified by generation token, completion runs once (atomic claim), OOM on task spawn retries via timer (never inline). Any new
+  code that writes SPIFFS from a task must wrap it in `tryLockFs()`.
 - `spoolhard/panic_persist.h` / `src/panic_persist.cpp` — best-effort
   crash-log persistence without an esp_core_dump partition. On boot,
   if `esp_reset_reason()` indicates panic/WDT/brownout AND a pending

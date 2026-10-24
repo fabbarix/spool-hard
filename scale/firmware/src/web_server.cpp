@@ -6,6 +6,7 @@
 #include "spoolhard/ws_buffer_pool.h"
 #include "spoolhard/auth.h"
 #include "spoolhard/deferred_reboot.h"
+#include "spoolhard/spiffs_upload.h"
 #include "spoolhard/common_routes.h"
 #include "load_cell.h"
 #include "console_channel.h"
@@ -616,58 +617,81 @@ void ScaleWebServer::_setupRoutes() {
     // The API path stays /api/upload/spiffs so existing clients keep working;
     // only the release-bundle filename and user-visible labels are renamed.
 
+    // Response contract: the POST returns once the bytes are streamed in.
+    //   400/409/500 {"ok":false,"error":..}  rejected / failed (FS formatted)
+    //   200 {"ok":true}                        already verified
+    //   202 {"ok":true,"status":"verifying"}   verify runs in a task; poll
+    //       GET /api/upload/spiffs/status -> {"phase":"verifying|ok|failed","error":..}
+    // The device reboots ~2.5 s after phase becomes "ok". The verify step
+    // (flash readback hash + remount + read every file) never runs on
+    // AsyncTCP; see spoolhard/spiffs_upload.h. Optional integrity check:
+    // ?sha256=<hex> or X-Sha256 header (sha256 of the image bytes).
+
     _server.on(AsyncURIMatcher::exact("/api/upload/spiffs"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             if (!_requireAuth(req)) return;
-            if (_uploadRejectedProduct) {
-                req->send(400, "application/json",
-                    "{\"ok\":false,\"error\":\"wrong product — expected " PRODUCT_NAME " frontend\"}");
-                _uploadRejectedProduct = false;
+            if (req != _spiffsReq || !SpiffsUpload::isCurrent(_spiffsTok)) {
+                const char* e = _spiffsBeginErr ? _spiffsBeginErr : "no upload in progress";
+                req->send(_spiffsBeginErr ? 409 : 400, "application/json",
+                          String("{\"ok\":false,\"error\":\"") + e + "\"}");
+                _spiffsBeginErr = nullptr;
                 return;
             }
-            bool ok = !Update.hasError();
-            req->send(ok ? 200 : 500, "application/json",
-                      ok ? "{\"ok\":true}" : "{\"ok\":false}");
-            if (ok) spoolhardDeferredReboot();
+            if (SpiffsUpload::failed(_spiffsTok)) {
+                req->send(400, "application/json", String("{\"ok\":false,\"error\":\"") + SpiffsUpload::error() + "\"}");
+                return;
+            }
+            if (SpiffsUpload::phase() == SpiffsUpload::Phase::Ok) {
+                req->send(200, "application/json", "{\"ok\":true}");
+            } else {
+                req->send(202, "application/json", "{\"ok\":true,\"status\":\"verifying\"}");
+            }
         },
         [this](AsyncWebServerRequest* req, const String& filename, size_t index,
            uint8_t* data, size_t len, bool final) {
-            if (index == 0 && !_requireAuth(req)) { Update.abort(); return; }
             if (index == 0) {
+                _spiffsBeginErr = nullptr;
+                if (!_requireAuth(req)) return;
                 Serial.printf("[Upload] Frontend: %s\n", filename.c_str());
                 if (_onUploadStarted) _onUploadStarted("spiffs");
                 _uploadMatcher.reset();
-                _uploadRejectedProduct = false;
-                _uploadIsSpiffs        = true;
-                if (!Update.begin(0x1f0000, U_SPIFFS)) {
-                    Serial.printf("[Upload] Begin failed: %s\n", Update.errorString());
+                const char* berr = nullptr;
+                uint32_t tok = SpiffsUpload::begin(&berr, SPOOLHARD_PRODUCT_SIGNATURE);
+                if (!tok) {
+                    _spiffsBeginErr = berr;
+                    if (req == _spiffsReq) _spiffsReq = nullptr;
+                    Serial.printf("[Upload] Begin failed: %s\n", berr);
                     return;
                 }
+                _spiffsReq = req;
+                _spiffsTok = tok;
+                String sh = req->hasParam("sha256") ? req->getParam("sha256")->value()
+                                                    : req->header("X-Sha256");
+                if (sh.length()) SpiffsUpload::setExpectedSha256(_spiffsTok, sh.c_str());
             }
+            if (req != _spiffsReq || !SpiffsUpload::owns(_spiffsTok)) return;
             _uploadMatcher.feed(data, len);
-            if (Update.isRunning()) Update.write(data, len);
+            SpiffsUpload::write(_spiffsTok, data, len);
             if (_onUploadProgress) _onUploadProgress();   // LED liveness ping
             if (final) {
                 if (!_uploadMatcher.matched()) {
-                    // Unlike firmware, SPIFFS writes have already landed in
-                    // the partition by now. Abort + format so the device
-                    // recovers to a clean empty FS on next boot instead of
-                    // trying to mount a half-written image of the wrong
-                    // product.
                     Serial.println("[Upload] Frontend rejected: product signature missing");
-                    Update.abort();
-                    SPIFFS.format();
-                    _uploadRejectedProduct = true;
-                    return;
+                    SpiffsUpload::fail(_spiffsTok, "wrong product - expected " PRODUCT_NAME " frontend");
                 }
-                if (Update.end(true)) {
-                    Serial.printf("[Upload] Frontend OK: %u bytes\n", index + len);
-                } else {
-                    Serial.printf("[Upload] Frontend failed: %s\n", Update.errorString());
-                }
+                SpiffsUpload::finish(_spiffsTok, true);
             }
         }
     );
+
+    _server.on("/api/upload/spiffs/status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        using P = SpiffsUpload::Phase;
+        P ph = SpiffsUpload::phase();
+        const char* n = ph == P::Writing ? "writing" : ph == P::Verifying ? "verifying"
+                      : ph == P::Ok ? "ok" : ph == P::Failed ? "failed" : "idle";
+        req->send(200, "application/json", String("{\"phase\":\"") + n + "\",\"error\":\""
+                  + (ph == P::Failed ? SpiffsUpload::error() : "") + "\"}");
+    });
 
     // ── Static SPA from SPIFFS (must be after API routes) ────
 

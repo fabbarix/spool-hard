@@ -1,6 +1,7 @@
 #include "spoolhard/panic_persist.h"
 #include "spoolhard/ring_log.h"
 #include <SPIFFS.h>
+#include "spoolhard/spiffs_upload.h"
 #include <esp_system.h>
 #include <esp_idf_version.h>
 #include <esp_rom_sys.h>
@@ -103,19 +104,22 @@ void tick() {
     // SPIFFS rewrite (flash wear + a multi-ms blocking write).
     uint32_t head = RingLog::headSeq();
     if (head == s_lastFlushedSeq && SPIFFS.exists(kPendingPath)) return;
-    // MERGE NOTE: any FS-lock gate (e.g. B10's tryLockFs()) goes right
-    // here as `if (!tryLockFs()) return;` BEFORE the write, and
-    // s_lastFlushedSeq is only set AFTER the write succeeded, so a failed
-    // lock leaves the change unflushed and retried on the next interval.
-    if (!_writePending()) return;
-    s_lastFlushedSeq = head;
+    // Never touch SPIFFS while a frontend upload is raw-writing the
+    // partition (it would scribble over the new image). A failed lock or
+    // write leaves the change unflushed so it is retried next interval.
+    if (!SpiffsUpload::tryLockFs()) return;
+    bool ok = _writePending();
+    SpiffsUpload::unlockFs();
+    if (ok) s_lastFlushedSeq = head;
 }
 
 void pause()  { s_paused.store(true); }
 void resume() { s_paused.store(false); }
 
 void markGracefulExit() {
+    if (!SpiffsUpload::tryLockFs()) return;
     SPIFFS.remove(kPendingPath);
+    SpiffsUpload::unlockFs();
 }
 
 }  // namespace PanicPersist

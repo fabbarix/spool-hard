@@ -25,6 +25,7 @@
 #include "spoolhard/ws_buffer_pool.h"
 #include "spoolhard/panic_persist.h"
 #include <SPIFFS.h>
+#include "spoolhard/spiffs_upload.h"
 #include <esp_task_wdt.h>
 #include <atomic>
 
@@ -265,8 +266,12 @@ static void handleConsoleMessage(ConsoleToScale::Message& msg) {
             Serial.printf("[App] TagsInStore received (%d chars)\n", tags.length());
 
             // Persist to SPIFFS so it survives page reloads (not reboots — it's a cache)
-            File f = SPIFFS.open("/tags_in_store.txt", FILE_WRITE);
-            if (f) { f.print(tags); f.close(); }
+            // (skipped while a frontend upload owns the partition)
+            if (SpiffsUpload::tryLockFs()) {
+                File f = SPIFFS.open("/tags_in_store.txt", FILE_WRITE);
+                if (f) { f.print(tags); f.close(); }
+                SpiffsUpload::unlockFs();
+            }
 
             // Push to dashboard
             JsonDocument dbg(&g_psramJsonAlloc);

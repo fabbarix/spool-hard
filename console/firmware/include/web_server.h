@@ -112,6 +112,9 @@ private:
     // false so the response handler serves 400.
     ProductSignatureMatcher _uploadMatcher;
     bool _uploadAccepted = false;
+    const void* _spiffsReq = nullptr;       // request that owns the SPIFFS upload
+    uint32_t    _spiffsTok = 0;             // SpiffsUpload generation token
+    const char* _spiffsBeginErr = nullptr;  // SpiffsUpload::begin() refusal for the response
     const char* _uploadRejectReason = "no upload";  // pointer to literal, never freed
 
     VersionMarkerParser _uploadVersion;

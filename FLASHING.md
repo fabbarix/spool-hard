@@ -145,6 +145,25 @@ The release script `scale/scripts/release.sh` bundles both artifacts plus a
 manifest into `scale/release/` for distribution, but for local iteration the
 two curl calls above are enough.
 
+> **Frontend upload contract (`/api/upload/spiffs`)**: the POST returns once the
+> bytes are streamed in. The device then unmounts SPIFFS, hashes a flash
+> readback, remounts and reads every file, in a background task. Response is
+> `202 {"ok":true,"status":"verifying"}` (curl exits 0 as before); poll
+> `GET /api/upload/spiffs/status` (`phase`: `verifying|ok|failed`, plus `error`).
+> On `ok` the device reboots ~2.5 s later; on `failed` SPIFFS is formatted
+> (clean empty FS) and `error` says why. Rejections (wrong product, busy,
+> sha mismatch) return 400/409 with `{"ok":false,"error":..}`. Optional
+> integrity check: append `&sha256=<hex of spiffs.bin>` (or `-H "X-Sha256: <hex>"`).
+> Product check: the first 4 KB are staged in RAM; a `SPOOLHARD-PRODUCT=<other>`
+> marker there is rejected (400) with the old frontend untouched (mkspiffs puts
+> the marker at ~offset 500). The partition is erased only once the correct
+> marker is seen (or 4 KB pass without any marker; then the final check still
+> rejects and formats). Limitation: a wrong `sha256=`, a truncated/corrupt
+> image, or a marker-less wrong image can't be detected before erasing (no
+> spare partition), so those leave an empty (formatted) FS and `status` = failed;
+> just re-upload.
+> Don't assume success from the POST alone: `curl .../status` afterwards.
+
 ## Troubleshooting
 
 - **"Not found" from the scale's HTTP root** — that's normal for arbitrary
