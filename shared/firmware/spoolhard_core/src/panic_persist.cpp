@@ -4,6 +4,7 @@
 #include <esp_system.h>
 #include <esp_idf_version.h>
 #include <esp_rom_sys.h>
+#include <atomic>
 
 namespace PanicPersist {
 
@@ -11,11 +12,13 @@ namespace {
 
 constexpr const char* kPendingPath = "/crash_pending.txt";
 constexpr const char* kSeqPath     = "/crash_seq.txt";
-constexpr uint32_t    kFlushIntervalMs = 30 * 1000;
+constexpr uint32_t    kFlushIntervalMs = 120 * 1000;
 constexpr size_t      kMaxLines = 80;
 constexpr bool        kGracefulOnly = false;  // future use
 
 uint32_t s_lastFlush_ms = 0;
+uint32_t s_lastFlushedSeq = 0;   // RingLog::headSeq() at last write
+std::atomic<bool> s_paused{false};
 const char* s_prev_reason = "UNKNOWN";
 
 const char* _resetReasonStr(esp_reset_reason_t r) {
@@ -93,9 +96,18 @@ const char* begin() {
 void tick() {
     uint32_t now = millis();
     if (now - s_lastFlush_ms < kFlushIntervalMs) return;
+    if (s_paused.load()) return;          // e.g. SPIFFS upload in progress
     s_lastFlush_ms = now;
+    // Nothing new in the ring since the last write: skip the ~10 KB
+    // SPIFFS rewrite (flash wear + a multi-ms blocking write).
+    uint32_t head = RingLog::headSeq();
+    if (head == s_lastFlushedSeq && SPIFFS.exists(kPendingPath)) return;
+    s_lastFlushedSeq = head;
     _writePending();
 }
+
+void pause()  { s_paused.store(true); }
+void resume() { s_paused.store(false); }
 
 void markGracefulExit() {
     SPIFFS.remove(kPendingPath);

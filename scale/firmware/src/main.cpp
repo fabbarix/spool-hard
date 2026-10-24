@@ -913,6 +913,8 @@ void loop() {
             // DIAGNOSTIC: dump WS client queue/state every second so we
             // can correlate the cycle's progression with queue-fill or
             // drain-stall behaviour.
+            // Throttled: log only on anomaly (queue backlog / full) or
+            // every 60 s as a liveness line; see tickStats().
             g_console.tickStats();
             // Surface the FreeRTOS-level ConsoleTx queue state too.
             // If this hits 0 free, we know the producer is over-running
@@ -920,7 +922,13 @@ void loop() {
             static uint32_t s_lastTxStat = 0;
             uint32_t tx  = ConsoleTx::framesTx();
             uint32_t drp = ConsoleTx::framesDropped();
-            if (tx != s_lastTxStat || drp != 0) {
+            static uint32_t s_lastTxLogMs = 0;
+            static uint32_t s_lastDrpLogged = 0;
+            // Log on new drops (anomaly), or tx progress at most every 60 s.
+            if (drp != s_lastDrpLogged ||
+                (tx != s_lastTxStat && (now - s_lastTxLogMs) >= 60000UL)) {
+                s_lastTxLogMs = now;
+                s_lastDrpLogged = drp;
                 dlog("ConsoleTx", "free=%u/%u tx=%u dropped=%u",
                      (unsigned)ConsoleTx::free(),
                      (unsigned)ConsoleTx::total(),
@@ -949,11 +957,16 @@ void loop() {
             // prints but the console doesn't see them, the loss is
             // wire-level (TCP / radio); if the dlog stops, it's a
             // local issue (count()==0, scheduler stall, etc.).
+            // Logged once per 60 s (every 40th beat) to keep the ring
+            // log and the SPIFFS crash tail free of 1.5 s chatter.
             static uint32_t s_hbSeq = 0;
-            dlog("HB", "#%u @%us heap=%u",
-                 ++s_hbSeq,
-                 (unsigned)(now/1000),
-                 (unsigned)ESP.getFreeHeap());
+            ++s_hbSeq;
+            if ((s_hbSeq % 40) == 1) {
+                dlog("HB", "#%u @%us heap=%u",
+                     s_hbSeq,
+                     (unsigned)(now/1000),
+                     (unsigned)ESP.getFreeHeap());
+            }
         }
     }
 

@@ -157,7 +157,7 @@ the headers are `#include`d).
   crash-log persistence without an esp_core_dump partition. On boot,
   if `esp_reset_reason()` indicates panic/WDT/brownout AND a pending
   ring-log tail file exists, it's promoted to `/crash_<seq>.txt`. The
-  pending file is rewritten every 30 s during normal operation. Each
+  pending file is rewritten every 120 s during normal operation (skipped when the ring is unchanged; `PanicPersist::pause()/resume()` suspend it). Each
   product registers its own `/api/crashes` route to surface the files.
 
 **Per-product identity**: the library has no per-product config header

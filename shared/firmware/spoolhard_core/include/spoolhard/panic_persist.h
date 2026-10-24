@@ -27,7 +27,7 @@
 //     normal operation; on next boot we check whether the previous
 //     reason was crashy and promote the tail to a stable seq if so.
 //   - The pending file is small (~8 KB) so the SPIFFS write cost is
-//     negligible. Persisted at most every 30 s and on clean
+//     negligible. Persisted at most every 120 s (only if the ring changed) and on clean
 //     `markGracefulExit()` calls.
 //   - On clean reboots the pending file is deleted to avoid
 //     confusing the next-boot promotion check.
@@ -39,8 +39,14 @@ namespace PanicPersist {
 const char* begin();
 
 // Periodic tick — call once per loop iteration (cheap). Internally
-// rate-gates SPIFFS writes to once every 30 s.
+// rate-gates SPIFFS writes to once every 120 s, and skips the
+// write entirely when the ring log has not changed.
 void tick();
+
+// Suspend / resume the periodic SPIFFS write (tick() becomes a no-op
+// while paused). Use around SPIFFS image uploads / filesystem-wide ops.
+void pause();
+void resume();
 
 // Mark this boot as cleanly exiting (call before ESP.restart()).
 void markGracefulExit();
