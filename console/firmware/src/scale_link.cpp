@@ -131,7 +131,9 @@ void ScaleLink::_taskBody(void* arg) {
             s_iter = 0;
             s_lastAliveMs = now;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        // 10 ms (~100 Hz): _ws.loop() + send-queue drain; was 2 ms (~485 Hz)
+        // which just burned CPU. Worst-case added latency per frame is 10 ms.
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -276,9 +278,24 @@ void ScaleLink::_onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
                         ? kNames[(int)type] : "?";
     uint32_t now = millis();
     uint32_t dt = _lastWsEventMs ? (now - _lastWsEventMs) : 0;
-    Serial.printf("[ScaleLink][ws] t=%s len=%u dt=%lums heap=%u\n",
-                  tname, (unsigned)length, (unsigned long)dt,
-                  (unsigned)ESP.getFreeHeap());
+    // Per-frame logging was pure noise (every Heartbeat/PING). Log anomalies
+    // (anything but TEXT/PING/PONG, a long inter-frame gap, low heap)
+    // immediately, and otherwise a one-line summary every 60 s.
+    static uint32_t s_wsFrames = 0, s_wsBytes = 0, s_wsLastSummaryMs = 0;
+    s_wsFrames++; s_wsBytes += (uint32_t)length;
+    const bool anomaly = (type != WStype_TEXT && type != WStype_PING && type != WStype_PONG) ||
+                         dt > 10000 || ESP.getFreeHeap() < 20000;
+    if (anomaly) {
+        Serial.printf("[ScaleLink][ws] t=%s len=%u dt=%lums heap=%u\n",
+                      tname, (unsigned)length, (unsigned long)dt,
+                      (unsigned)ESP.getFreeHeap());
+    } else if (now - s_wsLastSummaryMs >= 60000) {
+        Serial.printf("[ScaleLink][ws] %u frames / %u bytes in last %lus heap=%u\n",
+                      (unsigned)s_wsFrames, (unsigned)s_wsBytes,
+                      (unsigned long)((now - s_wsLastSummaryMs) / 1000),
+                      (unsigned)ESP.getFreeHeap());
+        s_wsFrames = 0; s_wsBytes = 0; s_wsLastSummaryMs = now;
+    }
     _lastWsEventMs = now;
     // Only TEXT/BIN frames count as "real" traffic for the stale
     // detector — PING/PONG keep the TCP connection alive but don't

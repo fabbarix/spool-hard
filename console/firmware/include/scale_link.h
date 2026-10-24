@@ -37,7 +37,7 @@ public:
     // same mesh AP. Pinning ruled out radio causes; Wi-Fi event log
     // confirmed zero STA-level disconnects.
     //
-    // After this task split, _ws.loop() runs at ~500 Hz regardless of
+    // After this task split, _ws.loop() runs at ~100 Hz regardless of
     // what main loop is doing, so PINGs are answered on time and
     // incoming TCP bytes are drained promptly.
     void beginTask();

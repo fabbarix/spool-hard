@@ -4,6 +4,9 @@
 #include <functional>
 #include <map>
 #include <vector>
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "spool_record.h"
 
 // Spool database — JSON Lines format, one record per line. Deleted records
@@ -23,6 +26,7 @@
 //                lastError() carries a user-facing message.
 class SpoolStore {
 public:
+    SpoolStore();
     enum class Status { NoBackend, Ready };
 
     // Initialise with a filesystem + JSONL path (e.g. "/spools.jsonl").
@@ -69,6 +73,11 @@ public:
     // tell the user where bytes land without re-querying NVS).
     void markBackendIsSd(bool b) { _backend_is_sd = b; }
 
+    // Bumped on EVERY mutation (upsert / remove / pack / migrate / begin /
+    // beginUnavailable). Pollers (LCD AMS panel, etc.) compare against the
+    // value they last rendered and skip the refresh when unchanged.
+    uint32_t generation() const { return _gen.load(std::memory_order_relaxed); }
+
     // Observer for any mutation (upsert / remove / pack). Fires AFTER
     // the index is updated and the on-disk file is consistent. Single
     // callback (set-replaces-set) — we only have one observer (the WS
@@ -84,6 +93,27 @@ private:
     bool    _backend_is_sd = false;
     std::function<void()> _onChange;   // fired after upsert/remove/pack
 
+    // The store is hit from loopTask, AsyncTCP handlers, the LVGL task and
+    // printer tasks, so every public op that touches _idIndex/_tagIndex/the
+    // file/the cache takes this (recursive: findByTagId -> findById).
+    // Created in the constructor (global object, before any task runs).
+    // _onChange is always fired AFTER the lock is released.
+    SemaphoreHandle_t _mtx = nullptr;
+    struct Lock {
+        SemaphoreHandle_t m;
+        explicit Lock(SemaphoreHandle_t mm) : m(mm) { xSemaphoreTakeRecursive(m, portMAX_DELAY); }
+        ~Lock() { xSemaphoreGiveRecursive(m); }
+    };
+    std::atomic<uint32_t> _gen{0};
+
+    // Tiny LRU of recently-read records (findById). Cleared wholesale on
+    // every mutation, so it can never serve stale data.
+    static constexpr size_t CACHE_N = 8;
+    struct CacheEnt { String id; SpoolRecord rec; uint32_t stamp = 0; bool used = false; };
+    CacheEnt _cache[CACHE_N];
+    uint32_t _cacheTick = 0;
+    void _invalidate() { for (auto& e : _cache) { e.used = false; e.id = ""; } _gen.fetch_add(1); }
+
     // id → byte offset of start of line in the file
     std::map<String, size_t> _idIndex;
     // tag_id → id
@@ -93,6 +123,7 @@ private:
     bool _append(const SpoolRecord& rec, size_t& outOffset);
     bool _tombstone(size_t offset);
     void _rebuildIndexes();
+    bool _packLocked();
     void _recoverPack();
 
     // Tombstoned lines seen by the last _rebuildIndexes().
