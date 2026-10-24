@@ -1,9 +1,9 @@
 import { useRef, useState } from 'react';
 import { Save, Upload, AlertTriangle, ShieldAlert, Download } from 'lucide-react';
-import { SectionCard } from '@spoolhard/ui/components/SectionCard';
-import { Button } from '@spoolhard/ui/components/Button';
-import { useReconnect } from '@spoolhard/ui/providers/ReconnectProvider';
-import { getStoredKey } from '@spoolhard/ui/utils/authStorage';
+import { SectionCard } from './SectionCard';
+import { Button } from './Button';
+import { useReconnect } from '../providers/ReconnectProvider';
+import { getStoredKey } from '../utils/authStorage';
 
 // Download/upload UI for the firmware's /api/backup + /api/restore
 // endpoints. The backup is a tar archive (manifest.json + nvs.json +
@@ -16,7 +16,7 @@ import { getStoredKey } from '@spoolhard/ui/utils/authStorage';
 // secrets, printer access codes. We force the user through an
 // explicit confirmation before generating a download so they can't
 // click through it without seeing the warning.
-export function BackupRestoreSection() {
+export function BackupRestoreSection({ product }: { product: 'console' | 'scale' }) {
   const [downloading,    setDownloading]    = useState(false);
   const [downloadError,  setDownloadError]  = useState<string | null>(null);
   const [acknowledged,   setAcknowledged]   = useState(false);
@@ -46,7 +46,7 @@ export function BackupRestoreSection() {
       const m  = cd.match(/filename="([^"]+)"/);
       const name = m
         ? m[1]
-        : `spoolhard-scale-${new Date().toISOString().slice(0, 10)}-backup.tar`;
+        : `spoolhard-${product}-${new Date().toISOString().slice(0, 10)}-backup.tar`;
       const url = URL.createObjectURL(blob);
       const a   = document.createElement('a');
       a.href = url; a.download = name;
@@ -110,7 +110,7 @@ export function BackupRestoreSection() {
     <SectionCard
       title="Backup & Restore"
       icon={<Save size={16} />}
-      description="Download a single JSON file capturing every configuration namespace and on-disk database the scale owns. Re-upload the same file (on this or a sibling device) to restore the full state. The device reboots automatically after a successful restore."
+      description={`Download a single JSON file capturing every configuration namespace and on-disk database the ${product} owns. Re-upload the same file (on this or a sibling device) to restore the full state. The device reboots automatically after a successful restore.`}
     >
       {/* ── Download ─────────────────────────────────────────── */}
       <div className="space-y-3">

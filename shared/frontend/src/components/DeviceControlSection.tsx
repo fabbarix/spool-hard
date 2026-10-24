@@ -1,14 +1,14 @@
 import { useState } from 'react';
 import { RotateCcw, Trash2, Power } from 'lucide-react';
-import { useRestart, useFactoryReset } from '../../hooks/useDeviceControl';
-import { SectionCard } from '@spoolhard/ui/components/SectionCard';
-import { Button } from '@spoolhard/ui/components/Button';
-import { ConfirmDialog } from '@spoolhard/ui/components/ConfirmDialog';
-import { useReconnect } from '@spoolhard/ui/providers/ReconnectProvider';
+import { useRestart, useFactoryReset } from '../hooks/useDeviceControl';
+import { SectionCard } from './SectionCard';
+import { Button } from './Button';
+import { ConfirmDialog } from './ConfirmDialog';
+import { useReconnect } from '../providers/ReconnectProvider';
 
 type ConfirmTarget = null | 'restart' | 'reset';
 
-export function DeviceControlSection() {
+export function DeviceControlSection({ factoryResetMessage }: { factoryResetMessage: string }) {
   const restart = useRestart();
   const factoryReset = useFactoryReset();
   const reconnect = useReconnect();
@@ -76,7 +76,7 @@ export function DeviceControlSection() {
       <ConfirmDialog
         open={confirming === 'reset'}
         title="Factory Reset"
-        message="This will erase all settings (WiFi, security key, calibration) and reboot. This cannot be undone."
+        message={factoryResetMessage}
         requireText="RESET"
         confirmLabel={factoryReset.isPending ? 'Resetting...' : 'Erase everything'}
         busy={isPending}

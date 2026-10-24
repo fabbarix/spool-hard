@@ -2,20 +2,22 @@ import { useState, useEffect } from 'react';
 import { Cpu, Scale, Printer, Shield, Wrench, Bug, Cloud } from 'lucide-react';
 import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
 import { WifiSection } from '../components/config/WifiSection';
-import { DeviceNameSection } from '../components/config/DeviceNameSection';
+import { DeviceNameSection } from '@spoolhard/ui/components/DeviceNameSection';
+import { SettingsGroup } from '@spoolhard/ui/components/SettingsGroup';
+import { QueryErrorBanner } from '@spoolhard/ui/components/QueryErrorBanner';
 import { OtaSection } from '../components/config/OtaSection';
 import { SecurityKeySection } from '../components/config/SecurityKeySection';
 import { ScaleSection } from '../components/config/ScaleSection';
 import { PrintersSection } from '../components/config/PrintersSection';
 import { DirectUploadSection } from '../components/config/DirectUploadSection';
-import { DeviceControlSection } from '../components/config/DeviceControlSection';
+import { DeviceControlSection } from '@spoolhard/ui/components/DeviceControlSection';
 import { DisplaySection } from '../components/config/DisplaySection';
 import { QuickWeightsSection } from '../components/config/QuickWeightsSection';
 import { CalibrationPresetsSection } from '../components/config/CalibrationPresetsSection';
 import { FilamentsDbSection } from '../components/config/FilamentsDbSection';
 import { BambuCloudSection } from '../components/config/BambuCloudSection';
 import { CloudPublicCacheSection } from '../components/config/CloudPublicCacheSection';
-import { BackupRestoreSection } from '../components/config/BackupRestoreSection';
+import { BackupRestoreSection } from '@spoolhard/ui/components/BackupRestoreSection';
 import { DebugSection } from '../components/config/DebugSection';
 
 type ConfigTab = 'setup' | 'scale' | 'printers' | 'cloud' | 'security' | 'device' | 'debug';
@@ -56,14 +58,15 @@ export function ConfigPage() {
   return (
     <div className="space-y-4">
       <SubTabBar tabs={tabs} active={activeTab} onChange={navigate} />
+      <QueryErrorBanner />
 
       <div className="animate-in">
         {activeTab === 'setup' && (
-          <div className="space-y-4">
+          <SettingsGroup title="Identity & network">
             <DeviceNameSection />
             <WifiSection />
             <DisplaySection />
-          </div>
+          </SettingsGroup>
         )}
 
         {activeTab === 'scale' && (
@@ -86,12 +89,18 @@ export function ConfigPage() {
         {activeTab === 'security' && <SecurityKeySection />}
 
         {activeTab === 'device' && (
-          <div className="space-y-4">
-            <OtaSection />
-            <DirectUploadSection />
-            <FilamentsDbSection />
-            <BackupRestoreSection />
-            <DeviceControlSection />
+          <div className="space-y-6">
+            <SettingsGroup title="Updates">
+              <OtaSection />
+              <DirectUploadSection />
+            </SettingsGroup>
+            <SettingsGroup title="Data" description="Filament library, backup and restore" defaultOpen={false}>
+              <FilamentsDbSection />
+              <BackupRestoreSection product="console" />
+            </SettingsGroup>
+            <SettingsGroup title="Danger zone" danger>
+              <DeviceControlSection factoryResetMessage="This will erase WiFi, security key, paired scale, printers, and the spool database, then reboot. This cannot be undone." />
+            </SettingsGroup>
           </div>
         )}
 

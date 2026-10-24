@@ -12,7 +12,7 @@ import {
   type GcodeAnalysis,
   type Printer,
 } from '../../hooks/usePrinters';
-import { useSpools, type SpoolRecord } from '../../hooks/useSpools';
+import { useSpools, remainingGrams, type SpoolRecord } from '../../hooks/useSpools';
 import { useUserFilaments, type UserFilament } from '../../hooks/useUserFilaments';
 import { useFilamentsDb } from '../../hooks/useFilamentsDb';
 import { AmsSlotPicker } from './AmsSlotPicker';
@@ -381,11 +381,7 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
   // for transparency, but the tile itself always reflects the running
   // estimate so users see it tick down through a print. Clamped at 0
   // so a slightly-over-budget run doesn't render as a negative number.
-  const weightG = (() => {
-    if (!spool || typeof spool.weight_current !== 'number' || spool.weight_current < 0) return null;
-    const consumed = typeof spool.consumed_since_weight === 'number' ? spool.consumed_since_weight : 0;
-    return Math.max(0, Math.round(spool.weight_current - consumed));
-  })();
+  const weightG = spool ? remainingGrams(spool) : null;
 
   // K value: prefer what the printer is actively reporting for this slot;
   // otherwise look up the stored value for this (printer, nozzle) in the

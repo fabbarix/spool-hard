@@ -1,19 +1,22 @@
 import { useState, useEffect } from 'react';
 import { Cpu, Scale, Shield, Wrench, Bug } from 'lucide-react';
-import { DeviceNameSection } from '../components/config/DeviceNameSection';
+import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
+import { DeviceNameSection } from '@spoolhard/ui/components/DeviceNameSection';
+import { SettingsGroup } from '@spoolhard/ui/components/SettingsGroup';
+import { QueryErrorBanner } from '@spoolhard/ui/components/QueryErrorBanner';
 import { WifiSection } from '../components/config/WifiSection';
 import { SecurityKeySection } from '../components/config/SecurityKeySection';
 import { ScaleSection } from '../components/config/ScaleSection';
 import { OtaSection } from '../components/config/OtaSection';
 import { DirectUploadSection } from '../components/config/DirectUploadSection';
-import { BackupRestoreSection } from '../components/config/BackupRestoreSection';
-import { DeviceControlSection } from '../components/config/DeviceControlSection';
+import { BackupRestoreSection } from '@spoolhard/ui/components/BackupRestoreSection';
+import { DeviceControlSection } from '@spoolhard/ui/components/DeviceControlSection';
 import { LedLegendSection } from '../components/config/LedLegendSection';
 import { DebugSection } from '../components/config/DebugSection';
 
 type ConfigTab = 'setup' | 'scale' | 'security' | 'device' | 'debug';
 
-const tabs: { id: ConfigTab; label: string; icon: React.ReactNode }[] = [
+const tabs: SubTab<ConfigTab>[] = [
   { id: 'setup',    label: 'Setup',    icon: <Cpu size={14} /> },
   { id: 'scale',    label: 'Scale',    icon: <Scale size={14} /> },
   { id: 'security', label: 'Security', icon: <Shield size={14} /> },
@@ -46,32 +49,16 @@ export function ConfigPage() {
 
   return (
     <div className="space-y-4">
-      {/* Sub-tab bar */}
-      <div className="flex gap-1 rounded-card bg-surface-card border border-surface-border p-1">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => navigate(tab.id)}
-            className={`
-              flex items-center gap-1.5 px-4 py-2 rounded-[7px] text-sm transition-all duration-200
-              ${activeTab === tab.id
-                ? 'bg-brand-500/15 text-brand-400 font-medium shadow-sm'
-                : 'text-text-secondary hover:text-text-primary hover:bg-surface-card-hover'}
-            `}
-          >
-            {tab.icon}
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      <SubTabBar tabs={tabs} active={activeTab} onChange={navigate} />
+      <QueryErrorBanner />
 
       {/* Tab content */}
       <div className="animate-in">
         {activeTab === 'setup' && (
-          <div className="space-y-4">
+          <SettingsGroup title="Identity & network">
             <DeviceNameSection />
             <WifiSection />
-          </div>
+          </SettingsGroup>
         )}
 
         {activeTab === 'scale' && <ScaleSection />}
@@ -79,12 +66,20 @@ export function ConfigPage() {
         {activeTab === 'security' && <SecurityKeySection />}
 
         {activeTab === 'device' && (
-          <div className="space-y-4">
-            <OtaSection />
-            <DirectUploadSection />
-            <BackupRestoreSection />
-            <LedLegendSection />
-            <DeviceControlSection />
+          <div className="space-y-6">
+            <SettingsGroup title="Updates">
+              <OtaSection />
+              <DirectUploadSection />
+            </SettingsGroup>
+            <SettingsGroup title="Data" description="Backup and restore" defaultOpen={false}>
+              <BackupRestoreSection product="scale" />
+            </SettingsGroup>
+            <SettingsGroup title="Indicators">
+              <LedLegendSection />
+            </SettingsGroup>
+            <SettingsGroup title="Danger zone" danger>
+              <DeviceControlSection factoryResetMessage="This will erase all settings (WiFi, security key, calibration) and reboot. This cannot be undone." />
+            </SettingsGroup>
           </div>
         )}
 
