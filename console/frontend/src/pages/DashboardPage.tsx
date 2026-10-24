@@ -112,7 +112,7 @@ export function DashboardPage() {
           </span>
         </summary>
         <div className="p-4 pt-0 space-y-4">
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             <StatCard
               label="Spools"
               value={spools?.total ?? '--'}
@@ -141,46 +141,44 @@ export function DashboardPage() {
               style={{ animationDelay: '150ms' }}
             />
           </div>
-          <div>
-        {/* microSD card */}
-        <div
-          className="animate-in bg-surface-card border border-surface-border rounded-card p-4"
-          style={{ animationDelay: '300ms' }}
-        >
-          <div className="flex items-center justify-between mb-2">
-            <div className="text-[10px] uppercase tracking-widest text-text-muted font-medium">microSD</div>
-            <div className="flex items-center gap-2">
-              <StatusDot status={fw?.sd_mounted ? 'connected' : 'disconnected'} />
-              <span className="text-xs text-text-secondary">
-                {fw?.sd_mounted ? 'Mounted' : 'Not inserted'}
-              </span>
-            </div>
-          </div>
-          {fw?.sd_mounted ? (
-            <>
-              {/* Used / total — explicit unit on both sides so "18" doesn't
-                  read as "18 bytes" or "18 GB". Also surface the percentage
-                  next to the bar since the raw MB number on its own doesn't
-                  convey "how full is this card". */}
-              <div className="flex items-baseline gap-2 font-data tabular-nums">
-                <span className="text-3xl text-text-data">{fmtMB(fw.sd_used)}</span>
-                <span className="text-base text-text-muted">MB</span>
-                <span className="text-base text-text-muted">/ {fmtGB(fw.sd_total)} GB</span>
-                <span className="text-base text-text-muted ml-auto">
-                  {((fw.sd_used / fw.sd_total) * 100).toFixed(1)}%
+          {/* microSD card */}
+          <div
+            className="animate-in bg-surface-card border border-surface-border rounded-card p-4"
+            style={{ animationDelay: '300ms' }}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-[10px] uppercase tracking-widest text-text-muted font-medium">microSD</div>
+              <div className="flex items-center gap-2">
+                <StatusDot status={fw?.sd_mounted ? 'connected' : 'disconnected'} />
+                <span className="text-xs text-text-secondary">
+                  {fw?.sd_mounted ? 'Mounted' : 'Not inserted'}
                 </span>
               </div>
-              <div className="mt-2 h-1.5 w-full rounded bg-surface-input overflow-hidden">
-                <div
-                  className="h-full bg-brand-500 transition-all duration-300"
-                  style={{ width: `${Math.min(100, (fw.sd_used / fw.sd_total) * 100)}%` }}
-                />
-              </div>
-            </>
-          ) : (
-            <div className="text-sm text-text-muted">Insert a microSD card to enable local spool backups.</div>
-          )}
-        </div>
+            </div>
+            {fw?.sd_mounted ? (
+              <>
+                {/* Used / total — explicit unit on both sides so "18" doesn't
+                    read as "18 bytes" or "18 GB". Also surface the percentage
+                    next to the bar since the raw MB number on its own doesn't
+                    convey "how full is this card". */}
+                <div className="flex items-baseline gap-2 font-data tabular-nums">
+                  <span className="text-3xl text-text-data">{fmtMB(fw.sd_used)}</span>
+                  <span className="text-base text-text-muted">MB</span>
+                  <span className="text-base text-text-muted">/ {fmtGB(fw.sd_total)} GB</span>
+                  <span className="text-base text-text-muted ml-auto">
+                    {((fw.sd_used / fw.sd_total) * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <div className="mt-2 h-1.5 w-full rounded bg-surface-input overflow-hidden">
+                  <div
+                    className="h-full bg-brand-500 transition-all duration-300"
+                    style={{ width: `${Math.min(100, (fw.sd_used / fw.sd_total) * 100)}%` }}
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="text-sm text-text-muted">Insert a microSD card to enable local spool backups.</div>
+            )}
           </div>
         </div>
       </details>
