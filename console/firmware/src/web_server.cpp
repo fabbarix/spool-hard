@@ -34,6 +34,7 @@
 #include <LittleFS.h>
 #include <SD.h>
 #include <Update.h>
+#include "spoolhard/path_route.h"
 #include "spoolhard/serial_mirror.h"
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -561,16 +562,16 @@ void ConsoleWebServer::_setupRoutes() {
     // Crash logs preserved on SD by CrashLogger. List, download a single
     // log, delete one, or delete all. Helps diagnose instability remotely
     // when the ring buffer was wiped by the crash itself.
-    // CRITICAL: register the per-id (regex) routes BEFORE the literal
-    // `/api/crashes` collection routes. mathieucarbou's ESPAsyncWebServer
+    // CRITICAL: register the per-id (PathRoute) routes BEFORE the literal
+    // `/api/crashes` collection routes. The esp32async ESPAsyncWebServer
     // does PREFIX match on literal `on()` paths — `/api/crashes` would
     // otherwise capture every `/api/crashes/<id>` request and serve the
     // list JSON instead of the requested crash log.
-    _server.on("^\\/api\\/crashes\\/([0-9]+)$", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_GET, "/api/crashes/", "", false, true, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCrashGet(req);
     });
-    _server.on("^\\/api\\/crashes\\/([0-9]+)$", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/crashes/", "", false, true, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCrashDelete(req);
     });
@@ -647,6 +648,7 @@ void ConsoleWebServer::_setupRoutes() {
             SpoolhardBackup::RestoreReport rep;
             String why;
             int code = _restore.finish(rep, why);
+            SpoolhardAuth::invalidateKeyCache();  // restore may have rewritten wifi_cfg/fixed_key
             if (code >= 400 && code < 500) {
                 JsonDocument err;
                 err["error"] = why;
@@ -695,11 +697,11 @@ void ConsoleWebServer::_setupRoutes() {
         });
 
     // ── Spool CRUD ───────────────────────────────────────────
+    spoolhard::addPathRoute(_server, HTTP_GET, "/api/spools/", "", true, false, [this](AsyncWebServerRequest* req) {
+        _handleSpoolGet(req);
+    });
     _server.on("/api/spools", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleSpoolsList(req);
-    });
-    _server.on("^\\/api\\/spools\\/(.+)$", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleSpoolGet(req);
     });
     _server.on("/api/spools", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -707,7 +709,7 @@ void ConsoleWebServer::_setupRoutes() {
             _handleSpoolPost(req, data, len);
         }
     );
-    _server.on("^\\/api\\/spools\\/(.+)$", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/spools/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handleSpoolDelete(req);
     });
 
@@ -727,11 +729,11 @@ void ConsoleWebServer::_setupRoutes() {
     _server.on("/api/user-filaments/cloud-sync/status", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentsCloudSyncStatus(req);
     });
-    _server.on("^\\/api\\/user-filaments\\/(.+)\\/cloud-push$", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_POST, "/api/user-filaments/", "/cloud-push", true, false, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleUserFilamentCloudPush(req);
     });
-    _server.on("^\\/api\\/user-filaments\\/(.+)\\/cloud-detail$", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_GET, "/api/user-filaments/", "/cloud-detail", true, false, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleUserFilamentCloudDetail(req);
     });
@@ -775,11 +777,11 @@ void ConsoleWebServer::_setupRoutes() {
         }
     );
 
+    spoolhard::addPathRoute(_server, HTTP_GET, "/api/user-filaments/", "", true, false, [this](AsyncWebServerRequest* req) {
+        _handleUserFilamentGet(req);
+    });
     _server.on("/api/user-filaments", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentsList(req);
-    });
-    _server.on("^\\/api\\/user-filaments\\/(.+)$", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleUserFilamentGet(req);
     });
     _server.on("/api/user-filaments", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -787,39 +789,39 @@ void ConsoleWebServer::_setupRoutes() {
             _handleUserFilamentPost(req, data, len);
         }
     );
-    _server.on("^\\/api\\/user-filaments\\/(.+)$", HTTP_PUT, [](AsyncWebServerRequest*) {}, nullptr,
+    spoolhard::addPathRoute(_server, HTTP_PUT, "/api/user-filaments/", "", true, false, [](AsyncWebServerRequest*) {},
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handleUserFilamentPost(req, data, len);  // PUT shares the upsert handler
         }
     );
-    _server.on("^\\/api\\/user-filaments\\/(.+)$", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/user-filaments/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentDelete(req);
     });
 
     // ── Printers CRUD ────────────────────────────────────────
-    // Register specific sub-routes FIRST — the ESPAsyncWebServer regex router
-    // matches in registration order and `^/api/printers/(.+)$` is greedy
+    // Register specific sub-routes FIRST — the ESPAsyncWebServer router
+    // matches in registration order and the `/api/printers/<(.+)>` route is greedy
     // enough to swallow `/api/printers/<serial>/analysis` as a single capture
     // group, shadowing the /analysis, /analyze, and /ams-mapping handlers.
-    _server.on("^\\/api\\/printers\\/([^/]+)\\/analyze$", HTTP_POST,
-        [](AsyncWebServerRequest*) {}, nullptr,
+    spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/analyze", false, false,
+        [](AsyncWebServerRequest*) {},
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handlePrinterAnalyzeStart(req, data, len);
         });
-    _server.on("^\\/api\\/printers\\/([^/]+)\\/analysis$", HTTP_GET,
+    spoolhard::addPathRoute(_server, HTTP_GET, "/api/printers/", "/analysis", false, false,
         [this](AsyncWebServerRequest* req) {
             _handlePrinterAnalysisGet(req);
         });
-    _server.on("^\\/api\\/printers\\/([^/]+)\\/ams-mapping$", HTTP_POST,
-        [](AsyncWebServerRequest*) {}, nullptr,
+    spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/ams-mapping", false, false,
+        [](AsyncWebServerRequest*) {},
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handlePrinterAmsMappingPost(req, data, len);
         });
-    _server.on("^\\/api\\/printers\\/([^/]+)\\/import-ams-spool$", HTTP_POST,
-        [](AsyncWebServerRequest*) {}, nullptr,
+    spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/import-ams-spool", false, false,
+        [](AsyncWebServerRequest*) {},
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handlePrinterImportAmsSpool(req, data, len);
@@ -828,8 +830,8 @@ void ConsoleWebServer::_setupRoutes() {
     // operation (probe / list / download) and streams per-step progress over
     // the WS as ftp_trace + a final ftp_done event. Body is JSON
     // {"op": "probe"|"list"|"download", "path": "/cache"}.
-    _server.on("^\\/api\\/printers\\/([^/]+)\\/ftp-debug$", HTTP_POST,
-        [](AsyncWebServerRequest*) {}, nullptr,
+    spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/ftp-debug", false, false,
+        [](AsyncWebServerRequest*) {},
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handlePrinterFtpDebug(req, data, len);
@@ -838,10 +840,10 @@ void ConsoleWebServer::_setupRoutes() {
     // when a firmware update has flipped the printer's session-reuse
     // behaviour and you want to force re-discovery on the next FTPS open
     // instead of waiting for the self-healing fallback to kick in.
-    _server.on("^\\/api\\/printers\\/([^/]+)\\/ftp-quirks\\/reset$", HTTP_POST,
+    spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/ftp-quirks/reset", false, false,
         [this](AsyncWebServerRequest* req) {
             if (!_requireAuth(req)) return;
-            String serial = req->pathArg(0);
+            String serial = spoolhard::pathArg(req, "/api/printers/", "/ftp-quirks/reset", false);
             if (serial.isEmpty()) {
                 req->send(400, "application/json", "{\"error\":\"serial required\"}");
                 return;
@@ -861,17 +863,17 @@ void ConsoleWebServer::_setupRoutes() {
             req->send(200, "application/json", out);
         });
 
-    // Registered before the `^\/api\/printers\/(.+)$` GET regex so the
+    // Registered before the `/api/printers/<serial>` GET PathRoute so the
     // exact path doesn't accidentally get swallowed as a serial.
     _server.on("/api/printers/refresh", HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handlePrinterRefresh(req);
     });
+    spoolhard::addPathRoute(_server, HTTP_GET, "/api/printers/", "", true, false, [this](AsyncWebServerRequest* req) {
+        _handlePrinterGet(req);
+    });
     _server.on("/api/printers", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handlePrintersList(req);
-    });
-    _server.on("^\\/api\\/printers\\/(.+)$", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handlePrinterGet(req);
     });
     _server.on("/api/printers", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -879,7 +881,7 @@ void ConsoleWebServer::_setupRoutes() {
             _handlePrinterPost(req, data, len);
         }
     );
-    _server.on("^\\/api\\/printers\\/(.+)$", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/printers/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handlePrinterDelete(req);
     });
     _server.on("/api/discovery/printers", HTTP_GET, [this](AsyncWebServerRequest* req) {
@@ -1369,6 +1371,7 @@ void ConsoleWebServer::_setupRoutes() {
         if (SPIFFS.exists("/index.html.gz")) {
             auto* resp = req->beginResponse(SPIFFS, "/index.html.gz", "text/html");
             resp->addHeader("Content-Encoding", "gzip");
+            resp->addHeader("Cache-Control", "no-cache");
             req->send(resp);
         } else if (SPIFFS.exists("/index.html")) {
             req->send(SPIFFS, "/index.html", "text/html");
@@ -1381,9 +1384,16 @@ void ConsoleWebServer::_setupRoutes() {
 
     // Serve static assets. Auto-gzip support: if a `.gz` variant exists in
     // SPIFFS, serveStatic serves it with Content-Encoding: gzip.
+    // Cache policy: Vite emits content-hashed files under /a/ (safe to cache
+    // forever); everything else (index.html and any other un-hashed entry)
+    // must revalidate on every load or a firmware/frontend update stays
+    // invisible for up to a day. Hashed dir first: the root handler would
+    // otherwise claim those URLs too.
+    _server.serveStatic("/a/", SPIFFS, "/a/")
+           .setCacheControl("public, max-age=31536000, immutable");
     _server.serveStatic("/", SPIFFS, "/")
            .setDefaultFile("index.html")
-           .setCacheControl("max-age=86400");
+           .setCacheControl("no-cache");
 
     // Log every incoming request that isn't handled by a registered route.
     // Helps diagnose 404s from the SPA or missing assets.
@@ -1699,11 +1709,11 @@ void ConsoleWebServer::_handleCrashGet(AsyncWebServerRequest* req) {
                   "{\"error\":\"crash logging unavailable (no SD card?)\"}");
         return;
     }
-    if (req->pathArg(0).isEmpty()) {
+    if (spoolhard::pathArg(req, "/api/crashes/", "", false).isEmpty()) {
         req->send(400, "application/json", "{\"error\":\"missing seq\"}");
         return;
     }
-    uint32_t seq = (uint32_t)req->pathArg(0).toInt();
+    uint32_t seq = (uint32_t)spoolhard::pathArg(req, "/api/crashes/", "", false).toInt();
     String path  = CrashLogger::pathFor(seq);
     if (path.isEmpty()) {
         req->send(404, "application/json", "{\"error\":\"crash not found\"}");
@@ -1720,7 +1730,7 @@ void ConsoleWebServer::_handleCrashDelete(AsyncWebServerRequest* req) {
                   "{\"error\":\"crash logging unavailable\"}");
         return;
     }
-    uint32_t seq = (uint32_t)req->pathArg(0).toInt();
+    uint32_t seq = (uint32_t)spoolhard::pathArg(req, "/api/crashes/", "", false).toInt();
     bool ok = CrashLogger::remove(seq);
     if (!ok) {
         req->send(404, "application/json", "{\"error\":\"crash not found\"}");
@@ -1791,7 +1801,7 @@ void ConsoleWebServer::_handleSpoolsList(AsyncWebServerRequest* req) {
 void ConsoleWebServer::_handleSpoolGet(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
     if (!_store) { req->send(503, "application/json", "{\"error\":\"store unavailable\"}"); return; }
-    String id = req->pathArg(0);
+    String id = spoolhard::pathArg(req, "/api/spools/", "", true);
     SpoolRecord rec;
     if (!_store->findById(id, rec)) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
@@ -1841,7 +1851,7 @@ void ConsoleWebServer::_handleSpoolPost(AsyncWebServerRequest* req, uint8_t* dat
 void ConsoleWebServer::_handleSpoolDelete(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
     if (!_store) { req->send(503, "application/json", "{\"error\":\"store unavailable\"}"); return; }
-    String id = req->pathArg(0);
+    String id = spoolhard::pathArg(req, "/api/spools/", "", true);
     if (!_store->remove(id)) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
         return;
@@ -1999,7 +2009,7 @@ void ConsoleWebServer::_handleUserFilamentsList(AsyncWebServerRequest* req) {
 
 void ConsoleWebServer::_handleUserFilamentGet(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
-    String id = req->pathArg(0);
+    String id = spoolhard::pathArg(req, "/api/user-filaments/", "", true);
     FilamentRecord rec;
     if (!g_user_filaments.findById(id, rec)) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
@@ -2025,7 +2035,7 @@ void ConsoleWebServer::_handleUserFilamentPost(AsyncWebServerRequest* req,
     //     it (lets a sync flow recreate a known id).
     //   PUT  /api/user-filaments/{id} — update. id from the URL takes
     //     precedence; body's setting_id (if any) is ignored.
-    String pathId = req->pathArg(0);   // "" for POST, id for PUT
+    String pathId = (req->method() == HTTP_PUT ? spoolhard::pathArg(req, "/api/user-filaments/", "", true) : String());   // "" for POST, id for PUT
     String bodyId = doc["setting_id"] | "";
 
     FilamentRecord rec;
@@ -2064,7 +2074,7 @@ void ConsoleWebServer::_handleUserFilamentPost(AsyncWebServerRequest* req,
 
 void ConsoleWebServer::_handleUserFilamentDelete(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
-    String id = req->pathArg(0);
+    String id = spoolhard::pathArg(req, "/api/user-filaments/", "", true);
     FilamentRecord rec;
     if (!g_user_filaments.findById(id, rec)) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
@@ -2357,7 +2367,7 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
                   "{\"error\":\"no Bambu Cloud token configured\"}");
         return;
     }
-    String id = req->pathArg(0);
+    String id = spoolhard::pathArg(req, "/api/user-filaments/", "/cloud-push", true);
     FilamentRecord rec;
     if (!g_user_filaments.findById(id, rec)) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
@@ -2451,7 +2461,7 @@ void ConsoleWebServer::_handleUserFilamentCloudDetail(AsyncWebServerRequest* req
                   "{\"error\":\"no Bambu Cloud token configured\"}");
         return;
     }
-    String id = req->pathArg(0);
+    String id = spoolhard::pathArg(req, "/api/user-filaments/", "/cloud-detail", true);
     FilamentRecord rec;
     if (!g_user_filaments.findById(id, rec)) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
@@ -3001,7 +3011,7 @@ void ConsoleWebServer::_handlePrintersList(AsyncWebServerRequest* req) {
 
 void ConsoleWebServer::_handlePrinterGet(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
-    String serial = req->pathArg(0);
+    String serial = spoolhard::pathArg(req, "/api/printers/", "", true);
     const PrinterConfig* cfg = g_printers_cfg.find(serial);
     if (!cfg) { req->send(404, "application/json", "{\"error\":\"not found\"}"); return; }
     JsonDocument doc;
@@ -3034,7 +3044,7 @@ void ConsoleWebServer::_handlePrinterPost(AsyncWebServerRequest* req, uint8_t* d
 
 void ConsoleWebServer::_handlePrinterDelete(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
-    String serial = req->pathArg(0);
+    String serial = spoolhard::pathArg(req, "/api/printers/", "", true);
     if (!g_printers_cfg.remove(serial)) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
         return;
@@ -3050,7 +3060,7 @@ void ConsoleWebServer::_handlePrinterDelete(AsyncWebServerRequest* req) {
 // PSRAM-static stack when internal DRAM is fragmented (typical mid-print).
 void ConsoleWebServer::_handlePrinterAnalyzeStart(AsyncWebServerRequest* req,
                                                   uint8_t* data, size_t len) {
-    String serial = req->pathArg(0);
+    String serial = spoolhard::pathArg(req, "/api/printers/", "/analyze", false);
     BambuPrinter* p = g_bambu.find(serial);
     if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
     if (p->analysisInProgress()) {
@@ -3144,7 +3154,7 @@ static void serializeAnalysis(JsonObject doc, BambuPrinter* p) {
 
 void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
-    String serial = req->pathArg(0);
+    String serial = spoolhard::pathArg(req, "/api/printers/", "/analysis", false);
     BambuPrinter* p = g_bambu.find(serial);
     if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
     JsonDocument doc;
@@ -3155,7 +3165,7 @@ void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
 
 void ConsoleWebServer::_handlePrinterAmsMappingPost(AsyncWebServerRequest* req,
                                                     uint8_t* data, size_t len) {
-    String serial = req->pathArg(0);
+    String serial = spoolhard::pathArg(req, "/api/printers/", "/ams-mapping", false);
     PrinterConfig* cfg = const_cast<PrinterConfig*>(g_printers_cfg.find(serial));
     if (!cfg) {
         req->send(404, "application/json", "{\"error\":\"unknown printer\"}");
@@ -3213,7 +3223,7 @@ void ConsoleWebServer::_handlePrinterAmsMappingPost(AsyncWebServerRequest* req,
 //                      "imported": [] means the record was already in sync.
 void ConsoleWebServer::_handlePrinterImportAmsSpool(AsyncWebServerRequest* req,
                                                     uint8_t* data, size_t len) {
-    String serial = req->pathArg(0);
+    String serial = spoolhard::pathArg(req, "/api/printers/", "/import-ams-spool", false);
     BambuPrinter* p = g_bambu.find(serial);
     if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
 
@@ -3286,7 +3296,7 @@ void ConsoleWebServer::_handlePrinterImportAmsSpool(AsyncWebServerRequest* req,
 
 void ConsoleWebServer::_handlePrinterFtpDebug(AsyncWebServerRequest* req,
                                               uint8_t* data, size_t len) {
-    String serial = req->pathArg(0);
+    String serial = spoolhard::pathArg(req, "/api/printers/", "/ftp-debug", false);
     BambuPrinter* p = g_bambu.find(serial);
     if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
     JsonDocument doc;

@@ -31,6 +31,11 @@ constexpr const char* kNvsKeyFixedKey   = "fixed_key";
 // /api/fixed-key-config to enable enforcement.
 constexpr const char* kDefaultFixedKey  = "Change-Me!";
 
+// The fixed key is cached in RAM after first use. Anything that writes
+// wifi_cfg/fixed_key outside auth.cpp (e.g. a backup restore) MUST
+// call this so the next request re-reads NVS.
+void invalidateKeyCache();
+
 // Returns true if the request is allowed (no key set OR Bearer/?key=
 // match). On false, sends 401 and the caller must `return;`.
 bool requireAuth(AsyncWebServerRequest* req);
