@@ -22,15 +22,25 @@ static constexpr size_t kMinFreeHeapForLog = 24 * 1024;
 
 static std::deque<Entry> s_buf;
 static uint32_t          s_seq = 0;
-static SemaphoreHandle_t s_mtx = nullptr;
+static SemaphoreHandle_t volatile s_mtx = nullptr;
 
-static void _ensureMutex() {
-    // Lazy-init the mutex so callers don't need an explicit begin().
-    // The first push lazily allocates; concurrent races at boot would
-    // double-init but RingLog is a singleton on a single core so it's
-    // a non-issue in practice.
-    if (!s_mtx) s_mtx = xSemaphoreCreateMutex();
+static SemaphoreHandle_t _lazyMutex(SemaphoreHandle_t volatile* slot) {
+    // Race-free lazy create: build a candidate, CAS it into the slot, and
+    // delete it if another task won. Safe from any task/core, any time.
+    SemaphoreHandle_t cur = *slot;
+    if (cur) return cur;
+    SemaphoreHandle_t fresh = xSemaphoreCreateMutex();
+    if (!fresh) return nullptr;
+    SemaphoreHandle_t expected = nullptr;
+    if (__atomic_compare_exchange_n((SemaphoreHandle_t*)slot, &expected, fresh, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        return fresh;
+    }
+    vSemaphoreDelete(fresh);
+    return expected;
 }
+
+static void _ensureMutex() { _lazyMutex(&s_mtx); }
 
 void push(const String& line) {
     // Self-throttle on heap pressure so logging never tips a marginal

@@ -35,14 +35,28 @@ const char* typeToString(ScaleToConsole::Type t) { return s2cName(t); }
 
 // ── Scale → Console ─────────────────────────────────────────
 
+static SemaphoreHandle_t _lazyMutex(SemaphoreHandle_t volatile* slot) {
+    // Race-free lazy create: build a candidate, CAS it into the slot, and
+    // delete it if another task won. Safe from any task/core, any time.
+    SemaphoreHandle_t cur = *slot;
+    if (cur) return cur;
+    SemaphoreHandle_t fresh = xSemaphoreCreateMutex();
+    if (!fresh) return nullptr;
+    SemaphoreHandle_t expected = nullptr;
+    if (__atomic_compare_exchange_n((SemaphoreHandle_t*)slot, &expected, fresh, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        return fresh;
+    }
+    vSemaphoreDelete(fresh);
+    return expected;
+}
+
 namespace ScaleToConsole {
 
 static std::function<void(const String&)> g_txTap;
-static SemaphoreHandle_t g_tx_tap_mtx = nullptr;
+static SemaphoreHandle_t volatile g_tx_tap_mtx = nullptr;
 
-static void _ensureTxTapMutex() {
-    if (!g_tx_tap_mtx) g_tx_tap_mtx = xSemaphoreCreateMutex();
-}
+static void _ensureTxTapMutex() { _lazyMutex(&g_tx_tap_mtx); }
 
 void setTxTap(std::function<void(const String&)> cb) {
     _ensureTxTapMutex();
@@ -287,12 +301,12 @@ static constexpr size_t kMaxQueueDepth = 64;
 // AsyncTCP path discards the inbound frame (better than blocking the
 // network task), the main path returns "no message" (next loop tick
 // will retry).
-static SemaphoreHandle_t g_queue_mtx = nullptr;
-static SemaphoreHandle_t g_tap_mtx   = nullptr;
+static SemaphoreHandle_t volatile g_queue_mtx = nullptr;
+static SemaphoreHandle_t volatile g_tap_mtx   = nullptr;
 
 static void _ensureMutex() {
-    if (!g_queue_mtx) g_queue_mtx = xSemaphoreCreateMutex();
-    if (!g_tap_mtx)   g_tap_mtx   = xSemaphoreCreateMutex();
+    _lazyMutex(&g_queue_mtx);
+    _lazyMutex(&g_tap_mtx);
 }
 
 void setRxTap(std::function<void(const String&)> cb) {

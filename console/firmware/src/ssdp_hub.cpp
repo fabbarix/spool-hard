@@ -22,3 +22,9 @@ void ssdp_hub_probe() {
     g_ssdp_1900.sendMSearch("ssdp:all");
     g_ssdp_bambu_2021.sendMSearch("urn:bambulab-com:device:3dprinter:1");
 }
+
+void ssdp_hub_poll() {
+    g_ssdp_1990.poll();
+    g_ssdp_1900.poll();
+    g_ssdp_bambu_2021.poll();
+}

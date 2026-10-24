@@ -141,6 +141,9 @@ the headers are `#include`d).
   SD-persisted output.) NB: the esp32async fork's default route matcher
   is prefix-style; `/api/logs` uses `AsyncURIMatcher::exact()` so it
   doesn't shadow those sub-routes. Register specific-before-generic.
+- Lazy mutexes (ring_log, scale protocol.cpp) are created via a CAS
+  helper (build candidate, compare-exchange into the slot, delete if
+  lost) so concurrent first use is race-free and usable before setup().
 - `spoolhard/deferred_reboot.h` / `src/deferred_reboot.cpp` —
   `spoolhardDeferredReboot()`: reboot from a detached task so an
   AsyncWebServer handler's queued response actually flushes first.
@@ -278,3 +281,12 @@ is separate from the `~/.claude/projects/.../memory/` auto-memory above.
 Don't duplicate; only write a Serena memory if a fact is specifically
 useful to future Serena symbol-navigation sessions (e.g. "the protocol
 enum lives at `*/firmware/src/protocol.h`").
+
+## Console SSDP + manual OTA (0.12.16+)
+
+- `SsdpListener::_onPacket` runs on the async_udp task (tiny stack): it only
+  parses and enqueues a POD record (4-deep ring, drop on overflow).
+  Subscribers run from `loopTask` via `ssdp_hub_poll()`.
+- Console manual OTA (`g_pendingOta`) now uses `otaTaskSpawn` like the scale.
+  The progress callback only writes atomics; `loop()` renders LVGL and
+  detects failure (task exit). Same 50 KB internal-DRAM gate as the checker.

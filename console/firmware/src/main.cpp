@@ -32,6 +32,8 @@
 #include <lvgl.h>   // LV_SYMBOL_* FontAwesome glyphs baked into Montserrat
 #include "scale_discovery.h"
 #include "ssdp_hub.h"
+#include <atomic>
+#include <esp_heap_caps.h>
 #include "spoolhard/serial_mirror.h"
 
 // ── Globals ──────────────────────────────────────────────────
@@ -1290,6 +1292,7 @@ void loop() {
     LAT_STEP("sd",              g_sd.update());
     LAT_STEP("crash_log",       CrashLogger::update());
     LAT_STEP("bambu",           g_bambu.update());
+    LAT_STEP("ssdp",            ssdp_hub_poll());
     LAT_STEP("bambu_discovery", g_bambu_discovery.update());
     LAT_STEP("scale_discovery", g_scale_discovery.update());
     LAT_STEP("ota_check",       g_ota_checker.update());
@@ -1470,64 +1473,101 @@ void loop() {
         }
     }
 
-    // Pending OTA triggered via web API.
-    if (g_pendingOta) {
-        g_pendingOta = false;
-        OtaConfig cfg; cfg.load();
+    // Pending OTA triggered via web API / LCD. otaRun executes on its own
+    // "ota_run" task (otaTaskSpawn) so loopTask keeps running (WDT, UI,
+    // MQTT). The progress callback runs on the OTA task and must NOT touch
+    // LVGL: it only publishes into atomics; loopTask renders them below.
+    static std::atomic<int>  s_otaKind{0};       // 0 idle, 1 firmware, 2 frontend
+    static std::atomic<int>  s_otaPercent{0};
+    static bool     s_otaActive    = false;      // loopTask-only
+    static bool     s_otaSeenTask  = false;
+    static uint32_t s_otaSpawnMs   = 0;
+    static uint32_t s_otaPrevSleepS = 0;
+    static String   s_otaFwLabel, s_otaFeLabel;
+    static int      s_otaShownKind = -1, s_otaShownPct = -1;
+    static uint32_t s_otaGateSinceMs = 0;
 
-        // Pull the target versions out of the cached manifest so the
-        // LCD's "vX.Y.Z" subtitle reflects what's actually being
-        // flashed, instead of the static "firmware" placeholder. Empty
-        // fallbacks for the cold-start case where the user could (in
-        // theory) trigger an update before the checker has run.
-        auto manifest = g_ota_checker.lastManifest();
-        String fwLabel = manifest.firmware_version.length()
-                         ? "v" + manifest.firmware_version
-                         : "firmware";
-        String feLabel = manifest.frontend_version.length()
-                         ? "v" + manifest.frontend_version
-                         : "frontend";
-
-        // Disable the screen-sleep timer for the duration of the
-        // update — calling wake() per tick handles the common case but
-        // a long pause between firmware verify and frontend start (or a
-        // slow manifest fetch) could otherwise let the screen blank
-        // mid-flash. Restored on the failure-return path; on success
-        // the device reboots so persisted NVS value is what we read on
-        // next boot.
-        uint32_t prevSleepS = ConsoleDisplay::sleepTimeout();
-        ConsoleDisplay::setSleepTimeout(0);
-
-        // Seed the in-flight tracker so /api/ota-status reflects the
-        // "preparing…" phase before otaRun's first progress tick lands.
-        g_ota_in_flight = { true, "firmware", 0, millis() };
-        ui_show_ota_progress(0, "Updating Firmware", fwLabel.c_str());
-
-        otaRun(cfg, [fwLabel, feLabel](OtaProgress p) {
-            const char* kind =
-                p.kind == OtaProgress::Kind::Frontend ? "frontend" :
-                p.kind == OtaProgress::Kind::Firmware ? "firmware" :
-                                                        "";
-            g_ota_in_flight = { true, kind, p.percent, g_ota_in_flight.started_ms };
-            const char* title = nullptr;
-            const char* ver   = nullptr;
-            if (p.kind == OtaProgress::Kind::Frontend) {
-                title = "Updating Frontend";
-                ver   = feLabel.c_str();
-            } else if (p.kind == OtaProgress::Kind::Firmware) {
-                title = "Updating Firmware";
-                ver   = fwLabel.c_str();
+    if (g_pendingOta && !s_otaActive && !otaTaskInFlight()) {
+        // Internal-DRAM gate (same threshold as the OTA checker): the task
+        // stack + TLS handshake come from internal DRAM; below this the
+        // handshake OOM-panics (see project_console_ota_oom_panic_loop).
+        // Keep the request pending and retry; give up after 2 minutes.
+        constexpr size_t kOtaMinFreeInternal = 50 * 1024;
+        size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        if (freeInternal < kOtaMinFreeInternal) {
+            if (!s_otaGateSinceMs) {
+                s_otaGateSinceMs = millis() | 1;
+                Serial.printf("[OTA] apply deferred — free internal DRAM %u < %u\n",
+                              (unsigned)freeInternal, (unsigned)kOtaMinFreeInternal);
+            } else if (millis() - s_otaGateSinceMs > 120000UL) {
+                Serial.println("[OTA] apply abandoned — DRAM gate never cleared");
+                g_pendingOta = false;
+                s_otaGateSinceMs = 0;
             }
-            // Belt-and-braces with setSleepTimeout(0) above — wake on
-            // every tick keeps the backlight pinned even if a future
-            // refactor drops the timeout override.
-            ConsoleDisplay::wake();
-            ui_show_ota_progress(p.percent, title, ver);
-        });
-        // otaRun() reboots on success; if we return, it failed.
-        ConsoleDisplay::setSleepTimeout(prevSleepS);
-        g_ota_in_flight = {};
-        ui_show_home();
+        } else {
+            g_pendingOta = false;
+            s_otaGateSinceMs = 0;
+            OtaConfig cfg; cfg.load();
+
+            // Pull the target versions out of the cached manifest so the
+            // LCD's "vX.Y.Z" subtitle reflects what's actually being
+            // flashed, instead of the static "firmware" placeholder.
+            auto manifest = g_ota_checker.lastManifest();
+            s_otaFwLabel = manifest.firmware_version.length()
+                           ? "v" + manifest.firmware_version : String("firmware");
+            s_otaFeLabel = manifest.frontend_version.length()
+                           ? "v" + manifest.frontend_version : String("frontend");
+
+            // Disable the screen-sleep timer for the duration of the
+            // update; restored below if the run fails (on success the
+            // device reboots).
+            s_otaPrevSleepS = ConsoleDisplay::sleepTimeout();
+            ConsoleDisplay::setSleepTimeout(0);
+
+            g_ota_in_flight = { true, "firmware", 0, millis() };
+            s_otaKind = 1; s_otaPercent = 0;
+            s_otaShownKind = -1; s_otaShownPct = -1;
+            ui_show_ota_progress(0, "Updating Firmware", s_otaFwLabel.c_str());
+
+            s_otaActive = true; s_otaSeenTask = false; s_otaSpawnMs = millis();
+            TaskHandle_t h = otaTaskSpawn(cfg, [](OtaProgress p) {
+                int k = p.kind == OtaProgress::Kind::Frontend ? 2 :
+                        p.kind == OtaProgress::Kind::Firmware ? 1 : 0;
+                const char* kind = k == 2 ? "frontend" : k == 1 ? "firmware" : "";
+                g_ota_in_flight = { true, kind, p.percent, g_ota_in_flight.started_ms };
+                s_otaKind = k;
+                s_otaPercent = p.percent;
+            });
+            if (!h) s_otaSeenTask = true;  // spawn refused/failed -> finish below
+        }
+    }
+
+    if (s_otaActive) {
+        // Render progress published by the OTA task (loopTask owns LVGL).
+        int k = s_otaKind, pct = s_otaPercent;
+        if (k != s_otaShownKind || pct != s_otaShownPct) {
+            s_otaShownKind = k; s_otaShownPct = pct;
+            const char* title = k == 2 ? "Updating Frontend" :
+                                k == 1 ? "Updating Firmware" : nullptr;
+            const char* ver   = k == 2 ? s_otaFeLabel.c_str() :
+                                k == 1 ? s_otaFwLabel.c_str() : nullptr;
+            ui_show_ota_progress(pct, title, ver);
+        }
+        // Keep the backlight pinned even if the timeout override is lost.
+        ConsoleDisplay::wake();
+
+        // otaRun() reboots on success; the task only exits when the run
+        // failed. otaTaskInFlight() is set from inside the task, so wait to
+        // see it go true (or 5 s) before treating "false" as finished.
+        bool running = otaTaskInFlight();
+        if (running) s_otaSeenTask = true;
+        else if (!s_otaSeenTask && millis() - s_otaSpawnMs > 5000UL) s_otaSeenTask = true;
+        if (!running && s_otaSeenTask) {
+            ConsoleDisplay::setSleepTimeout(s_otaPrevSleepS);
+            g_ota_in_flight = {};
+            s_otaActive = false;
+            ui_show_home();
+        }
     }
 
     delay(5);
