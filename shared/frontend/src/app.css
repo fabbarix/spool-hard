@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./fonts/fonts.css"; /* self-hosted DM Sans + JetBrains Mono (OFL, see fonts/OFL-*.txt) */
 
 /* Make Tailwind v4 scan the shared component files so classes used only in
  * @spoolhard/ui (StatusDot, SubTabBar, StatCard, etc.) are emitted into
