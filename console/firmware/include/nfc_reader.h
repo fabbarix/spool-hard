@@ -55,6 +55,9 @@ private:
     // Task-private debounce state.
     char     _lastUid[24] = {0};
     bool     _present     = false;
+    bool     _readable    = false;   // first READ succeeded (NTAG-style)
+    char     _unreadUid[24] = {0};
+    uint32_t _lastSeenMs  = 0;
     uint8_t  _misses      = 0;
 
     std::atomic<uint32_t> _polls{0};
