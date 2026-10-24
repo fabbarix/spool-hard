@@ -513,10 +513,10 @@ static void on_spool_btn(lv_event_t* e) {
 
 // Helper: make a primary (brand) or secondary (surface) button with a label.
 static lv_obj_t* make_spool_button(lv_obj_t* parent, const char* text, bool primary,
-                                   spool_btn_t action, int x, int y, int w) {
+                                   spool_btn_t action, int x, int y, int w, int h = 44) {
     lv_obj_t* b = lv_btn_create(parent);
     lv_obj_set_pos(b, x, y);
-    lv_obj_set_size(b, w, 44);
+    lv_obj_set_size(b, w, h);
     lv_obj_set_style_radius(b, 8, 0);
     // Primary: amber brand colour. Secondary: COL_CARD bg + COL_TEXT_MUTED
     // border — COL_INPUT was only one luminance step above COL_BODY, so
@@ -558,7 +558,7 @@ static void build_spool() {
     lv_label_set_long_mode(s_lbl_spool_subtitle, LV_LABEL_LONG_DOT);
 
     // Weight card (left): big current weight + small trio
-    lv_obj_t* wCard = make_card(s_spool, 12, 58, 280, 140);
+    lv_obj_t* wCard = make_card(s_spool, 12, 56, 280, 118);
     make_label(wCard, "Current", COL_TEXT_MUTED, &spoolhard_mont_14);
     s_lbl_spool_current = make_label(wCard, "— g", COL_BRAND, &spoolhard_mont_36);
     lv_obj_align(s_lbl_spool_current, LV_ALIGN_CENTER, 0, -8);
@@ -566,7 +566,7 @@ static void build_spool() {
     lv_obj_align(s_lbl_spool_since, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
     // Detail card (right): advertised / core / new
-    lv_obj_t* dCard = make_card(s_spool, 300, 58, 168, 140);
+    lv_obj_t* dCard = make_card(s_spool, 300, 56, 168, 118);
     make_label(dCard, "Advertised",   COL_TEXT_MUTED, &spoolhard_mont_14);
     s_lbl_spool_advert = make_label(dCard, "—", COL_TEXT, &spoolhard_mont_16);
     lv_obj_align(s_lbl_spool_advert, LV_ALIGN_TOP_RIGHT, 0, 0);
@@ -583,21 +583,153 @@ static void build_spool() {
 
     // Live scale readout strip
     s_lbl_spool_scale = make_label(s_spool, "Scale: --", COL_TEXT_MUTED, &spoolhard_mont_14);
-    lv_obj_set_pos(s_lbl_spool_scale, 12, 206);
+    lv_obj_set_pos(s_lbl_spool_scale, 12, 180);
 
     // AMS auto-assignment status (right of the scale label). Hidden until
     // the PendingAms latch arms it on a tag scan.
     s_lbl_spool_ams = make_label(s_spool, "", COL_BRAND, &spoolhard_mont_14);
-    lv_obj_set_pos(s_lbl_spool_ams, 220, 206);
+    lv_obj_set_pos(s_lbl_spool_ams, 220, 180);
     lv_obj_set_width(s_lbl_spool_ams, 248);
     lv_label_set_long_mode(s_lbl_spool_ams, LV_LABEL_LONG_DOT);
 
     // Action row
-    s_btn_spool_current = make_spool_button(s_spool, "Capture weight", true,
-                                            SPOOL_BTN_CAPTURE_CURRENT, 12, 236, 200);
+    // Row A (y=204..250, h=46): the two weigh actions, 224 + 8 + 224 = 456.
+    // Row B (y=258..308, h=50): "Load into..." (primary, opens the
+    // choose-destination screen) + Close, 316 + 8 + 132 = 456.
+    s_btn_spool_current = make_spool_button(s_spool, "Capture weight", false,
+                                            SPOOL_BTN_CAPTURE_CURRENT, 12, 204, 224, 46);
     s_btn_spool_empty   = make_spool_button(s_spool, "Capture empty",  false,
-                                            SPOOL_BTN_CAPTURE_EMPTY,  220, 236, 160);
-    make_spool_button(s_spool, "Close", false, SPOOL_BTN_CLOSE, 388, 236, 80);
+                                            SPOOL_BTN_CAPTURE_EMPTY,  244, 204, 224, 46);
+    make_spool_button(s_spool, LV_SYMBOL_RIGHT "  Load into slot...", true,
+                      SPOOL_BTN_LOAD_INTO, 12, 258, 316, 50);
+    make_spool_button(s_spool, "Close", false, SPOOL_BTN_CLOSE, 336, 258, 132, 50);
+}
+
+// ── Choose-destination screen ───────────────────────────────
+// Reached from the spool screen's "Load into slot..." button while
+// PendingAms is armed. Layout (480x320):
+//   header   y=8..58   : title (22pt, h~26) at y=8, subtitle (16pt) at y=36
+//   row 1    y=64..144 : 4 AMS slot buttons, 108 x 80, gap 8 (4*108+3*8=456)
+//   row 2    y=152..216: External button, 456 x 64
+//   notice   y=224..244: 16pt line for errors / hints (one line, DOT)
+//   Cancel   y=252..308: 456 x 56
+// Slot / External targets are >= 64 px on both axes; Cancel is 56 tall and
+// full width (the escape hatch).
+#define DEST_SLOTS 5
+static lv_obj_t* s_dest             = nullptr;
+static lv_obj_t* s_lbl_dest_sub     = nullptr;
+static lv_obj_t* s_lbl_dest_notice  = nullptr;
+static lv_obj_t* s_dest_btn[DEST_SLOTS]     = {nullptr};
+static lv_obj_t* s_dest_sw[DEST_SLOTS]      = {nullptr};
+static lv_obj_t* s_dest_lbl_mat[DEST_SLOTS] = {nullptr};
+static ui_dest_cb_t s_dest_cb = nullptr;
+
+static void on_dest_btn(lv_event_t* e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_dest_cb) s_dest_cb(idx);
+}
+
+static void build_destination() {
+    s_dest = lv_obj_create(nullptr);
+    style_screen(s_dest);
+
+    lv_obj_t* title = make_label(s_dest, "Load spool into...", COL_BRAND, &spoolhard_mont_22);
+    lv_obj_set_pos(title, 12, 8);
+    s_lbl_dest_sub = make_label(s_dest, "", COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_set_pos(s_lbl_dest_sub, 12, 36);
+    lv_obj_set_width(s_lbl_dest_sub, 456);
+    lv_label_set_long_mode(s_lbl_dest_sub, LV_LABEL_LONG_DOT);
+
+    for (int i = 0; i < DEST_SLOTS; ++i) {
+        bool ext = (i == 4);
+        lv_obj_t* b = lv_btn_create(s_dest);
+        if (ext) { lv_obj_set_pos(b, 12, 152); lv_obj_set_size(b, 456, 64); }
+        else     { lv_obj_set_pos(b, 12 + i * 116, 64); lv_obj_set_size(b, 108, 80); }
+        lv_obj_set_style_radius(b, 8, 0);
+        lv_obj_set_style_bg_color(b, COL_CARD, 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(b, COL_TEXT_MUTED, 0);
+        lv_obj_set_style_border_width(b, 1, 0);
+        lv_obj_set_style_pad_all(b, 0, 0);
+        lv_obj_set_style_bg_color(b, COL_BORDER, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(b, on_dest_btn, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        s_dest_btn[i] = b;
+
+        // Colour swatch of what is in the slot now: top strip (AMS) or left
+        // block (External). Non-clickable so taps reach the button.
+        lv_obj_t* sw = lv_obj_create(b);
+        if (ext) { lv_obj_set_pos(sw, 0, 0); lv_obj_set_size(sw, 20, 62); }
+        else     { lv_obj_set_pos(sw, 0, 0); lv_obj_set_size(sw, 106, 18); }
+        lv_obj_set_style_bg_color(sw, COL_INPUT, 0);
+        lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(sw, 0, 0);
+        lv_obj_set_style_radius(sw, 0, 0);
+        lv_obj_set_style_pad_all(sw, 0, 0);
+        lv_obj_clear_flag(sw, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(sw, LV_OBJ_FLAG_CLICKABLE);
+        s_dest_sw[i] = sw;
+
+        char name[24];
+        if (ext) snprintf(name, sizeof(name), "External spool");
+        else     snprintf(name, sizeof(name), "Slot %d", i + 1);
+        lv_obj_t* nl = make_label(b, name, COL_TEXT, ext ? &spoolhard_mont_22 : &spoolhard_mont_18);
+        if (ext) lv_obj_align(nl, LV_ALIGN_TOP_LEFT, 34, 6);
+        else     lv_obj_align(nl, LV_ALIGN_TOP_MID, 0, 24);
+
+        // Material currently in the slot (16pt). 100 px wide in a 108 px
+        // tile: fits ~9 chars of Montserrat 16 ("PETG-CF").
+        s_dest_lbl_mat[i] = make_label(b, "", COL_TEXT_MUTED, &spoolhard_mont_16);
+        lv_obj_set_width(s_dest_lbl_mat[i], ext ? 400 : 100);
+        lv_label_set_long_mode(s_dest_lbl_mat[i], LV_LABEL_LONG_DOT);
+        if (ext) lv_obj_align(s_dest_lbl_mat[i], LV_ALIGN_TOP_LEFT, 34, 34);
+        else {
+            lv_obj_set_style_text_align(s_dest_lbl_mat[i], LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(s_dest_lbl_mat[i], LV_ALIGN_TOP_MID, 0, 50);
+        }
+    }
+
+    s_lbl_dest_notice = make_label(s_dest, "", COL_BRAND, &spoolhard_mont_16);
+    lv_obj_set_pos(s_lbl_dest_notice, 12, 224);
+    lv_obj_set_width(s_lbl_dest_notice, 456);
+    lv_label_set_long_mode(s_lbl_dest_notice, LV_LABEL_LONG_DOT);
+
+    lv_obj_t* cancel = lv_btn_create(s_dest);
+    lv_obj_set_pos(cancel, 12, 252);
+    lv_obj_set_size(cancel, 456, 56);
+    lv_obj_set_style_radius(cancel, 10, 0);
+    lv_obj_set_style_bg_color(cancel, COL_CARD, 0);
+    lv_obj_set_style_border_color(cancel, COL_TEXT_MUTED, 0);
+    lv_obj_set_style_border_width(cancel, 1, 0);
+    lv_obj_add_event_cb(cancel, on_dest_btn, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
+    lv_obj_t* cl = make_label(cancel, "Cancel", COL_TEXT, &spoolhard_mont_18);
+    lv_obj_center(cl);
+}
+
+void ui_set_destination_callback(ui_dest_cb_t cb) { s_dest_cb = cb; }
+
+void ui_show_destination(const char* printer_name, const UiAmsSlot* slots) {
+    lv_lock();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Printer: %s", printer_name ? printer_name : "?");
+    lv_label_set_text(s_lbl_dest_sub, buf);
+    lv_label_set_text(s_lbl_dest_notice, "");
+    for (int i = 0; i < DEST_SLOTS; ++i) {
+        const UiAmsSlot* sl = slots ? &slots[i] : nullptr;
+        bool has = sl && sl->occupied;
+        lv_obj_set_style_bg_color(s_dest_sw[i],
+            (has && sl->color_rgb) ? lv_color_hex(sl->color_rgb) : COL_INPUT, 0);
+        lv_label_set_text(s_dest_lbl_mat[i],
+            has ? (sl->material[0] ? sl->material : "loaded") : "empty");
+    }
+    lv_screen_load(s_dest);
+    lv_unlock();
+}
+
+void ui_destination_set_notice(const char* text) {
+    if (!s_lbl_dest_notice) return;
+    lv_lock();
+    lv_label_set_text(s_lbl_dest_notice, text ? text : "");
+    lv_unlock();
 }
 
 // Weight-update confirmation. Shown when the user taps "Capture
@@ -1382,6 +1514,7 @@ void ui_init() {
     build_confirm();
     build_devcfg();
     build_spool();
+    build_destination();
     build_weight_confirm();
     build_slot_detail();
     build_scale_settings();

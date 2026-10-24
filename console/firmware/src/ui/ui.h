@@ -122,6 +122,7 @@ typedef enum {
     SPOOL_BTN_CAPTURE_CURRENT = 1,
     SPOOL_BTN_CAPTURE_EMPTY   = 2,
     SPOOL_BTN_CLOSE           = 3,
+    SPOOL_BTN_LOAD_INTO       = 4,   // open the choose-destination screen
 } spool_btn_t;
 typedef void (*spool_cb_t)(spool_btn_t action, const char* spool_id);
 
@@ -403,3 +404,16 @@ struct UiDevcfgLive {
     int         check_age_s;        // seconds since last check, -1 = never
 };
 void ui_set_devcfg_live(const UiDevcfgLive& live);
+
+// ── Choose-destination screen (scan -> pick AMS slot / External) ──
+// Opened by main.cpp when the spool screen's "Load into slot..." button is
+// tapped (SPOOL_BTN_LOAD_INTO) while PendingAms is armed. `slots` is the
+// same 5-entry layout as ui_set_ams_panel (AMS 0 trays 0..3, then
+// External); only occupied/material/color_rgb are used. The callback gets
+// 0..3 for an AMS slot, 4 for External, or -1 for Cancel. It runs on the
+// lvgl task: must not block.
+typedef void (*ui_dest_cb_t)(int slot_idx);
+void ui_set_destination_callback(ui_dest_cb_t cb);
+void ui_show_destination(const char* printer_name, const UiAmsSlot* slots);
+// One-line message under the buttons (errors such as "scan expired"); "" clears.
+void ui_destination_set_notice(const char* text);

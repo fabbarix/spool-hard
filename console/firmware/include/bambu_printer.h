@@ -242,6 +242,16 @@ public:
     // if a previous request is still queued.
     bool requestClaimPending(int ams_unit, int slot_id);
 
+    // Validate + queue an explicit claim: the single code path shared by the
+    // web (POST /api/printers/<serial>/claim-pending) and the LCD
+    // "choose destination" screen. `ams_unit`/`slot_id` are normalised in
+    // place (external -> 254/0). On Queued, `spool_id_out` (if non-null) gets
+    // the pending spool id. Thread-safe, never blocks, never publishes MQTT.
+    enum class ClaimResult { Queued, BadSlot, NotConnected, NoSuchTray,
+                             NothingPending, Busy };
+    ClaimResult claimPendingExplicit(int& ams_unit, int& slot_id,
+                                     String* spool_id_out = nullptr);
+
     // Forget what we last pushed per slot so the next report re-runs the
     // (edge-triggered) spool->printer sync. Thread-safe; applied in loop().
     // Used by the "Retry sync" action after the user enabled Developer Mode.

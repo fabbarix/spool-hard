@@ -106,6 +106,24 @@ static void showSpoolDetail(const SpoolRecord& rec) {
     }
 }
 
+// Choose-destination screen support. The printer the screen was opened for
+// (first connected printer, same pick as the home AMS panel).
+static String g_destPrinterSerial;
+
+// Fill the 5-slot destination layout (AMS unit 0 trays 0..3 + external) from a
+// printer state. Only occupied/material/colour matter to the destination UI.
+static void _buildDestSlots(const PrinterState& s, UiAmsSlot out[5]) {
+    auto fill = [](UiAmsSlot& d, const AmsTray& tr) {
+        snprintf(d.material, sizeof(d.material), "%s", tr.tray_type.c_str());
+        d.occupied = tr.tray_type.length() || tr.tray_color.length() || tr.tag_uid.length();
+        if (tr.tray_color.length() >= 6)
+            d.color_rgb = (uint32_t)strtoul(tr.tray_color.substring(0, 6).c_str(), nullptr, 16);
+    };
+    if (s.ams_count > 0)
+        for (int t = 0; t < 4; ++t) fill(out[t], s.ams[0].trays[t]);
+    if (s.has_vt_tray) fill(out[4], s.vt_tray);
+}
+
 // Apply "capture current weight" to a known spool, mirroring the LCD button
 // path: subtract the known/learned core weight, reset consumed_since_weight,
 // persist. Returns false when we can't determine a valid net weight (no
@@ -760,6 +778,32 @@ void setup() {
             return;
         }
 
+        if (action == SPOOL_BTN_LOAD_INTO) {
+            // Explicit destination step. Works even for the H2S external
+            // holder, which never produces the empty->populated edge the
+            // auto-claim needs. Pick the first connected printer (same as
+            // the home AMS panel).
+            const BambuPrinter* bp = nullptr;
+            for (const auto& pp : g_bambu.printers()) {
+                if (pp && pp->state().link == BambuLinkState::Connected) { bp = pp.get(); break; }
+            }
+            if (!bp) {
+                ui_set_spool_ams_status(LV_SYMBOL_WARNING "  No printer connected");
+                return;
+            }
+            if (PendingAms::peek().isEmpty()) {
+                ui_set_spool_ams_status(LV_SYMBOL_WARNING "  Scan expired - rescan tag");
+                return;
+            }
+            g_destPrinterSerial = bp->config().serial;
+            UiAmsSlot slots[5] = {};   // 5 * ~64 B, fine on the lvgl task stack
+            _buildDestSlots(bp->state(), slots);
+            const char* nm = bp->config().name.length() ? bp->config().name.c_str()
+                                                        : bp->config().serial.c_str();
+            ui_show_destination(nm, slots);
+            return;
+        }
+
         if (action == SPOOL_BTN_CAPTURE_CURRENT) {
             if (!g_scale.hasStableWeight()) {
                 Serial.println("[Spool] capture: no stable reading — stay on screen");
@@ -802,6 +846,50 @@ void setup() {
             showSpoolDetail(rec);
             ui_set_spool_ams_status(LV_SYMBOL_REFRESH "  AMS: waiting for load…");
             ui_flash_spool_current();
+        }
+    });
+
+    // Choose-destination callback (lvgl task; non-blocking: claimPendingExplicit
+    // only validates + queues, BambuPrinter::loop() on loopTask does the MQTT
+    // publish -- identical to POST /api/printers/<serial>/claim-pending).
+    //   -1 = Cancel -> back to the spool screen (latch stays armed).
+    ui_set_destination_callback([](int idx) {
+        SpoolRecord rec;
+        bool have = !g_activeSpoolId.isEmpty() && g_store.findById(g_activeSpoolId, rec);
+        if (idx < 0) {
+            if (have) {
+                showSpoolDetail(rec);
+                ui_set_spool_ams_status(LV_SYMBOL_REFRESH "  AMS: waiting for load…");
+            } else {
+                ui_show_home();
+            }
+            return;
+        }
+        BambuPrinter* p = g_bambu.find(g_destPrinterSerial);
+        if (!p) { ui_destination_set_notice("Printer not found"); return; }
+        int unit = idx < 4 ? 0 : 254;
+        int slot = idx < 4 ? idx : 0;
+        String spool_id;
+        switch (p->claimPendingExplicit(unit, slot, &spool_id)) {
+        case BambuPrinter::ClaimResult::Queued:
+            dlog("ui", "dest: claim queued spool=%s unit=%d slot=%d",
+                 spool_id.c_str(), unit, slot);
+            if (have) showSpoolDetail(rec); else ui_show_home();
+            // BambuPrinter publishes the AMS setting from loopTask, then
+            // ui_set_spool_ams_status + the onSpoolAssigned hook (auto-close
+            // after 2.5 s) take over.
+            if (have) ui_set_spool_ams_status(LV_SYMBOL_REFRESH "  Sending to printer…");
+            break;
+        case BambuPrinter::ClaimResult::NothingPending:
+            ui_destination_set_notice("Scan expired - rescan the tag"); break;
+        case BambuPrinter::ClaimResult::NotConnected:
+            ui_destination_set_notice("Printer not connected"); break;
+        case BambuPrinter::ClaimResult::NoSuchTray:
+            ui_destination_set_notice("Printer has no such slot"); break;
+        case BambuPrinter::ClaimResult::Busy:
+            ui_destination_set_notice("Busy - try again"); break;
+        default:
+            ui_destination_set_notice("Cannot assign"); break;
         }
     });
 

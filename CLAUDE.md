@@ -426,3 +426,15 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   Config page's partial save (name/serial/ip/access_code) keeps ams_overrides,
   dev_mode, auto_restore_k, track_print_consume. `?dry=1` returns the would-be
   merged record (secret masked) without saving or reloading.
+
+## Console LCD: scan -> choose destination
+
+After a spool tag scan the spool screen arms `PendingAms` (auto-claim on a
+real AMS empty->populated edge stays). Its **Load into slot...** button opens
+the choose-destination screen (`ui_show_destination`): 4 AMS slots of the
+first connected printer + **External spool** (the H2S external holder never
+produces the edge, so the explicit pick is the reliable path) + Cancel. The
+pick calls `BambuPrinter::claimPendingExplicit()` — the same validate+queue
+function behind `POST /api/printers/<serial>/claim-pending`; the MQTT publish
+still happens on loopTask via `_maybeAssignPendingSpool`. LVGL callbacks run
+on the `lvgl` task, so they must only validate/queue, never publish or block.
