@@ -49,14 +49,15 @@ uint32_t _nextSeq() {
     return seq;
 }
 
-void _writePending() {
+bool _writePending() {
     File f = SPIFFS.open(kPendingPath, FILE_WRITE);
-    if (!f) return;
+    if (!f) return false;
     auto rows = RingLog::snapshot(0, kMaxLines);
     for (auto& e : rows) {
         f.printf("[%lu] %s\n", (unsigned long)e.millis_at, e.line.c_str());
     }
     f.close();
+    return true;
 }
 
 }  // namespace
@@ -102,8 +103,12 @@ void tick() {
     // SPIFFS rewrite (flash wear + a multi-ms blocking write).
     uint32_t head = RingLog::headSeq();
     if (head == s_lastFlushedSeq && SPIFFS.exists(kPendingPath)) return;
+    // MERGE NOTE: any FS-lock gate (e.g. B10's tryLockFs()) goes right
+    // here as `if (!tryLockFs()) return;` BEFORE the write, and
+    // s_lastFlushedSeq is only set AFTER the write succeeded, so a failed
+    // lock leaves the change unflushed and retried on the next interval.
+    if (!_writePending()) return;
     s_lastFlushedSeq = head;
-    _writePending();
 }
 
 void pause()  { s_paused.store(true); }

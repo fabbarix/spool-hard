@@ -86,7 +86,7 @@ void ConsoleChannel::tickStats() {
     if (qlen > _peakQueueLen) _peakQueueLen = qlen;
     // Anomaly-only (backlog, full, stalled TCP, non-connected state) or a
     // 60 s liveness line. Called once per second from loopTask.
-    bool anomaly = full || qlen >= 8 || (qlen > 0 && !canSend) || status != 3 /*WS_CONNECTED*/;
+    bool anomaly = full || qlen >= 8 || (qlen >= 2 && !canSend) || status != WS_CONNECTED;
     uint32_t nowMs = millis();
     if (!anomaly && (nowMs - _lastStatsLogMs) < 60000UL) { _statsSeq++; return; }
     _lastStatsLogMs = nowMs;
