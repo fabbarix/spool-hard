@@ -5,7 +5,7 @@ import { Button } from '@spoolhard/ui/components/Button';
 import { ConfirmDialog } from '@spoolhard/ui/components/ConfirmDialog';
 import { ErrorBanner } from '@spoolhard/ui/components/ErrorBanner';
 import { SkeletonRows } from '@spoolhard/ui/components/Skeleton';
-import { useSpools, useSpoolDelete, useSpoolUpsert, type SpoolRecord } from '../hooks/useSpools';
+import { useSpools, useSpoolDelete, useSpoolUpsert, remainingGrams, type SpoolRecord } from '../hooks/useSpools';
 import { SpoolDetailPanel } from '../components/spools/SpoolDetailPanel';
 
 // Same (offset, limit, material) as the dashboard's WS-pushed entry, so the
@@ -17,14 +17,6 @@ const LOW_PCT = 10;
 const UNDO_MS = 8000;
 
 type Filter = 'active' | 'low' | 'empty' | 'all';
-
-// weight_current is the net filament weight (main.cpp stamps scale net),
-// minus what prints have consumed since that weighing.
-function remainingGrams(r: SpoolRecord): number | null {
-  if (typeof r.weight_current !== 'number' || r.weight_current < 0) return null;
-  const used = typeof r.consumed_since_weight === 'number' ? r.consumed_since_weight : 0;
-  return Math.max(0, Math.round(r.weight_current - used));
-}
 
 // Full-spool filament weight, or null when unknown (no bar is drawn then).
 function fullGrams(r: SpoolRecord): number | null {

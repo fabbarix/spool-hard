@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Scale, Save, Gauge, Thermometer, StickyNote, Printer, BookOpen, Link2, Link2Off, BatteryLow, BatteryFull } from 'lucide-react';
 import { Button } from '@spoolhard/ui/components/Button';
 import { InputField } from '@spoolhard/ui/components/InputField';
-import { useSpoolUpsert, type SpoolRecord } from '../../hooks/useSpools';
+import { useSpoolUpsert, remainingGrams, type SpoolRecord } from '../../hooks/useSpools';
 import { useScaleLink } from '../../hooks/useScaleLink';
 import { useFilamentsDb, type FilamentEntry } from '../../hooks/useFilamentsDb';
 import { useUserFilaments } from '../../hooks/useUserFilaments';
@@ -26,7 +26,27 @@ export function SpoolDetailPanel({ spool }: Props) {
 
   // Local draft so the user can edit without every keystroke round-tripping.
   const [draft, setDraft] = useState<SpoolRecord>(spool);
-  useEffect(() => { setDraft(spool); }, [spool]);
+  // The row is re-rendered live from the WS-pushed spools cache. Merge each
+  // push into the draft without clobbering unsaved edits: a field is only
+  // overwritten if the user hasn't changed it from the previous server
+  // value. The live weight fields are read-only here (captureWeight sends
+  // them explicitly), so they always follow the server.
+  const prevServer = useRef<SpoolRecord>(spool);
+  useEffect(() => {
+    const prev = prevServer.current;
+    prevServer.current = spool;
+    if (prev === spool) return;
+    setDraft((d) => {
+      const next: Record<string, unknown> = { ...d };
+      const sp = spool as unknown as Record<string, unknown>;
+      const pv = prev as unknown as Record<string, unknown>;
+      const dr = d as unknown as Record<string, unknown>;
+      for (const k of new Set([...Object.keys(sp), ...Object.keys(pv)])) {
+        if (k === 'weight_current' || k === 'consumed_since_weight' || dr[k] === pv[k]) next[k] = sp[k];
+      }
+      return next as unknown as SpoolRecord;
+    });
+  }, [spool]);
   const [pickerOpen, setPickerOpen] = useState(false);
 
   // Resolve the linked-preset name for display next to the picker
@@ -309,15 +329,17 @@ export function SpoolDetailPanel({ spool }: Props) {
         </div>
         <div className="flex items-center gap-3">
           <div className="font-mono tabular-nums">
-            {typeof draft.weight_current === 'number' && draft.weight_current >= 0 ? (
-              <span className="text-brand-400 text-lg">{draft.weight_current}g</span>
+            {remainingGrams(draft) !== null ? (
+              <span className="text-brand-400 text-lg">{remainingGrams(draft)}g</span>
             ) : (
               <span className="text-text-muted">never weighed</span>
             )}
           </div>
-          {typeof draft.consumed_since_weight === 'number' && draft.consumed_since_weight > 0 && (
+          {remainingGrams(draft) !== null && (
             <div className="text-xs text-text-muted">
-              − {draft.consumed_since_weight.toFixed(0)}g predicted since last weigh
+              remaining estimate · weighed {draft.weight_current}g
+              {typeof draft.consumed_since_weight === 'number' && draft.consumed_since_weight > 0
+                && ` · −${draft.consumed_since_weight.toFixed(0)}g since`}
             </div>
           )}
         </div>

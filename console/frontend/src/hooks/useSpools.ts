@@ -61,6 +61,17 @@ export interface SpoolsPage {
   rows: SpoolRecord[];
 }
 
+/**
+ * Remaining filament estimate in grams: the last weighed net weight minus
+ * what prints have consumed since (same figure the LCD shows). Null when the
+ * spool was never weighed. Single source of truth for every weight display.
+ */
+export function remainingGrams(r: Pick<SpoolRecord, 'weight_current' | 'consumed_since_weight'>): number | null {
+  if (typeof r.weight_current !== 'number' || r.weight_current < 0) return null;
+  const used = typeof r.consumed_since_weight === 'number' ? r.consumed_since_weight : 0;
+  return Math.max(0, Math.round(r.weight_current - used));
+}
+
 export function useSpools(offset = 0, limit = 50, material?: string) {
   const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
   if (material) params.set('material', material);

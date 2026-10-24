@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { X, Check, Eraser, Download } from 'lucide-react';
 import { Button } from '@spoolhard/ui/components/Button';
-import { useSpools, type SpoolRecord } from '../../hooks/useSpools';
+import { useSpools, remainingGrams, type SpoolRecord } from '../../hooks/useSpools';
 import { useSetAmsMapping, useImportAmsSpool } from '../../hooks/usePrinters';
 
 interface Props {
@@ -177,8 +177,8 @@ function SpoolPickRow({ r, active, onPick }: { r: SpoolRecord; active: boolean; 
           </div>
           <div className="text-[11px] text-text-muted font-mono truncate">{r.id}</div>
         </span>
-        {typeof r.weight_current === 'number' && r.weight_current >= 0 && (
-          <span className="font-mono text-xs text-text-muted tabular-nums">{r.weight_current}g</span>
+        {remainingGrams(r) !== null && (
+          <span className="font-mono text-xs text-text-muted tabular-nums">{remainingGrams(r)}g</span>
         )}
         {active && <Check size={14} className="text-brand-400 flex-shrink-0" />}
       </button>
