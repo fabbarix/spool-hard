@@ -1,4 +1,5 @@
 #include "bambu_printer.h"
+#include "bambu_report_filter.h"
 #include "user_filaments_store.h"
 #include "store.h"
 #include "printer_ftp.h"
@@ -488,7 +489,11 @@ void BambuPrinter::_onMessage(const char* /*topic*/, uint8_t* payload, unsigned 
     // PSRAM-backed JsonDocument so a 17 KB H2S pushall doesn't fight
     // the FTPS analyzer for internal DRAM during a print analysis.
     JsonDocument doc(&g_psramJsonAlloc);
-    DeserializationError err = deserializeJson(doc, payload, length);
+    // Filtered: only the keys _parseReport & co. read are materialised
+    // (bambu_report_filter.h) -- cuts the node tree ~5x on an H2S report.
+    DeserializationError err = deserializeJson(
+        doc, payload, length,
+        DeserializationOption::Filter(bambuReportFilter(&g_psramJsonAlloc)));
     if (err) {
         Serial.printf("[Bambu %s] parse error: %s (len=%u)\n",
                       _cfg.serial.c_str(), err.c_str(), length);
