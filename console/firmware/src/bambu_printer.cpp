@@ -27,6 +27,7 @@
 #include <IPAddress.h>
 #include <esp_heap_caps.h>   // PSRAM-capable allocator for the analyzer
 #include <new>               // placement new
+#include <esp_timer.h>
 #include <lvgl.h>   // LV_SYMBOL_* — used for the LCD ams-status label
 
 extern ScaleLink g_scale;   // defined in main.cpp
@@ -1467,6 +1468,8 @@ static String _bestThreeMfIn(PrinterFtp& ftp, const String& dir, const String& h
     return dir.endsWith("/") ? (dir + best) : (dir + "/" + best);
 }
 
+std::atomic<bool> g_analysisInflatePsram{true};
+
 bool BambuPrinter::analyseRemote(const String& requestedPath) {
     if (_analysisInProgress) {
         _lastAnalysis.error = "analysis already in progress";
@@ -1486,12 +1489,23 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
     GcodeAnalysis& result = _lastAnalysis;
     result.reset();
     result.started_ms = millis();
+    _inflateStats = InflateStats{};   // small POD (<100 B)
+    _inflateStats.requested_psram = g_analysisInflatePsram.load();
+    _inflateStats.free_int_start  = _inflateStats.free_int_min =
+        (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const uint32_t statT0 = millis();
+    uint32_t streamT0 = 0;
     // Surface the resolved path below; if requestedPath was empty we
     // overwrite this once we know what we're actually fetching.
     result.path       = requestedPath;
 
     auto fail = [&](const String& why) -> bool {
         result.finished_ms  = millis();
+        _inflateStats.valid = true;
+        _inflateStats.ok    = false;
+        _inflateStats.total_ms = result.finished_ms - statT0;
+        dlog("inflate", "%s analysis FAILED after %u ms (%s)", _cfg.serial.c_str(),
+             (unsigned)_inflateStats.total_ms, why.c_str());
         result.error        = why;
         result.valid        = false;
         _analysisInProgress = false;
@@ -1848,6 +1862,7 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
     // deflate path since 1 byte in ≈ 1 unit of progress.
     result.progress_total_bytes = data_length;
     bool ok;
+    streamT0 = millis();
     if (data_length == 0) {
         ok = ftp.retrieveStream(path, [&](const uint8_t* d, size_t n, size_t total) {
             analyzer.feed(d, n);
@@ -1875,10 +1890,25 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             return true;
         });
     } else {
-        // Deflate path. Allocate state in PSRAM to keep internal DRAM
-        // free for the concurrent FTPS data context.
-        auto* inflator = (tinfl_decompressor*)heap_caps_malloc(
-            sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM);
+        // Deflate path. The 32 KiB dict is always PSRAM. The ~11 KiB
+        // tinfl_decompressor goes to PSRAM (default, shipped) or internal
+        // DRAM per g_analysisInflatePsram (see InflateStats). Internal
+        // alloc failure falls back to PSRAM.
+        _inflateStats.deflate     = true;
+        _inflateStats.decomp_size = sizeof(tinfl_decompressor);
+        tinfl_decompressor* inflator = nullptr;
+        bool inflatorInternal = false;
+        if (!_inflateStats.requested_psram) {
+            inflator = (tinfl_decompressor*)heap_caps_malloc(
+                sizeof(tinfl_decompressor), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            inflatorInternal = inflator != nullptr;
+            _inflateStats.fallback = !inflator;
+        }
+        if (!inflator) {
+            inflator = (tinfl_decompressor*)heap_caps_malloc(
+                sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM);
+        }
+        _inflateStats.psram = !inflatorInternal;
         auto* dict = (uint8_t*)heap_caps_malloc(
             TINFL_LZ_DICT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!inflator || !dict) {
@@ -1897,7 +1927,10 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             GCodeAnalyzer*      analyzer;
             bool                ok;
             String              err;
-        } st = { inflator, dict, 0, 0, data_length, &analyzer, true, "" };
+            uint64_t            inflate_us, feed_us, bytes_out;
+            uint32_t            free_min;
+        } st = { inflator, dict, 0, 0, data_length, &analyzer, true, "",
+                 0, 0, 0, _inflateStats.free_int_start };
 
         ok = ftp.retrieveRange(path, data_offset, data_length,
                                [&st, &result, &analyzer, this](const uint8_t* d, size_t n) {
@@ -1912,6 +1945,10 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
             result.progress_bytes = st.consumed_in;
             result.running_grams  = analyzer.totalGrams();
             result.running_mm     = analyzer.totalMm();
+            {
+                uint32_t fi = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+                if (fi < st.free_min) st.free_min = fi;
+            }
             // Inner loop: a single FTP chunk may contain bytes that
             // produce multiple output windows (e.g. when the
             // decompressed stream is much larger than the compressed
@@ -1922,11 +1959,15 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
                 size_t out_size = TINFL_LZ_DICT_SIZE - st.dict_pos;
                 uint32_t flags = (st.consumed_in < st.total_in)
                                 ? TINFL_FLAG_HAS_MORE_INPUT : 0;
+                int64_t t0 = esp_timer_get_time();
                 tinfl_status status = tinfl_decompress(
                     st.inflator,
                     in_ptr, &in_size,
                     st.dict, st.dict + st.dict_pos, &out_size,
                     flags);
+                int64_t t1 = esp_timer_get_time();
+                st.inflate_us += (uint64_t)(t1 - t0);
+                st.bytes_out  += out_size;
 
                 // Feed the freshly-written window to the analyzer.
                 // The dict is treated as a ring; if a single tinfl
@@ -1940,6 +1981,7 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
                     st.analyzer->feed(st.dict + st.dict_pos, first);
                     st.analyzer->feed(st.dict, out_size - first);
                 }
+                st.feed_us += (uint64_t)(esp_timer_get_time() - t1);
                 st.dict_pos = (st.dict_pos + out_size) & (TINFL_LZ_DICT_SIZE - 1);
 
                 in_ptr    += in_size;
@@ -1958,6 +2000,11 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
         });
         heap_caps_free(inflator);
         heap_caps_free(dict);
+        _inflateStats.inflate_ms   = (uint32_t)(st.inflate_us / 1000);
+        _inflateStats.feed_ms      = (uint32_t)(st.feed_us / 1000);
+        _inflateStats.bytes_in     = st.consumed_in;
+        _inflateStats.bytes_out    = (uint32_t)st.bytes_out;
+        _inflateStats.free_int_min = st.free_min;
         if (!st.ok) {
             ftp.quit();
             return fail("inflate: " + st.err);
@@ -2138,6 +2185,20 @@ bool BambuPrinter::analyseRemote(const String& requestedPath) {
     }
     result.finished_ms  = millis();
     result.valid        = true;
+    _inflateStats.stream_ms = result.finished_ms - streamT0;
+    _inflateStats.total_ms  = result.finished_ms - statT0;
+    _inflateStats.ok        = true;
+    _inflateStats.valid     = true;
+    dlog("inflate", "%s analysis ok: total=%ums stream=%ums inflate=%ums feed=%ums "
+         "in=%u out=%u deflate=%d decomp=%s%s(%uB) free_int start=%u min=%u",
+         _cfg.serial.c_str(), (unsigned)_inflateStats.total_ms,
+         (unsigned)_inflateStats.stream_ms, (unsigned)_inflateStats.inflate_ms,
+         (unsigned)_inflateStats.feed_ms, (unsigned)_inflateStats.bytes_in,
+         (unsigned)_inflateStats.bytes_out, (int)_inflateStats.deflate,
+         _inflateStats.psram ? "psram" : "internal",
+         _inflateStats.fallback ? "(fallback)" : "",
+         (unsigned)_inflateStats.decomp_size,
+         (unsigned)_inflateStats.free_int_start, (unsigned)_inflateStats.free_int_min);
     // `result` is already a reference to `_lastAnalysis`, so no copy needed.
     _analysisInProgress = false;
     // Final push — `valid=true` now, in_progress=false. The rate-limit
@@ -2222,14 +2283,18 @@ static constexpr size_t ANALYSIS_MIN_FREE_INTERNAL = 38 * 1024;
 
 bool BambuPrinter::startAnalyseTask(const String& path) {
     size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    if (freeInternal < ANALYSIS_MIN_FREE_INTERNAL) {
+    // The decompressor counts against the gate only when it will live in
+    // internal DRAM (g_analysisInflatePsram == false).
+    const size_t gateNeed = ANALYSIS_MIN_FREE_INTERNAL +
+        (g_analysisInflatePsram.load() ? 0 : sizeof(tinfl_decompressor));
+    if (freeInternal < gateNeed) {
         // Defer rather than risk an OOM-panic. Arm the retry directly so the
         // RUNNING-edge auto-trigger (which doesn't re-arm on its own) still
         // gets picked up by _maybeRetryAnalysis once memory frees up.
         _analysisNextRetryAt = millis() + 30000;
         dlog("Bambu", "%s analysis deferred — free internal DRAM %u < %u, retry in 30s",
              _cfg.serial.c_str(), (unsigned)freeInternal,
-             (unsigned)ANALYSIS_MIN_FREE_INTERNAL);
+             (unsigned)gateNeed);
         return false;
     }
     auto* ctx = new AnalyseTaskCtx{this, path};

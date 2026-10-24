@@ -301,6 +301,7 @@ public:
     bool _lcdDebug  = false;
     // Gates GET /api/debug/nfc (read-only dump of the last detected tag).
     bool _nfcDebug = false;
+    bool _analysisDebug = false;   // gates GET /api/debug/analysis
 };
 
 extern ConsoleWebServer g_web;   // defined in main.cpp
