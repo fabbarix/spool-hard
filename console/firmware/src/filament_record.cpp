@@ -1,3 +1,4 @@
+#include "spoolhard/psram_json_alloc.h"
 #include "filament_record.h"
 
 void FilamentRecord::toJson(JsonDocument& doc) const {
@@ -198,7 +199,7 @@ bool FilamentRecord::resolveVariant(const String& printer_model, float nozzle_di
 }
 
 String FilamentRecord::toLine() const {
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     toJson(doc);
     String out;
     serializeJson(doc, out);
@@ -206,7 +207,7 @@ String FilamentRecord::toLine() const {
 }
 
 bool FilamentRecord::fromLine(const String& line) {
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     if (deserializeJson(doc, line)) return false;
     return fromJson(doc);
 }

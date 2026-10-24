@@ -132,6 +132,13 @@ the headers are `#include`d).
 - `spoolhard/psram_json_alloc.h` / `src/psram_json_alloc.cpp` — `g_psramJsonAlloc`
   singleton: `JsonDocument doc(&g_psramJsonAlloc);` routes the node
   tree to PSRAM. All hot WS/HTTP paths use this.
+  Console: every hot/large `JsonDocument` (per-MQTT AMS debug payload,
+  spool/filament/printer lists + single-record GET/POST, cloud-preset
+  detail bodies, FTPS list payload, SpoolRecord/FilamentRecord line
+  parse) uses it; tiny (<~300 B) docs deliberately stay on the default
+  allocator. `StockFilamentsStore` keeps the raw filaments.jsonl in one
+  PSRAM buffer + a PSRAM index and parses rows on demand (no resident
+  FilamentRecord Strings).
 - `spoolhard/ws_buffer_pool.h` / `src/ws_buffer_pool.cpp` — `g_wsBufPool`
   singleton: up to 8 × 8 KB `AsyncWebSocketSharedBuffer` slots.
   Eliminates internal-DRAM churn on broadcastDebug/broadcastState pushes.

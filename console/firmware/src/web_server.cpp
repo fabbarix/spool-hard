@@ -229,7 +229,7 @@ void ConsoleWebServer::broadcastState(const char* resource, const JsonDocument& 
 // gate inside `broadcastState` decides whether the actual send happens.
 void ConsoleWebServer::pushPrintersList() {
     if (_ws.count() == 0) return;   // skip serialization when nobody's listening
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     JsonArray arr = doc.to<JsonArray>();
     for (const auto& cfg : g_printers_cfg.list()) {
         JsonObject row = arr.add<JsonObject>();
@@ -285,13 +285,13 @@ void ConsoleWebServer::pushSpoolsList() {
     // payload past the per-client queue's per-frame budget. Beyond 200
     // the UI uses paginated HTTP reads anyway.
     auto rows = _store->list(0, 200, String());
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["total"]  = (unsigned)_store->count();
     doc["offset"] = 0;
     doc["limit"]  = 200;
     JsonArray arr = doc["rows"].to<JsonArray>();
     for (auto& r : rows) {
-        JsonDocument row; r.toJson(row);
+        JsonDocument row(&g_psramJsonAlloc); r.toJson(row);
         arr.add(row);
     }
     broadcastState("spools", doc);
@@ -1756,7 +1756,7 @@ void ConsoleWebServer::_handleRestorePost(AsyncWebServerRequest* req,
 // ── Crash logs ───────────────────────────────────────────────
 
 void ConsoleWebServer::_handleCrashesList(AsyncWebServerRequest* req) {
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["available"] = CrashLogger::isAvailable();
     JsonArray arr = doc["crashes"].to<JsonArray>();
     if (CrashLogger::isAvailable()) {
@@ -1856,13 +1856,13 @@ void ConsoleWebServer::_handleSpoolsList(AsyncWebServerRequest* req) {
 
     auto rows = _store->list(offset, limit, material);
 
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["total"]  = (unsigned)_store->count();
     doc["offset"] = offset;
     doc["limit"]  = limit;
     JsonArray arr = doc["rows"].to<JsonArray>();
     for (auto& r : rows) {
-        JsonDocument row; r.toJson(row);
+        JsonDocument row(&g_psramJsonAlloc); r.toJson(row);
         arr.add(row);
     }
     String out; serializeJson(doc, out);
@@ -1878,7 +1878,7 @@ void ConsoleWebServer::_handleSpoolGet(AsyncWebServerRequest* req) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
         return;
     }
-    JsonDocument doc; rec.toJson(doc);
+    JsonDocument doc(&g_psramJsonAlloc); rec.toJson(doc);
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }
@@ -1887,7 +1887,7 @@ void ConsoleWebServer::_handleSpoolPost(AsyncWebServerRequest* req, uint8_t* dat
     _DiagTrace _trace("spool-post");
     if (!_requireAuth(req)) return;
     if (!_store) { req->send(503, "application/json", "{\"error\":\"store unavailable\"}"); return; }
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     if (deserializeJson(doc, data, len)) {
         req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
         return;
@@ -2065,13 +2065,13 @@ void ConsoleWebServer::_handleUserFilamentsList(AsyncWebServerRequest* req) {
     if (limit <= 0 || limit > 500) limit = 200;
 
     auto rows = g_user_filaments.list(offset, limit, material);
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     doc["total"]  = (unsigned)g_user_filaments.count();
     doc["offset"] = offset;
     doc["limit"]  = limit;
     JsonArray arr = doc["rows"].to<JsonArray>();
     for (auto& r : rows) {
-        JsonDocument row; r.toJson(row);
+        JsonDocument row(&g_psramJsonAlloc); r.toJson(row);
         arr.add(row);
     }
     String out; serializeJson(doc, out);
@@ -2086,7 +2086,7 @@ void ConsoleWebServer::_handleUserFilamentGet(AsyncWebServerRequest* req) {
         req->send(404, "application/json", "{\"error\":\"not found\"}");
         return;
     }
-    JsonDocument doc; rec.toJson(doc);
+    JsonDocument doc(&g_psramJsonAlloc); rec.toJson(doc);
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }
@@ -2095,7 +2095,7 @@ void ConsoleWebServer::_handleUserFilamentPost(AsyncWebServerRequest* req,
                                                uint8_t* data, size_t len) {
     _DiagTrace _trace("user-filament-write");
     if (!_requireAuth(req)) return;
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     if (deserializeJson(doc, data, len)) {
         req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
         return;
@@ -2138,7 +2138,7 @@ void ConsoleWebServer::_handleUserFilamentPost(AsyncWebServerRequest* req,
         req->send(500, "application/json", "{\"error\":\"upsert failed\"}");
         return;
     }
-    JsonDocument resp; rec.toJson(resp);
+    JsonDocument resp(&g_psramJsonAlloc); rec.toJson(resp);
     String out; serializeJson(resp, out);
     req->send(200, "application/json", out);
 }
@@ -2558,7 +2558,7 @@ void ConsoleWebServer::_handleUserFilamentCloudDetail(AsyncWebServerRequest* req
     // already knows how to render `unreachable` / `rejected` with
     // diagnostics, so the detail panel reuses the same shape.
     if (r.cfBlocked || r.httpStatus <= 0) {
-        JsonDocument resp;
+        JsonDocument resp(&g_psramJsonAlloc);
         resp["status"] = "unreachable";
         JsonObject d = resp["diagnostics"].to<JsonObject>();
         d["stage"]         = "cloud-detail " + cloudId;
@@ -2571,7 +2571,7 @@ void ConsoleWebServer::_handleUserFilamentCloudDetail(AsyncWebServerRequest* req
         return;
     }
     if (r.httpStatus >= 400) {
-        JsonDocument resp;
+        JsonDocument resp(&g_psramJsonAlloc);
         resp["status"] = "rejected";
         JsonObject d = resp["diagnostics"].to<JsonObject>();
         d["stage"]         = "cloud-detail " + cloudId;
@@ -2585,9 +2585,9 @@ void ConsoleWebServer::_handleUserFilamentCloudDetail(AsyncWebServerRequest* req
     }
     // Wrap the cloud body so the frontend always sees a status field —
     // makes the success/failure branching uniform.
-    JsonDocument resp;
+    JsonDocument resp(&g_psramJsonAlloc);
     resp["status"] = "ok";
-    JsonDocument inner;
+    JsonDocument inner(&g_psramJsonAlloc);
     if (deserializeJson(inner, r.body)) {
         // Cloud said 200 but body wasn't JSON — surface the raw text.
         resp["status"]      = "rejected";
@@ -2684,7 +2684,7 @@ RefreshResult refreshPublicCache(int& entriesOut, String& errMsgOut) {
     JsonDocument filter;
     filter["filament"]["public"][0]["name"]       = true;
     filter["filament"]["public"][0]["setting_id"] = true;
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     DeserializationError jerr = deserializeJson(doc, resp.body,
                                                  DeserializationOption::Filter(filter));
     resp.body = String();
@@ -2743,7 +2743,7 @@ void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
     auto envelopeError = [&](const char* status, const String& stage,
                              const String& url, int httpStatus,
                              bool cfBlocked, const String& body) {
-        JsonDocument resp;
+        JsonDocument resp(&g_psramJsonAlloc);
         resp["status"] = status;
         JsonObject d = resp["diagnostics"].to<JsonObject>();
         d["stage"]         = stage;
@@ -2821,10 +2821,10 @@ void ConsoleWebServer::_handleCloudFilamentByName(AsyncWebServerRequest* req) {
         return;
     }
 
-    JsonDocument resp;
+    JsonDocument resp(&g_psramJsonAlloc);
     resp["status"] = "ok";
     resp["resolved_setting_id"] = matchedId;
-    JsonDocument inner;
+    JsonDocument inner(&g_psramJsonAlloc);
     if (deserializeJson(inner, detailResp.body)) {
         resp["status"] = "rejected";
         JsonObject d = resp["diagnostics"].to<JsonObject>();
@@ -2862,7 +2862,7 @@ void ConsoleWebServer::_handleCloudPresetById(AsyncWebServerRequest* req) {
 
     auto envelopeError = [&](const char* status, const String& stage,
                              int httpStatus, bool cfBlocked, const String& body) {
-        JsonDocument resp;
+        JsonDocument resp(&g_psramJsonAlloc);
         resp["status"] = status;
         JsonObject d = resp["diagnostics"].to<JsonObject>();
         d["stage"]         = stage;
@@ -2881,10 +2881,10 @@ void ConsoleWebServer::_handleCloudPresetById(AsyncWebServerRequest* req) {
         envelopeError("rejected", "preset-by-id " + id, r.httpStatus, false, r.body);
         return;
     }
-    JsonDocument resp;
+    JsonDocument resp(&g_psramJsonAlloc);
     resp["status"] = "ok";
     resp["resolved_setting_id"] = id;
-    JsonDocument inner;
+    JsonDocument inner(&g_psramJsonAlloc);
     if (deserializeJson(inner, r.body)) {
         resp["status"] = "rejected";
         JsonObject d = resp["diagnostics"].to<JsonObject>();
@@ -3088,7 +3088,7 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
 
 void ConsoleWebServer::_handlePrintersList(AsyncWebServerRequest* req) {
     if (!_requireAuth(req)) return;
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     JsonArray arr = doc.to<JsonArray>();
     for (const auto& cfg : g_printers_cfg.list()) {
         JsonObject row = arr.add<JsonObject>();
@@ -3260,7 +3260,7 @@ void ConsoleWebServer::_handlePrinterAnalysisGet(AsyncWebServerRequest* req) {
     String serial = spoolhard::pathArg(req, "/api/printers/", "/analysis", false);
     BambuPrinter* p = g_bambu.find(serial);
     if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     serializeAnalysis(doc.to<JsonObject>(), p);
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);

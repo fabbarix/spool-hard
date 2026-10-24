@@ -29,10 +29,26 @@ public:
     std::vector<FilamentRecord> list(size_t offset, size_t limit,
                                      const String& material_filter = "") const;
 
-    size_t count() const { return _rows.size(); }
+    size_t count() const { return _count; }
     bool   loaded() const { return _loaded; }
 
 private:
-    std::vector<FilamentRecord> _rows;
+    // Memory layout: raw JSONL text in ONE PSRAM buffer + a small PSRAM
+    // index (offset, len, FNV-1a of setting_id / filament_type). Rows are
+    // parsed on demand by findById()/list() instead of keeping ~100
+    // FilamentRecords (13 Arduino Strings each => hundreds of tiny
+    // internal-DRAM allocations) resident.
+    struct RowIdx {
+        uint32_t off;        // byte offset of the line in _buf
+        uint16_t len;        // line length (no newline)
+        uint32_t id_hash;
+        uint32_t type_hash;
+    };
+    void freeBuffers();
+    bool parseRow(const RowIdx& r, FilamentRecord& out) const;
+
+    char*   _buf   = nullptr;
+    RowIdx* _idx   = nullptr;
+    size_t  _count = 0;
     bool _loaded = false;
 };

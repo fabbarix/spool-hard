@@ -655,7 +655,7 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
         // via Config → Debug → "Log AMS messages". Off by default because
         // each message is 1–5 KB and AMS reports land every few seconds.
         if (g_web._logAmsRaw) {
-            JsonDocument payload;
+            JsonDocument payload(&g_psramJsonAlloc);
             payload["serial"] = _cfg.serial;
             payload["ams"]    = ams;
             if (print["vt_tray"].is<JsonObjectConst>()) {
@@ -2409,7 +2409,7 @@ void BambuPrinter::_runFtpDebug(const String& op, const String& path,
         if (!ok) {
             emitDone(s, serial, op, false, String("list failed: ") + ftp.lastError());
         } else {
-            JsonDocument payload;
+            JsonDocument payload(&g_psramJsonAlloc);
             JsonArray arr = payload["entries"].to<JsonArray>();
             for (auto& e : entries) arr.add(e);
             emitDoneWith(s, serial, op, true,

@@ -1,3 +1,4 @@
+#include "spoolhard/psram_json_alloc.h"
 #include "spool_record.h"
 
 void SpoolRecord::toJson(JsonDocument& doc) const {
@@ -88,7 +89,7 @@ bool SpoolRecord::fromJson(const JsonDocument& doc) {
 }
 
 String SpoolRecord::toLine() const {
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     toJson(doc);
     String out;
     serializeJson(doc, out);
@@ -96,7 +97,7 @@ String SpoolRecord::toLine() const {
 }
 
 bool SpoolRecord::fromLine(const String& line) {
-    JsonDocument doc;
+    JsonDocument doc(&g_psramJsonAlloc);
     if (deserializeJson(doc, line)) return false;
     return fromJson(doc);
 }
