@@ -501,6 +501,17 @@ served under `loop_stat` in `GET /api/heap` (added via
 `SpoolhardCommonRoutes::setHeapExtra()`, add-only; scale doesn't set it).
 The old `[LoopLat]` >200 ms per-step / >500 ms first-half lines remain.
 
+**Housekeeping task (step 4)**: `console/firmware/src/housekeeping.cpp` runs
+`SdCard::update()` (2 s mount/liveness gate) and `CrashLogger::update()` (3 s
+spill gate) from one `housekeeping` task (4 KB internal stack, core 0, prio 1,
+100 ms tick; logs `[HK] stack_hwm` at +30 s then every 5 min). `loop()` only
+calls them when `housekeepingActive()` is false (task-create failure
+fallback), so LoopStat `sd`/`crash_log` now read ~0. `SdCard::_mounted` is
+`std::atomic<bool>`. `CrashLogger::flush(sdLockTimeoutMs=50)` is still callable
+synchronously (pre-restart in `wifi_provisioning.cpp`, `/api/logs/current`);
+the housekeeping call uses 200 ms, and the ring snapshot is now taken under
+`s_mtx` so concurrent flushers can't write duplicate lines.
+
 **OTA checker config cache**: `OtaChecker::update()` runs every loop tick
 (~200 Hz on the console). It used to `OtaConfig::load()` (NVS open + 9
 reads) each tick; it now caches only `check_enabled` + `check_interval_h`

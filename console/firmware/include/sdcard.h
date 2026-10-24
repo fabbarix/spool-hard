@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <atomic>
 
 // microSD slot on the WT32-SC01-Plus (SPI bus: CS=41, SCK=39, MOSI=40, MISO=38).
 // Mounted at SD_MOUNT ("/sd") if a card is present at boot. The mount is
@@ -14,7 +15,7 @@ public:
     uint64_t usedBytes() const  { return _used; }
 
 private:
-    bool _mounted = false;
+    std::atomic<bool> _mounted{false};   // written by housekeeping task, read everywhere
     uint64_t _total = 0;
     uint64_t _used  = 0;
     uint32_t _lastCheck = 0;

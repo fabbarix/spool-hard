@@ -19,6 +19,7 @@
 #include "protocol.h"
 #include "spoolhard/ota.h"
 #include "sdcard.h"
+#include "housekeeping.h"
 #include "bambu_manager.h"
 #include "bambu_cloud.h"
 #include "bambu_discovery.h"
@@ -241,6 +242,7 @@ void setup() {
     // present and the previous boot ended in a panic / watchdog reset,
     // begin() also archives the prior session's log under crashes/.
     CrashLogger::begin();
+    housekeepingBegin();   // SdCard::update + CrashLogger::update off loopTask
     g_bambu.begin();
     g_bambu_cloud.begin();
     // SNTP — gives the OTA checker a real wall-clock for "last
@@ -1482,8 +1484,10 @@ void loop() {
     LAT_STEP(S_WIFI, "wifi",            g_wifi.update());
     LAT_STEP(S_SCALE, "scale",           g_scale.update());
     LAT_STEP(S_NFC, "nfc",             g_nfc.update());
-    LAT_STEP(S_SD, "sd",              g_sd.update());
-    LAT_STEP(S_CRASH_LOG, "crash_log",       CrashLogger::update());
+    if (!housekeepingActive()) {   // fallback only; normally the housekeeping task owns these
+        LAT_STEP(S_SD, "sd",              g_sd.update());
+        LAT_STEP(S_CRASH_LOG, "crash_log",       CrashLogger::update());
+    }
     LAT_STEP(S_BAMBU, "bambu",           g_bambu.update());
     LAT_STEP(S_SSDP, "ssdp",            ssdp_hub_poll());
     LAT_STEP(S_BAMBU_DISC, "bambu_discovery", g_bambu_discovery.update());

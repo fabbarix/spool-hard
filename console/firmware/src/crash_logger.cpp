@@ -271,20 +271,22 @@ void update() {
     uint32_t now = millis();
     if (now - s_lastFlushAtMs < kFlushIntervalMs) return;
     s_lastFlushAtMs = now;
-    flush();
+    flush(200);   // housekeeping task: can afford to wait for the SD lock
 }
 
-void flush() {
+void flush(uint32_t sdLockTimeoutMs) {
     if (!s_active) return;
     if (!g_sd.isMounted()) return;   // card hot-removed; skip silently
-    auto snap = RingLog::snapshot(s_lastFlushedSeq, /*limit*/ 256);
-    if (snap.empty()) return;
-
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(200)) != pdTRUE) return;
-    // Lock order: s_mtx -> SdLock. Short timeout: flush() runs on loopTask;
-    // on contention skip and retry next tick (s_lastFlushedSeq only
-    // advances after a successful write, so nothing is lost).
-    SdLock sdl(50);
+    // Snapshot under s_mtx: flush() is called from the housekeeping task, from
+    // AsyncTCP (/api/logs/current) and from loopTask (pre-restart), so
+    // s_lastFlushedSeq must not be read/advanced concurrently (dup lines).
+    auto snap = RingLog::snapshot(s_lastFlushedSeq, /*limit*/ 256);
+    if (snap.empty()) { xSemaphoreGive(s_mtx); return; }
+    // Lock order: s_mtx -> SdLock. Short timeout; on contention skip and
+    // retry next tick (s_lastFlushedSeq only advances after a successful
+    // write, so nothing is lost).
+    SdLock sdl(sdLockTimeoutMs);
     if (!sdl) { xSemaphoreGive(s_mtx); return; }
 
     // FILE_APPEND opens for write at end-of-file — exactly what we want

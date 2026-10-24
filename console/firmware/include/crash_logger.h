@@ -37,7 +37,7 @@ void update();
 // Force-flush whatever is in the ring buffer right now. Use from
 // orderly shutdown handlers (esp_register_shutdown_handler) so a planned
 // reboot doesn't lose the last few seconds of log.
-void flush();
+void flush(uint32_t sdLockTimeoutMs = 50);
 
 // True when SD is mounted and the persistence loop is running. Used by
 // the API handler to surface a clear error when the user opens the
