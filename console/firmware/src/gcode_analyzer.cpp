@@ -1,5 +1,8 @@
 #include "gcode_analyzer.h"
 #include <math.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 static constexpr float DEFAULT_DIAMETER = 1.75f;
 static constexpr float DEFAULT_DENSITY  = 1.24f;   // PLA, reasonable default
@@ -23,7 +26,8 @@ void GCodeAnalyzer::reset() {
     for (int p = 0; p < PCT_SLOTS; ++p) {
         for (int i = 0; i < MAX_TOOLS; ++i) _mmAtPct[p][i] = -1.f;
     }
-    _lineBuf = "";
+    _lineLen = 0;
+    _line[0] = '\0';
 }
 
 const GCodeAnalyzer::SlicerSlot& GCodeAnalyzer::slicerSlot(int idx) const {
@@ -58,30 +62,39 @@ void GCodeAnalyzer::_addExtrusion(float delta_mm) {
     _totalG               += delta_mm * area * den / 1000.f;
 }
 
-void GCodeAnalyzer::_processLine(const String& rawLine) {
+// Allocation-free line handler. `rawLine` is a NUL-terminated, mutable
+// buffer (the analyzer's own _line); it is edited in place (comment
+// strip / trim / token terminators). Semantics mirror the earlier
+// String-based implementation exactly.
+void GCodeAnalyzer::_processLine(char* rawLine) {
     // Header comments (`; key = ...`) carry slicer→AMS hints we need
     // for the result packer. Parse them BEFORE the strip-comment step
     // — once we hit real G-code those don't recur.
-    if (rawLine.length() && rawLine[0] == ';') {
+    if (rawLine[0] == ';') {
         if (_maybeParseSlicerHeader(rawLine)) return;
         // Other comments are noise — fall through and let the strip-
         // comment step below ignore them.
     }
     // Strip a trailing comment if any (Bambu uses ';').
-    int semi = rawLine.indexOf(';');
-    String line = (semi >= 0) ? rawLine.substring(0, semi) : rawLine;
-    line.trim();
-    if (line.isEmpty()) return;
+    char* semi = strchr(rawLine, ';');
+    if (semi) *semi = '\0';
+    // Trim leading/trailing whitespace.
+    char* line = rawLine;
+    while (*line && isspace((unsigned char)*line)) ++line;
+    size_t n = strlen(line);
+    while (n && isspace((unsigned char)line[n - 1])) --n;
+    line[n] = '\0';
+    if (n == 0) return;
 
     // M82 = absolute extrusion, M83 = relative extrusion.
-    if (line == "M82") { _relative = false; return; }
-    if (line == "M83") { _relative = true;  return; }
+    if (strcmp(line, "M82") == 0) { _relative = false; return; }
+    if (strcmp(line, "M83") == 0) { _relative = true;  return; }
 
     // Tool switch: T0, T1, … (and occasional T255 = unload). Bambu also uses
     // M620 S<n> for AMS slot loads; we treat it as a T-switch to keep the
     // tool bucket accurate even if the printer pre-loads via M620 before a T.
-    if (line.length() >= 2 && line[0] == 'T' && isdigit(line[1])) {
-        int t = atoi(line.c_str() + 1);
+    if (n >= 2 && line[0] == 'T' && isdigit((unsigned char)line[1])) {
+        int t = atoi(line + 1);
         if (t >= 0 && t < MAX_TOOLS) {
             if (_active != t) ++_swaps;
             _active = t;
@@ -93,10 +106,10 @@ void GCodeAnalyzer::_processLine(const String& rawLine) {
     // firmware uses them to drive `mc_percent`. Snapshot cumulative per-tool
     // extrusion at each marker so live-consume tracking can report exact
     // grams (not linear extrapolation) at every progress boundary.
-    if (line.startsWith("M73")) {
-        int pPos = line.indexOf(" P");
-        if (pPos >= 0) {
-            int pct = atoi(line.c_str() + pPos + 2);
+    if (strncmp(line, "M73", 3) == 0) {
+        const char* p = strstr(line, " P");
+        if (p) {
+            int pct = atoi(p + 2);
             if (pct >= 0 && pct < PCT_SLOTS) {
                 for (int i = 0; i < MAX_TOOLS; ++i) _mmAtPct[pct][i] = _tools[i].mm;
                 _pctEverSeen = true;
@@ -105,10 +118,10 @@ void GCodeAnalyzer::_processLine(const String& rawLine) {
         return;
     }
 
-    if (line.startsWith("M620 ")) {
-        int s = line.indexOf('S');
-        if (s > 0) {
-            int t = atoi(line.c_str() + s + 1);
+    if (strncmp(line, "M620 ", 5) == 0) {
+        const char* s = strchr(line, 'S');
+        if (s && s > line) {
+            int t = atoi(s + 1);
             if (t >= 0 && t < MAX_TOOLS) {
                 if (_active != t) ++_swaps;
                 _active = t;
@@ -119,10 +132,10 @@ void GCodeAnalyzer::_processLine(const String& rawLine) {
     }
 
     // G92 E<n>: reset E axis reference. Can appear mid-file multiple times.
-    if (line.startsWith("G92")) {
-        int ePos = line.indexOf(" E");
-        if (ePos >= 0) {
-            _lastE = atof(line.c_str() + ePos + 2);
+    if (strncmp(line, "G92", 3) == 0) {
+        const char* p = strstr(line, " E");
+        if (p) {
+            _lastE = atof(p + 2);
             _seenAnyE = true;
         }
         return;
@@ -133,11 +146,11 @@ void GCodeAnalyzer::_processLine(const String& rawLine) {
     // default — runs of short G1 segments get rewritten as G2/G3
     // arcs, so dropping them silently under-counts mm by ~30 % on
     // any print with curved walls (1.72 m → 1.2 m kind of miss).
-    if (line.startsWith("G1 ") || line.startsWith("G0 ") ||
-        line.startsWith("G2 ") || line.startsWith("G3 ")) {
-        int ePos = line.indexOf(" E");
-        if (ePos < 0) return;
-        float e = atof(line.c_str() + ePos + 2);
+    if (strncmp(line, "G1 ", 3) == 0 || strncmp(line, "G0 ", 3) == 0 ||
+        strncmp(line, "G2 ", 3) == 0 || strncmp(line, "G3 ", 3) == 0) {
+        const char* p = strstr(line, " E");
+        if (!p) return;
+        float e = atof(p + 2);
         if (_relative) {
             _addExtrusion(e);
         } else {
@@ -151,24 +164,28 @@ void GCodeAnalyzer::_processLine(const String& rawLine) {
 void GCodeAnalyzer::feed(const uint8_t* data, size_t len) {
     for (size_t i = 0; i < len; ++i) {
         char c = (char)data[i];
-        if (c == '\r') continue;
+        // '\r' dropped; '\0' dropped too (the old String-based buffer
+        // silently ignored NULs because concat went through strlen).
+        if (c == '\r' || c == '\0') continue;
         if (c == '\n') {
-            if (_lineBuf.length()) {
-                _processLine(_lineBuf);
-                _lineBuf = "";
+            if (_lineLen) {
+                _line[_lineLen] = '\0';
+                _processLine(_line);
+                _lineLen = 0;
             }
         } else {
-            _lineBuf += c;
+            _line[_lineLen++] = c;
             // Cap line length to guard against pathological input.
-            if (_lineBuf.length() > 1024) _lineBuf = "";
+            if (_lineLen > LINE_CAP) _lineLen = 0;
         }
     }
 }
 
 void GCodeAnalyzer::finalise() {
-    if (_lineBuf.length()) {
-        _processLine(_lineBuf);
-        _lineBuf = "";
+    if (_lineLen) {
+        _line[_lineLen] = '\0';
+        _processLine(_line);
+        _lineLen = 0;
     }
     // Convert mm of filament → grams:
     //   volume = length × π × (d/2)² mm³ = length × π × d²/4 mm³
@@ -226,9 +243,9 @@ float GCodeAnalyzer::gramsAtPct(int pct, int tool) const {
 // the caller can short-circuit the regular G-code path). Bambu is
 // inconsistent with the delimiter — `;` for filament_ids /
 // filament_colour, `,` for filament_density — so we accept either.
-bool GCodeAnalyzer::_maybeParseSlicerHeader(const String& rawLine) {
+bool GCodeAnalyzer::_maybeParseSlicerHeader(char* rawLine) {
     struct Spec {
-        const char* prefix;   // matched against rawLine.startsWith(...)
+        const char* prefix;   // matched against the start of rawLine
         enum Kind { Ids, Colour, Density } kind;
     };
     static const Spec specs[] = {
@@ -243,45 +260,57 @@ bool GCodeAnalyzer::_maybeParseSlicerHeader(const String& rawLine) {
     };
     const Spec* match = nullptr;
     for (const auto& s : specs) {
-        if (rawLine.startsWith(s.prefix)) { match = &s; break; }
+        if (strncmp(rawLine, s.prefix, strlen(s.prefix)) == 0) { match = &s; break; }
     }
     if (!match) return false;
-    int eq = rawLine.indexOf('=');
-    if (eq < 0) return true;   // matched key but no value — consume + ignore
-    String values = rawLine.substring(eq + 1);
-    values.trim();
+    char* eq = strchr(rawLine, '=');
+    if (!eq) return true;   // matched key but no value — consume + ignore
+    char* values = eq + 1;
+    while (*values && isspace((unsigned char)*values)) ++values;
+    {
+        size_t vn = strlen(values);
+        while (vn && isspace((unsigned char)values[vn - 1])) --vn;
+        values[vn] = '\0';
+    }
 
     int idx = 0;
-    int start = 0;
-    int len = (int)values.length();
-    for (int i = 0; i <= len && idx < MAX_TOOLS; ++i) {
-        bool boundary = (i == len) || values[i] == ';' || values[i] == ',';
-        if (!boundary) continue;
-        String tok = values.substring(start, i);
-        tok.trim();
+    char* tokStart = values;
+    for (char* q = values; idx < MAX_TOOLS; ++q) {
+        bool end = (*q == '\0');
+        if (!end && *q != ';' && *q != ',') continue;
+        *q = '\0';                      // terminate this token in place
+        char* tok = tokStart;
+        while (*tok && isspace((unsigned char)*tok)) ++tok;
+        size_t tn = strlen(tok);
+        while (tn && isspace((unsigned char)tok[tn - 1])) --tn;
+        tok[tn] = '\0';
         // Trim wrapping double-quotes — filament_settings_id-style
         // values use them; our three known keys don't, but cheap
         // safety for possible future additions.
-        if (tok.length() >= 2 && tok[0] == '"' && tok[tok.length() - 1] == '"') {
-            tok = tok.substring(1, tok.length() - 1);
+        if (tn >= 2 && tok[0] == '"' && tok[tn - 1] == '"') {
+            tok[tn - 1] = '\0';
+            ++tok;
+            tn -= 2;
         }
-        if (tok.length()) {
+        if (tn) {
             switch (match->kind) {
                 case Spec::Ids:
                     _slicerSlots[idx].filament_id = tok;
                     break;
                 case Spec::Colour: {
                     // Hex like "#FFDE0A" → 0xFFDE0A. Skip leading '#'.
-                    const char* p = tok.c_str();
+                    const char* p = tok;
                     if (*p == '#') p++;
                     if (strlen(p) >= 6) {
-                        _slicerSlots[idx].color_rgb =
-                            (uint32_t)strtoul(String(p).substring(0, 6).c_str(), nullptr, 16);
+                        char hex[7];
+                        memcpy(hex, p, 6);
+                        hex[6] = '\0';
+                        _slicerSlots[idx].color_rgb = (uint32_t)strtoul(hex, nullptr, 16);
                     }
                     break;
                 }
                 case Spec::Density: {
-                    float d = tok.toFloat();
+                    float d = atof(tok);
                     if (d > 0.f) {
                         _slicerSlots[idx].density = d;
                         _densities[idx] = d;   // override the family-default
@@ -291,7 +320,8 @@ bool GCodeAnalyzer::_maybeParseSlicerHeader(const String& rawLine) {
             }
         }
         idx++;
-        start = i + 1;
+        if (end) break;
+        tokStart = q + 1;
     }
     _slicerHeaderParsed = true;
     return true;
