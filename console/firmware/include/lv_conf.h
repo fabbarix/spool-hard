@@ -69,6 +69,18 @@
  * exercised while the Config -> Debug toggle is on. */
 #define LV_USE_SNAPSHOT         1
 
+/* SW renderer pixel formats. The display and snapshot are RGB565; opacity
+ * layers use ARGB8888 and glyph masks A8 — keep those (+ PREMULTIPLIED, RGB565).
+ * No images are ever loaded, so the remaining formats' blend/convert code is
+ * dead weight. */
+#define LV_DRAW_SW_SUPPORT_RGB565_SWAPPED   0
+#define LV_DRAW_SW_SUPPORT_RGB565A8         0
+#define LV_DRAW_SW_SUPPORT_RGB888           0
+#define LV_DRAW_SW_SUPPORT_XRGB8888         0
+#define LV_DRAW_SW_SUPPORT_L8               0
+#define LV_DRAW_SW_SUPPORT_AL88             0
+#define LV_DRAW_SW_SUPPORT_I1               0
+
 #define LV_USE_PERF_MONITOR     0
 #define LV_USE_MEM_MONITOR      0
 
@@ -77,11 +89,46 @@
  *=================*/
 #define LV_USE_THEME_DEFAULT    1
 #define LV_THEME_DEFAULT_DARK   1
+/* Only the default theme is applied (display.cpp never calls
+ * lv_theme_simple/mono_init); grid layout is unused (flex only). */
+#define LV_USE_THEME_SIMPLE     0
+#define LV_USE_THEME_MONO       0
+#define LV_USE_GRID             0
 
 /*=================
  * Widgets
  *=================*/
-/* Leave widgets at defaults (all enabled). Disable if binary-size becomes an issue. */
+/* Used by the src/ui sources: obj, label, button (lv_btn_create), bar, led, list
+ * (lv_list_add_btn), image (pulled in by lv_list), flex layout. Everything
+ * else is compiled out (verified unreferenced via grep of lv_* identifiers
+ * in console/firmware/src). Re-enable the specific widget if the UI grows
+ * one. */
+#define LV_USE_ANIMIMG      0
+#define LV_USE_ARC          0
+#define LV_USE_ARCLABEL     0
+#define LV_USE_BUTTONMATRIX 0
+#define LV_USE_CALENDAR     0
+#define LV_USE_CANVAS       0
+#define LV_USE_CHART        0
+#define LV_USE_CHECKBOX     0
+#define LV_USE_DROPDOWN     0
+#define LV_USE_IMAGEBUTTON  0
+#define LV_USE_KEYBOARD     0
+#define LV_USE_LINE         0
+#define LV_USE_MENU         0
+#define LV_USE_MSGBOX       0
+#define LV_USE_ROLLER       0
+#define LV_USE_SCALE        0
+#define LV_USE_SLIDER       0
+#define LV_USE_SPAN         0
+#define LV_USE_SPINBOX      0
+#define LV_USE_SPINNER      0
+#define LV_USE_SWITCH       0
+#define LV_USE_TABLE        0
+#define LV_USE_TABVIEW      0
+#define LV_USE_TEXTAREA     0
+#define LV_USE_TILEVIEW     0
+#define LV_USE_WIN          0
 
 /*=================
  * Fonts
