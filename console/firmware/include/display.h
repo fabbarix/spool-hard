@@ -58,7 +58,15 @@ public:
     // AsyncWebServer chunked-response fill callback; returns 0 at end.
     static size_t     snapshotFill(uint8_t* out, size_t maxLen, size_t index);
     // Release a claimed buffer early (client disconnected).
-    static void       snapshotAbort();
+    // `gen` is snapshotGeneration() captured when the stream was claimed;
+    // a stale disconnect (older stream) is ignored.
+    static void       snapshotAbort(uint32_t gen);
+    static uint32_t   snapshotGeneration();
+    // Free any READY/STREAMING buffer now (debug toggle turned off).
+    static void       snapshotRelease();
+    // Frees an abandoned (>30 s) READY/STREAMING buffer; called from the
+    // LVGL task loop.
+    static void       snapshotSweep();
 
     // Touch injection into the LVGL indev. action: 0 = tap (press, ~100 ms,
     // release), 1 = press (held until release; auto-released after 5 s),
