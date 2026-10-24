@@ -18,10 +18,13 @@ interface SubTabBarProps<T extends string> {
  */
 export function SubTabBar<T extends string>({ tabs, active, onChange }: SubTabBarProps<T>) {
   return (
-    <div className="flex gap-1 rounded-card bg-surface-card border border-surface-border p-1">
+    <div role="tablist" className="flex gap-1 rounded-card bg-surface-card border border-surface-border p-1">
       {tabs.map((tab) => (
         <button
           key={tab.id}
+          type="button"
+          role="tab"
+          aria-selected={active === tab.id}
           onClick={() => onChange(tab.id)}
           className={`
             flex items-center gap-1.5 px-4 py-2 rounded-[7px] text-sm transition-all duration-200 cursor-pointer
