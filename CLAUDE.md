@@ -509,6 +509,16 @@ and re-reads when `OtaConfig::save()` bumps a static generation counter
 (safety net for writers that bypass `save()`, e.g. `/api/restore`). A real
 check start does one fresh full `load()` for url/ssl flags. `kickNow()`,
 the 5-min force floor and the interval/boot gates are unchanged.
+
+**Event-driven 1 Hz block (step 2)**: the LCD refreshes in `loop()`
+(`_refreshHomeAmsPanel` / `_refreshHomeFooter` / `_refreshOtaBanner`) now
+FNV-hash the values they display (printer state incl. trays/temps/progress,
+`g_store.generation()`, wifi state/name, OTA pending) on loopTask and skip the
+LVGL/String-building work when the hash is unchanged, forcing a refresh at
+least every 5 s (`kLcdSafetyMs`) and on the first tick after screen wake
+(the hash is invalidated while asleep). `pushScaleLink()` from the 1 Hz
+block is a keep-alive only every 5 s (or immediately on a connect flip);
+`ScaleLink` still pushes on every event/handshake transition itself.
 ## Gcode-analysis inflate placement measurement (console only)
 
 `analyseRemote()` times every run (`InflateStats` in `bambu_printer.h`:

@@ -1149,7 +1149,34 @@ void setup() {
 // stored — the onboarding → home transition block in loop() below never
 // fires, so the footer labels would otherwise stay on their "—"
 // placeholders forever.
+// ── Change-detection helpers for the 1 Hz LCD refresh (loopTask only) ──
+// FNV-1a over the displayed values. Hashing happens on loopTask, which is
+// also the only writer of PrinterState (g_bambu.update()), so no cross-task
+// reads. A skipped refresh is always re-forced after kLcdSafetyMs.
+static constexpr uint32_t kLcdSafetyMs = 5000;
+static inline void _fnv(uint32_t& h, const void* p, size_t n) {
+    const uint8_t* b = (const uint8_t*)p;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 16777619u; }
+}
+static inline void _fnvS(uint32_t& h, const String& s) {
+    _fnv(h, s.c_str(), s.length()); uint8_t z = 0xff; _fnv(h, &z, 1);
+}
+template <typename T> static inline void _fnvV(uint32_t& h, T v) { _fnv(h, &v, sizeof(v)); }
+
+static void _refreshHomeFooterImpl();
 static void _refreshHomeFooter() {
+    static uint32_t s_lastHash = 0, s_lastMs = 0;
+    static bool s_valid = false;
+    uint32_t h = 2166136261u;
+    _fnvV(h, (int)g_wifi.getState());
+    _fnvV(h, (int)WiFi.status());
+    _fnvS(h, g_wifi.getDeviceName());
+    uint32_t now = millis();
+    if (s_valid && h == s_lastHash && (now - s_lastMs) < kLcdSafetyMs) return;
+    s_valid = true; s_lastHash = h; s_lastMs = now;
+    _refreshHomeFooterImpl();
+}
+static void _refreshHomeFooterImpl() {
     // Map the firmware-facing WifiState into the UI's four-state enum.
     // Unconfigured/Failed both drive the provisioning SoftAP (orange);
     // Connecting is yellow; Connected is green; anything else renders
@@ -1207,11 +1234,46 @@ static void _refreshDevModeWarning() {
     ui_set_dev_mode_warning(names.length() ? names.c_str() : nullptr);
 }
 
+static void _refreshHomeAmsPanelImpl();
+static void _hashTray(uint32_t& h, const AmsTray& t) {
+    _fnvV(h, t.id); _fnvS(h, t.tray_type); _fnvS(h, t.tray_color);
+    _fnvS(h, t.tag_uid); _fnvV(h, t.remain_pct); _fnvV(h, t.k);
+    _fnvS(h, t.mapped_spool_id);
+}
 static void _refreshHomeAmsPanel() {
     _refreshDevModeWarning();
     // Nothing visible while the LCD is asleep; the next 1 s tick after wake
-    // repaints (ui_set_*_panel also skip identical snapshots).
-    if (ConsoleDisplay::isAsleep()) return;
+    // repaints (ui_set_*_panel also skip identical snapshots). Invalidate
+    // the change-hash so the first awake tick always repaints.
+    static uint32_t s_lastHash = 0, s_lastMs = 0;
+    static bool s_valid = false;
+    if (ConsoleDisplay::isAsleep()) { s_valid = false; return; }
+
+    // Hash everything the panel/printer card displays (plus the spool-store
+    // generation, which covers weight/colour/material fallbacks).
+    uint32_t h = 2166136261u;
+    _fnvV(h, g_store.generation());
+    for (const auto& pp : g_bambu.printers()) {
+        if (!pp) continue;
+        const PrinterState& s = pp->state();
+        _fnvV(h, (int)s.link);
+        if (s.link != BambuLinkState::Connected) continue;
+        _fnvS(h, pp->config().name); _fnvS(h, pp->config().serial);
+        _fnvS(h, s.gcode_state);
+        _fnvV(h, s.progress_pct); _fnvV(h, s.layer_num); _fnvV(h, s.total_layers);
+        _fnvV(h, (int)(s.nozzle_temp * 10.f)); _fnvV(h, (int)(s.bed_temp * 10.f));
+        _fnvV(h, s.active_tray); _fnvV(h, s.ams_count); _fnvV(h, s.has_vt_tray);
+        if (s.ams_count > 0)
+            for (int t = 0; t < 4; ++t) _hashTray(h, s.ams[0].trays[t]);
+        if (s.has_vt_tray) _hashTray(h, s.vt_tray);
+        break;   // LCD shows the first connected printer only
+    }
+    uint32_t now = millis();
+    if (s_valid && h == s_lastHash && (now - s_lastMs) < kLcdSafetyMs) return;
+    s_valid = true; s_lastHash = h; s_lastMs = now;
+    _refreshHomeAmsPanelImpl();
+}
+static void _refreshHomeAmsPanelImpl() {
     for (const auto& pp : g_bambu.printers()) {
         if (!pp) continue;
         const PrinterState& s = pp->state();
@@ -1339,7 +1401,24 @@ static void _refreshHomeAmsPanel() {
 // and reflects either / both on the LCD home screen. Hides the banner when
 // nothing is pending. Cheap — one LVGL call only when the message text
 // actually changed.
+static void _refreshOtaBannerImpl();
 static void _refreshOtaBanner() {
+    static uint32_t s_lastHash = 0, s_lastMs = 0;
+    static bool s_valid = false;
+    uint32_t h = 2166136261u;
+    {
+        auto cp = g_ota_checker.pending();
+        const auto& sp = g_scale.scaleOtaPending();
+        _fnvV(h, cp.firmware); _fnvV(h, cp.frontend); _fnvS(h, cp.firmware_latest);
+        _fnvV(h, sp.valid); _fnvV(h, sp.firmware_update);
+        _fnvV(h, sp.frontend_update); _fnvS(h, sp.firmware_latest);
+    }
+    uint32_t now = millis();
+    if (s_valid && h == s_lastHash && (now - s_lastMs) < kLcdSafetyMs) return;
+    s_valid = true; s_lastHash = h; s_lastMs = now;
+    _refreshOtaBannerImpl();
+}
+static void _refreshOtaBannerImpl() {
     auto cp = g_ota_checker.pending();
     const auto& sp = g_scale.scaleOtaPending();
     bool consolePending = cp.firmware || cp.frontend;
@@ -1467,7 +1546,21 @@ void loop() {
         // watching, and the scale_link key has no rate gate so it goes
         // out every second when a tab IS open. The "ago_ms" alone
         // updating every second tells the user the link is alive.
-        g_web.pushScaleLink();
+        // Event-driven now: ScaleLink pushes on every event/handshake
+        // transition itself. This is only the keep-alive so the dashboard's
+        // *_ago_ms fields (weight/event/heartbeat) refresh — gated to 5 s
+        // (or immediately on a connect/disconnect flip).
+        {
+            static uint32_t s_lastLinkPush = 0;
+            static bool s_lastLinked = false;
+            bool linked = g_scale.isConnected();
+            uint32_t nowp = millis();
+            if (linked != s_lastLinked || nowp - s_lastLinkPush >= 5000) {
+                s_lastLinked = linked;
+                s_lastLinkPush = nowp;
+                g_web.pushScaleLink();
+            }
+        }
         // ESPAsyncWebServer holds AsyncWebSocketClient instances even
         // after the underlying TCP connection drops abruptly (page
         // navigated away, network change, browser killed). Without a
