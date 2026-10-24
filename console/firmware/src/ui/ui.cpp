@@ -11,15 +11,16 @@
 #include "spoolhard/serial_mirror.h"
 
 // ── Theme tokens (mirror shared/frontend/src/app.css) ────────
-#define COL_BODY        lv_color_hex(0x0f1117)
-#define COL_CARD        lv_color_hex(0x1a1d27)
-#define COL_INPUT       lv_color_hex(0x12141c)
-#define COL_BORDER      lv_color_hex(0x252830)
+#define COL_BODY        lv_color_hex(0x05070b)
+#define COL_CARD        lv_color_hex(0x1f2638)
+#define COL_INPUT       lv_color_hex(0x0d1018)
+#define COL_BORDER      lv_color_hex(0x3a4560)
 #define COL_BRAND       lv_color_hex(0xf0b429)
 #define COL_TEXT        lv_color_hex(0xe2e8f0)
-// 0x94a3b8: 7.36:1 on COL_BODY, 6.56:1 on COL_CARD, 7.17:1 on COL_INPUT,
-// 5.75:1 on COL_BORDER (old 0x64748b was 3.53:1 on COL_CARD).
-#define COL_TEXT_MUTED  lv_color_hex(0x94a3b8)
+// Palette tuned for the real (washed-out) panel: body 0x05070b, card 0x1f2638
+// (card/body 1.34:1, was 1.12). Muted 0xa9b8cc: 10.0:1 on body, 7.48:1 on card
+// (old 0x64748b was 3.53:1). Tile outline 0x56627f is 2.48:1 on card.
+#define COL_TEXT_MUTED  lv_color_hex(0xa9b8cc)
 #define COL_CONNECTED   lv_color_hex(0x2dd4bf)
 #define COL_DISCONN     lv_color_hex(0xf87171)
 
@@ -406,7 +407,7 @@ static void build_home() {
         lv_obj_t* tile = lv_obj_create(s_ams_panel);
         lv_obj_set_pos(tile, x, 0);
         lv_obj_set_size(tile, tileW, tileH);
-        lv_obj_set_style_bg_color(tile, COL_INPUT, 0);
+        lv_obj_set_style_bg_color(tile, COL_CARD, 0);
         lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
         lv_obj_set_style_border_color(tile, COL_BORDER, 0);
         lv_obj_set_style_border_width(tile, 2, 0);
@@ -428,7 +429,9 @@ static void build_home() {
         lv_obj_set_size(sw, 84, 40);
         lv_obj_set_style_bg_color(sw, COL_INPUT, 0);
         lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(sw, 0, 0);
+        // 1 px light outline inside the swatch so black filament is visible.
+        lv_obj_set_style_border_width(sw, 1, 0);
+        lv_obj_set_style_border_color(sw, lv_color_hex(0x8a96b0), 0);
         lv_obj_set_style_radius(sw, 0, 0);
         lv_obj_set_style_pad_all(sw, 0, 0);
         lv_obj_clear_flag(sw, LV_OBJ_FLAG_SCROLLABLE);
@@ -437,19 +440,24 @@ static void build_home() {
         s_ams_swatch[i] = sw;
 
         s_ams_lbl_tag[i] = make_label(sw, "—", COL_TEXT_MUTED, &spoolhard_mont_16);
-        lv_obj_align(s_ams_lbl_tag[i], LV_ALIGN_LEFT_MID, 6, 0);
+        lv_obj_set_width(s_ams_lbl_tag[i], 84);
+        lv_obj_set_style_text_align(s_ams_lbl_tag[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(s_ams_lbl_tag[i], LV_ALIGN_CENTER, 0, 0);
 
         s_ams_lbl_material[i] = make_label(tile, "", COL_TEXT, &spoolhard_mont_18);
-        lv_obj_set_pos(s_ams_lbl_material[i], 4, 44);
-        lv_obj_set_width(s_ams_lbl_material[i], 78);
+        lv_obj_set_pos(s_ams_lbl_material[i], 0, 46);
+        lv_obj_set_width(s_ams_lbl_material[i], 84);
+        lv_obj_set_style_text_align(s_ams_lbl_material[i], LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(s_ams_lbl_material[i], LV_LABEL_LONG_DOT);
         s_ams_lbl_weight[i]   = make_label(tile, "", COL_BRAND, &spoolhard_mont_22);
-        lv_obj_set_pos(s_ams_lbl_weight[i], 4, 68);
-        lv_obj_set_width(s_ams_lbl_weight[i], 80);
+        lv_obj_set_pos(s_ams_lbl_weight[i], 0, 70);
+        lv_obj_set_width(s_ams_lbl_weight[i], 84);
+        lv_obj_set_style_text_align(s_ams_lbl_weight[i], LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(s_ams_lbl_weight[i], LV_LABEL_LONG_CLIP);
         s_ams_lbl_k[i]        = make_label(tile, "", COL_TEXT_MUTED, &spoolhard_mont_16);
-        lv_obj_set_pos(s_ams_lbl_k[i], 4, 98);
-        lv_obj_set_width(s_ams_lbl_k[i], 80);
+        lv_obj_set_pos(s_ams_lbl_k[i], 0, 100);
+        lv_obj_set_width(s_ams_lbl_k[i], 84);
+        lv_obj_set_style_text_align(s_ams_lbl_k[i], LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(s_ams_lbl_k[i], LV_LABEL_LONG_CLIP);
 
         // "FEEDING" badge for the active tray (replaces the K line).
@@ -2022,26 +2030,29 @@ void ui_set_ams_panel(const char* status, const UiAmsSlot* slots) {
         const UiAmsSlot* s = slots ? &slots[i] : nullptr;
         const bool occupied = s && s->occupied;
 
-        // Active tray gets a brand-accent border so the user can see which
-        // slot is currently feeding the extruder at a glance.
+        const bool feedingTile = s && s->active;
+        // Loaded: card fill + light outline; empty: recessed (body fill, dim
+        // outline) so loaded slots stand out. Active: brand outline.
+        lv_obj_set_style_bg_color(s_ams_tile[i], occupied ? COL_CARD : COL_BODY, 0);
         lv_obj_set_style_border_color(
             s_ams_tile[i],
-            (s && s->active) ? COL_BRAND : COL_BORDER,
+            feedingTile ? COL_BRAND : (occupied ? lv_color_hex(0x56627f) : lv_color_hex(0x2a3144)),
             0);
-        // Border width stays constant (2) so children don't shift; the
-        // FEEDING badge below is the non-colour cue for the active tray.
 
-        // Swatch colour + tag text colour.
-        uint32_t rgb = occupied ? (s->color_rgb ? s->color_rgb : 0x303540) : 0x1a1d27;
+        // Swatch: filament colour (outlined) when loaded, hidden-ish when empty.
+        uint32_t rgb = occupied ? (s->color_rgb ? s->color_rgb : 0x303540) : 0x05070b;
         lv_obj_set_style_bg_color(s_ams_swatch[i], lv_color_hex(rgb), 0);
-        lv_color_t tag_col = occupied && s->color_rgb ? _textColorFor(rgb) : COL_TEXT_MUTED;
+        lv_obj_set_style_border_color(s_ams_swatch[i],
+            occupied ? lv_color_hex(0x8a96b0) : lv_color_hex(0x2a3144), 0);
+        lv_color_t tag_col = occupied && s->color_rgb ? _textColorFor(rgb)
+                                                      : lv_color_hex(occupied ? 0xa9b8cc : 0x78879f);
         lv_obj_set_style_text_color(s_ams_lbl_tag[i], tag_col, 0);
         lv_label_set_text(s_ams_lbl_tag[i], s ? s->label : "");
 
         // Body.
         lv_label_set_text(s_ams_lbl_material[i], occupied ? s->material : "empty");
         lv_obj_set_style_text_color(s_ams_lbl_material[i],
-                                    occupied ? COL_TEXT : COL_TEXT_MUTED, 0);
+                                    occupied ? COL_TEXT : lv_color_hex(0x78879f), 0);
 
         char wbuf[16];
         if (occupied && s->weight_g >= 0) {
@@ -2049,7 +2060,7 @@ void ui_set_ams_panel(const char* status, const UiAmsSlot* slots) {
         } else if (occupied && s->remain_pct >= 0) {
             snprintf(wbuf, sizeof(wbuf), "~%d%%", s->remain_pct);
         } else {
-            snprintf(wbuf, sizeof(wbuf), "—");
+            snprintf(wbuf, sizeof(wbuf), occupied ? "—" : "");   // no dash on empty slots
         }
         lv_label_set_text(s_ams_lbl_weight[i], wbuf);
 

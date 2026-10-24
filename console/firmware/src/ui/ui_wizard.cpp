@@ -21,13 +21,13 @@ extern StockFilamentsStore g_stock_filaments;
 extern ScaleLink           g_scale;
 
 // ── Theme tokens (match ui.cpp) ────────────────────────────
-#define COL_BODY        lv_color_hex(0x0f1117)
-#define COL_CARD        lv_color_hex(0x1a1d27)
-#define COL_INPUT       lv_color_hex(0x12141c)
-#define COL_BORDER      lv_color_hex(0x252830)
+#define COL_BODY        lv_color_hex(0x05070b)
+#define COL_CARD        lv_color_hex(0x1f2638)
+#define COL_INPUT       lv_color_hex(0x0d1018)
+#define COL_BORDER      lv_color_hex(0x3a4560)
 #define COL_BRAND       lv_color_hex(0xf0b429)
 #define COL_TEXT        lv_color_hex(0xe2e8f0)
-#define COL_TEXT_MUTED  lv_color_hex(0x94a3b8)   // >= 5.75:1 on every surface (was 0x64748b, 3.5:1)
+#define COL_TEXT_MUTED  lv_color_hex(0xa9b8cc)   // >= 5.75:1 on every surface (was 0x64748b, 3.5:1)
 #define COL_CONNECTED   lv_color_hex(0x2dd4bf)
 
 // ── Wizard state machine ───────────────────────────────────
