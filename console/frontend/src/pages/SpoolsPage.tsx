@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { Trash2, ChevronDown, ChevronRight, Gauge, BatteryLow } from 'lucide-react';
 import { Card } from '@spoolhard/ui/components/Card';
 import { Button } from '@spoolhard/ui/components/Button';
+import { ConfirmDialog } from '@spoolhard/ui/components/ConfirmDialog';
 import { useSpools, useSpoolDelete, type SpoolRecord } from '../hooks/useSpools';
 import { SpoolDetailPanel } from '../components/spools/SpoolDetailPanel';
 
@@ -24,6 +25,7 @@ function SpoolsListSection() {
   const [showEmpty, setShowEmpty] = useState(false);
   const { data, isLoading } = useSpools(offset, PAGE_SIZE);
   const del = useSpoolDelete();
+  const [pendingDelete, setPendingDelete] = useState<SpoolRecord | null>(null);
 
   const rawRows = data?.rows ?? [];
   // Filter on the client because the backend has no "include empty" flag
@@ -82,8 +84,28 @@ function SpoolsListSection() {
       )}
 
       <div className="space-y-2">
-        {rows.map((r) => <SpoolRow key={r.id} r={r} onDelete={() => del.mutate(r.id)} />)}
+        {rows.map((r) => <SpoolRow key={r.id} r={r} onDelete={() => setPendingDelete(r)} />)}
       </div>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="Delete spool?"
+        message={pendingDelete && (
+          <>
+            {pendingDelete.brand || 'Unknown'} · {pendingDelete.material_type || '—'}
+            {pendingDelete.color_name && ` · ${pendingDelete.color_name}`}
+            {' '}(<span className="font-mono">{pendingDelete.tag_id}</span>) will be removed from the
+            spool database. This cannot be undone.
+          </>
+        )}
+        confirmLabel={del.isPending ? 'Deleting...' : 'Delete'}
+        busy={del.isPending}
+        onConfirm={() => {
+          if (!pendingDelete) return;
+          del.mutate(pendingDelete.id, { onSettled: () => setPendingDelete(null) });
+        }}
+        onCancel={() => setPendingDelete(null)}
+      />
     </Card>
   );
 }
@@ -100,7 +122,14 @@ function SpoolRow({ r, onDelete }: { r: SpoolRecord; onDelete: () => void }) {
         className="flex items-center gap-3 p-3 cursor-pointer hover:bg-surface-card-hover"
         onClick={() => setOpen((v) => !v)}
         role="button"
+        tabIndex={0}
         aria-expanded={open}
+        onKeyDown={(e) => {
+          if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+            e.preventDefault();
+            setOpen((v) => !v);
+          }
+        }}
       >
         <span className="flex-shrink-0 text-text-muted">
           {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
@@ -138,7 +167,8 @@ function SpoolRow({ r, onDelete }: { r: SpoolRecord; onDelete: () => void }) {
         <button
           onClick={(e) => { e.stopPropagation(); onDelete(); }}
           className="text-text-muted hover:text-red-400 transition-colors cursor-pointer"
-          aria-label="Delete spool"
+          aria-label={`Delete spool ${r.brand || 'Unknown'} ${r.material_type || ''} ${r.tag_id}`}
+          title="Delete spool"
         >
           <Trash2 size={16} />
         </button>

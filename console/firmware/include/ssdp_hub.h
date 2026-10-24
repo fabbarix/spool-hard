@@ -21,3 +21,7 @@ void ssdp_hub_begin();
 // instead of waiting for their next periodic NOTIFY (~30 s on Bambu).
 // Cheap, but don't spam — call on user action or on a slow timer.
 void ssdp_hub_probe();
+
+// Drain announces queued by the async_udp callbacks and run subscribers.
+// Call every loop() iteration from loopTask.
+void ssdp_hub_poll();

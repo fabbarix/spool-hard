@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import { RotateCcw, Trash2, Power, AlertTriangle } from 'lucide-react';
+import { RotateCcw, Trash2, Power } from 'lucide-react';
 import { useRestart, useFactoryReset } from '../../hooks/useDeviceControl';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { Button } from '@spoolhard/ui/components/Button';
+import { ConfirmDialog } from '@spoolhard/ui/components/ConfirmDialog';
 import { useReconnect } from '@spoolhard/ui/providers/ReconnectProvider';
 
 type ConfirmTarget = null | 'restart' | 'reset';
@@ -50,41 +51,6 @@ export function DeviceControlSection() {
     );
   }
 
-  if (confirming) {
-    const isReset = confirming === 'reset';
-    return (
-      <SectionCard title="Device Control" icon={<Power size={16} />}>
-        <div className="flex items-center gap-2 rounded-card border border-status-error/30 bg-status-error/5 p-4">
-          <AlertTriangle size={20} className="text-status-error shrink-0" />
-          <div className="flex-1">
-            <div className="text-sm font-medium text-text-primary">
-              {isReset ? 'Factory Reset' : 'Restart Device'}
-            </div>
-            <div className="text-xs text-text-secondary mt-0.5">
-              {isReset
-                ? 'This will erase all settings (WiFi, security key, calibration) and reboot. This cannot be undone.'
-                : 'The device will reboot. Unsaved changes will be lost.'}
-            </div>
-          </div>
-        </div>
-        <div className="flex gap-2">
-          <Button
-            variant={isReset ? 'danger' : 'primary'}
-            onClick={() => execute(confirming)}
-            disabled={isPending}
-          >
-            {isPending
-              ? (isReset ? 'Resetting...' : 'Restarting...')
-              : (isReset ? 'Yes, erase everything' : 'Yes, restart')}
-          </Button>
-          <Button variant="secondary" onClick={() => setConfirming(null)} disabled={isPending}>
-            Cancel
-          </Button>
-        </div>
-      </SectionCard>
-    );
-  }
-
   return (
     <SectionCard title="Device Control" icon={<Power size={16} />}>
       <div className="flex gap-3">
@@ -97,6 +63,26 @@ export function DeviceControlSection() {
           Factory Reset
         </Button>
       </div>
+      <ConfirmDialog
+        open={confirming === 'restart'}
+        title="Restart Device"
+        message="The device will reboot. Unsaved changes will be lost."
+        variant="primary"
+        confirmLabel={restart.isPending ? 'Restarting...' : 'Yes, restart'}
+        busy={isPending}
+        onConfirm={() => execute('restart')}
+        onCancel={() => setConfirming(null)}
+      />
+      <ConfirmDialog
+        open={confirming === 'reset'}
+        title="Factory Reset"
+        message="This will erase all settings (WiFi, security key, calibration) and reboot. This cannot be undone."
+        requireText="RESET"
+        confirmLabel={factoryReset.isPending ? 'Resetting...' : 'Erase everything'}
+        busy={isPending}
+        onConfirm={() => execute('reset')}
+        onCancel={() => setConfirming(null)}
+      />
     </SectionCard>
   );
 }

@@ -143,6 +143,9 @@ the headers are `#include`d).
   SD-persisted output.) NB: the esp32async fork's default route matcher
   is prefix-style; `/api/logs` uses `AsyncURIMatcher::exact()` so it
   doesn't shadow those sub-routes. Register specific-before-generic.
+- Lazy mutexes (ring_log, scale protocol.cpp) are created via a CAS
+  helper (build candidate, compare-exchange into the slot, delete if
+  lost) so concurrent first use is race-free and usable before setup().
 - `spoolhard/path_route.h` — `spoolhard::addPathRoute(server, method, prefix,
   suffix, allowSlash, digitsOnly, onRequest[, onBody])` + `spoolhard::pathArg(req,
   prefix, suffix, allowSlash)`: regex-free `<prefix><arg><suffix>` routes (arg
@@ -215,7 +218,7 @@ so the coordinator loop never blocks on hardware I/O:
 |-----------------|-------|------|--------------------------------------------|
 | `loopTask`      | Arduino default | 1 | Coordinator: drains task event queues, dispatches WS broadcasts, runs the LED state machine, services WiFi state machine. |
 | `sensor_task`   | 4 KB  | 1    | `g_scale` (LoadCell). 100 Hz poll, drains command queue (tare/calibrate/addCalPoint/clear/reloadParams). Publishes a seqlock snapshot. |
-| `nfc_task`      | 4 KB  | 1    | `g_nfc` (NfcReader / PN532 SPI). 50 Hz poll, drains write/erase/emulate command queue. Publishes a seqlock snapshot. |
+| `nfc_task`      | 4 KB  | 1    | `g_nfc` (NfcReader / PN532 SPI). 50 Hz poll, drains write/erase/emulate command queue. Publishes status as an atomic; the SpoolTag (Strings) is copied under a mutex, and events queue heap pointers. |
 | `console_tx`    | 4 KB  | 1    | Single writer to the port-80 `/ws/console` AsyncWebSocket. Drains a 32-deep frame queue. |
 | `ota_run`       | 12 KB | 0    | Spawned on demand by `otaTaskSpawn`; self-deletes when done. Handles HTTPS manifest + binary fetch, sha256, `Update.write`. |
 | `AsyncTCP_task` | system | 0   | mathieucarbou's lib + lwIP + WiFi. |
@@ -300,3 +303,23 @@ is separate from the `~/.claude/projects/.../memory/` auto-memory above.
 Don't duplicate; only write a Serena memory if a fact is specifically
 useful to future Serena symbol-navigation sessions (e.g. "the protocol
 enum lives at `*/firmware/src/protocol.h`").
+
+## Console SSDP + manual OTA (0.12.16+)
+
+- `SsdpListener::_onPacket` runs on the async_udp task (tiny stack): it only
+  parses and enqueues a POD record (4-deep ring, drop on overflow).
+  Subscribers run from `loopTask` via `ssdp_hub_poll()`.
+- Console manual OTA (`g_pendingOta`) now uses `otaTaskSpawn` like the scale.
+  The progress callback only writes atomics; `loop()` renders LVGL and
+  detects failure (task exit). Same 50 KB internal-DRAM gate as the checker.
+## Console SpoolStore concurrency + caching
+
+`SpoolStore` (`console/firmware/include/store.h`) is hit from loopTask,
+AsyncTCP, the LVGL task and printer tasks. All public ops take a recursive
+mutex (created in the constructor); `onChange` fires after the lock is
+released. `findById` is served from an 8-entry LRU cache that is cleared on
+every mutation (upsert/remove/pack/migrate/begin/rebuild); `generation()`
+increments on each mutation. `list()` opens the file once. The LVGL
+`ui_set_ams_panel` / `ui_set_printer_panel` skip identical snapshots, the
+lvgl task sleeps per `lv_timer_handler()`'s return (5..30 ms awake, <=50 ms
+asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.

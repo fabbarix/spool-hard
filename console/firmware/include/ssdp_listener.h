@@ -53,7 +53,25 @@ public:
 
     void stop();
 
+    /// Drain announces queued by the UDP callback and invoke subscribers.
+    /// MUST be called from loopTask (ssdp_hub_poll()). The async_udp task has
+    /// very little stack headroom, so _onPacket only parses + enqueues a
+    /// small POD record (bounded ring, drop-on-overflow); subscribers run here.
+    void poll();
+
 private:
+    struct QItem {
+        char     urn[56];
+        char     usn[48];
+        char     dev_name[32];
+        char     dev_model[12];
+        uint32_t ip;
+    };
+    static constexpr uint8_t kQDepth = 4;
+    QItem    _q[kQDepth];
+    uint8_t  _qHead = 0, _qCount = 0;
+    portMUX_TYPE _qMux = portMUX_INITIALIZER_UNLOCKED;
+
     AsyncUDP _udp;
     std::vector<Callback> _cbs;
     uint16_t _port      = 0;

@@ -203,9 +203,10 @@ export function resolveVariant(
 
 const LIST_KEY = ['user-filaments'];
 
-export function useUserFilaments(material?: string) {
+export function useUserFilaments(material?: string, opts?: { enabled?: boolean }) {
   return useQuery<UserFilamentsList>({
     queryKey: [...LIST_KEY, material ?? ''],
+    enabled: opts?.enabled ?? true,
     queryFn: () => {
       const qs = material ? `?material=${encodeURIComponent(material)}` : '';
       return fetch(`/api/user-filaments${qs}`).then((r) => r.json());

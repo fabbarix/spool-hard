@@ -19,8 +19,10 @@
 // unaffected.
 namespace NfcTask {
 
-// Atomic-publish snapshot. Mirrors SensorTask's seqlock pattern for
-// multi-field consistency.
+// Status + tag snapshot. The status is a lock-free atomic (getStatus());
+// the tag holds Strings, so it is published/copied under a mutex —
+// never torn, but allocating: use snapshot() only when the tag is
+// actually needed, never from a hot per-tick path.
 struct Snapshot {
     TagStatus status = TagStatus::Idle;
     SpoolTag  tag    = {};
@@ -30,10 +32,10 @@ struct Snapshot {
 // Stack 4 KB; priority 4 on core 1.
 void begin();
 
-// Read-only snapshot. Seqlock-safe.
+// Consistent status+tag copy (mutex-guarded; may allocate).
 Snapshot snapshot();
 
-// Convenience getters — single-word reads, atomic.
+// Lock-free, allocation-free status read.
 TagStatus getStatus();
 
 // Mutating commands. Return immediately; status updates flow through

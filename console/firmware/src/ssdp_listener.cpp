@@ -42,6 +42,9 @@ void SsdpListener::stop() {
     _udp.close();
     _running = false;
     _cbs.clear();
+    portENTER_CRITICAL(&_qMux);
+    _qHead = _qCount = 0;
+    portEXIT_CRITICAL(&_qMux);
 }
 
 void SsdpListener::sendMSearch(const char* st) {
@@ -116,6 +119,39 @@ void SsdpListener::_onPacket(AsyncUDPPacket& pkt) {
     }
 
     if (a.urn.length() && (uint32_t)a.ip != 0) {
+        // Enqueue only; subscribers run from loopTask via poll().
+        QItem it;
+        memset(&it, 0, sizeof(it));
+        strlcpy(it.urn, a.urn.c_str(), sizeof(it.urn));
+        strlcpy(it.usn, a.usn.c_str(), sizeof(it.usn));
+        strlcpy(it.dev_name, a.dev_name.c_str(), sizeof(it.dev_name));
+        strlcpy(it.dev_model, a.dev_model.c_str(), sizeof(it.dev_model));
+        it.ip = (uint32_t)a.ip;
+        portENTER_CRITICAL(&_qMux);
+        if (_qCount < kQDepth) {
+            _q[(_qHead + _qCount) % kQDepth] = it;
+            _qCount++;
+        }  // else: drop; the device re-announces periodically
+        portEXIT_CRITICAL(&_qMux);
+    }
+}
+
+void SsdpListener::poll() {
+    for (;;) {
+        QItem it;
+        portENTER_CRITICAL(&_qMux);
+        if (_qCount == 0) { portEXIT_CRITICAL(&_qMux); return; }
+        it = _q[_qHead];
+        _qHead = (_qHead + 1) % kQDepth;
+        _qCount--;
+        portEXIT_CRITICAL(&_qMux);
+
+        Announce a;
+        a.urn = it.urn;
+        a.ip = IPAddress(it.ip);
+        a.usn = it.usn;
+        a.dev_name = it.dev_name;
+        a.dev_model = it.dev_model;
         for (auto& cb : _cbs) cb(a);
     }
 }

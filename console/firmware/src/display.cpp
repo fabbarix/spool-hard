@@ -201,7 +201,6 @@ static void lvgl_task(void*) {
         lv_lock();
         uint32_t t = lv_timer_handler();
         lv_unlock();
-        (void)t;
         // Idle-to-sleep check. Does not touch LVGL state so it's fine outside
         // the lock. Skipped when the timeout is 0 (feature disabled) or when
         // we're already asleep (no work to do).
@@ -209,7 +208,15 @@ static void lvgl_task(void*) {
             uint32_t since = millis() - s_last_interaction_ms;
             if (since >= s_sleep_timeout_ms) apply_sleep();
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // Follow lv_timer_handler()'s hint (ms until the next timer is
+        // due; LV_NO_TIMER_READY when none). Clamp to 5..30 ms while awake
+        // so touch polling stays responsive; asleep there's nothing to
+        // animate, but still poll touch (wake-on-tap) at ~50 ms.
+        uint32_t d = t;
+        if (d < 5) d = 5;
+        uint32_t maxd = s_display_asleep ? 50 : 30;
+        if (d > maxd) d = maxd;
+        vTaskDelay(pdMS_TO_TICKS(d));
     }
 }
 

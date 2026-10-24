@@ -25,14 +25,23 @@ QueueHandle_t s_cmd_q   = nullptr;
 QueueHandle_t s_event_q = nullptr;
 TaskHandle_t  s_task    = nullptr;
 
-std::atomic<uint32_t> s_snap_seq{0};
-Snapshot              s_snap;
+std::atomic<TagStatus> s_status{TagStatus::Idle};   // lock-free, POD
+SemaphoreHandle_t      s_tag_mtx = nullptr;         // guards s_snap_tag
+SpoolTag               s_snap_tag;
+uint32_t               s_snap_gen = 0xFFFFFFFFu;    // task-private
 
 void _publishSnapshot() {
-    s_snap_seq.fetch_add(1, std::memory_order_acquire);
-    s_snap.status = g_nfc.getStatus();
-    s_snap.tag    = g_nfc.getLastTag();
-    s_snap_seq.fetch_add(1, std::memory_order_release);
+    // Tag first, status last: a reader that sees a new status via
+    // snapshot() then never pairs it with an older tag.
+    // Tag holds Strings: copy under the mutex, and only when it changed.
+    uint32_t gen = g_nfc.tagGeneration();
+    if (gen != s_snap_gen && s_tag_mtx &&
+        xSemaphoreTake(s_tag_mtx, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s_snap_tag = g_nfc.getLastTag();
+        xSemaphoreGive(s_tag_mtx);
+        s_snap_gen = gen;
+    }
+    s_status.store(g_nfc.getStatus(), std::memory_order_release);
 }
 
 void _drainCommands() {
@@ -71,8 +80,13 @@ void _taskBody(void*) {
 
         TagStatus st = g_nfc.getStatus();
         if (st != last) {
-            StatusEvent e{ st, g_nfc.getLastTag() };
-            xQueueSend(s_event_q, &e, 0);
+            // StatusEvent holds Strings — never memcpy it through the
+            // queue. Heap-allocate and queue the pointer.
+            auto* e = new StatusEvent{ st, g_nfc.getLastTag() };
+            if (xQueueSend(s_event_q, &e, 0) != pdTRUE) {
+                Serial.println("[NFC] event queue full — dropped");
+                delete e;
+            }
             last = st;
         }
         _publishSnapshot();
@@ -91,7 +105,8 @@ void _taskBody(void*) {
 void begin() {
     if (s_task) return;
     s_cmd_q   = xQueueCreate(4, sizeof(Cmd*));      // pointers — Cmd contains Strings
-    s_event_q = xQueueCreate(8, sizeof(StatusEvent));
+    s_event_q = xQueueCreate(8, sizeof(StatusEvent*));   // pointers — Strings inside
+    s_tag_mtx = xSemaphoreCreateMutex();
     BaseType_t r = xTaskCreatePinnedToCore(_taskBody, "nfc_task",
                                            4 * 1024, nullptr, 4, &s_task, 1);
     if (r != pdPASS) {
@@ -102,15 +117,14 @@ void begin() {
 
 Snapshot snapshot() {
     Snapshot s;
-    for (;;) {
-        uint32_t s0 = s_snap_seq.load(std::memory_order_acquire);
-        if (s0 & 1) { taskYIELD(); continue; }
-        s = s_snap;
-        uint32_t s1 = s_snap_seq.load(std::memory_order_acquire);
-        if (s0 == s1) return s;
+    s.status = s_status.load(std::memory_order_acquire);
+    if (s_tag_mtx && xSemaphoreTake(s_tag_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s.tag = s_snap_tag;
+        xSemaphoreGive(s_tag_mtx);
     }
+    return s;
 }
-TagStatus getStatus() { return snapshot().status; }
+TagStatus getStatus() { return s_status.load(std::memory_order_acquire); }
 
 static void _post(Cmd* c) {
     if (!s_cmd_q) { delete c; return; }
@@ -141,7 +155,11 @@ void requestEmulate(const String& url) {
 
 bool pollEvent(StatusEvent& out) {
     if (!s_event_q) return false;
-    return xQueueReceive(s_event_q, &out, 0) == pdTRUE;
+    StatusEvent* e = nullptr;
+    if (xQueueReceive(s_event_q, &e, 0) != pdTRUE || !e) return false;
+    out = *e;
+    delete e;
+    return true;
 }
 
 }  // namespace NfcTask

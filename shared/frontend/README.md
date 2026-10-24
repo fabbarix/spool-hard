@@ -6,7 +6,7 @@ When building the Console frontend, copy these as the starting point and keep th
 
 ## What's shared
 
-- **`src/components/`** — Button, Card, Badge, StatusDot, InputField, PasswordField, SectionCard, DropZone
+- **`src/components/`** — Button, Card, Badge, StatusDot, InputField, PasswordField, SectionCard, DropZone, ConfirmDialog (accessible modal; `requireText` = type-to-confirm)
 - **`src/providers/`** — QueryProvider, WebSocketProvider
 - **`src/types/`** — WebSocket message types
 - **`src/app.css`** — TailwindCSS v4 theme (@theme block with all design tokens)
