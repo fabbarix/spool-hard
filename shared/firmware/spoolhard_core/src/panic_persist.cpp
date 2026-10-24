@@ -4,6 +4,7 @@
 #include <esp_system.h>
 #include <esp_idf_version.h>
 #include <esp_rom_sys.h>
+#include <atomic>
 
 namespace PanicPersist {
 
@@ -11,11 +12,13 @@ namespace {
 
 constexpr const char* kPendingPath = "/crash_pending.txt";
 constexpr const char* kSeqPath     = "/crash_seq.txt";
-constexpr uint32_t    kFlushIntervalMs = 30 * 1000;
+constexpr uint32_t    kFlushIntervalMs = 120 * 1000;
 constexpr size_t      kMaxLines = 80;
 constexpr bool        kGracefulOnly = false;  // future use
 
 uint32_t s_lastFlush_ms = 0;
+uint32_t s_lastFlushedSeq = 0;   // RingLog::headSeq() at last write
+std::atomic<bool> s_paused{false};
 const char* s_prev_reason = "UNKNOWN";
 
 const char* _resetReasonStr(esp_reset_reason_t r) {
@@ -46,14 +49,15 @@ uint32_t _nextSeq() {
     return seq;
 }
 
-void _writePending() {
+bool _writePending() {
     File f = SPIFFS.open(kPendingPath, FILE_WRITE);
-    if (!f) return;
+    if (!f) return false;
     auto rows = RingLog::snapshot(0, kMaxLines);
     for (auto& e : rows) {
         f.printf("[%lu] %s\n", (unsigned long)e.millis_at, e.line.c_str());
     }
     f.close();
+    return true;
 }
 
 }  // namespace
@@ -93,9 +97,22 @@ const char* begin() {
 void tick() {
     uint32_t now = millis();
     if (now - s_lastFlush_ms < kFlushIntervalMs) return;
+    if (s_paused.load()) return;          // e.g. SPIFFS upload in progress
     s_lastFlush_ms = now;
-    _writePending();
+    // Nothing new in the ring since the last write: skip the ~10 KB
+    // SPIFFS rewrite (flash wear + a multi-ms blocking write).
+    uint32_t head = RingLog::headSeq();
+    if (head == s_lastFlushedSeq && SPIFFS.exists(kPendingPath)) return;
+    // MERGE NOTE: any FS-lock gate (e.g. B10's tryLockFs()) goes right
+    // here as `if (!tryLockFs()) return;` BEFORE the write, and
+    // s_lastFlushedSeq is only set AFTER the write succeeded, so a failed
+    // lock leaves the change unflushed and retried on the next interval.
+    if (!_writePending()) return;
+    s_lastFlushedSeq = head;
 }
+
+void pause()  { s_paused.store(true); }
+void resume() { s_paused.store(false); }
 
 void markGracefulExit() {
     SPIFFS.remove(kPendingPath);

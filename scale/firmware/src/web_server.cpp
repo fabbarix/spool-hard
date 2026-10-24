@@ -109,6 +109,18 @@ static StateRateLimit s_stateRates[] = {
     {"ota",          5000, 0},   // periodic-checker completion + edge updates
 };
 
+// Non-consuming peek: would _stateRateGate let this resource through
+// right now? Lets the per-tick push helpers skip NVS reads + JSON
+// building while the gate would drop the frame anyway.
+static bool _stateRateDue(const char* resource) {
+    uint32_t now = millis();
+    for (auto& r : s_stateRates) {
+        if (strcmp(r.key, resource) != 0) continue;
+        return r.last_ms == 0 || (now - r.last_ms) >= r.min_interval_ms;
+    }
+    return true;
+}
+
 static bool _stateRateGate(const char* resource) {
     uint32_t now = millis();
     for (auto& r : s_stateRates) {
@@ -843,6 +855,7 @@ void ScaleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
 // bytes-identical data.
 void ScaleWebServer::pushWifiStatus() {
     if (_ws.count() == 0) return;
+    if (!_stateRateDue("wifi_status")) return;
     JsonDocument doc(&g_psramJsonAlloc);
     _buildWifiStatusDoc(doc);
     broadcastState("wifi_status", doc);
@@ -850,6 +863,7 @@ void ScaleWebServer::pushWifiStatus() {
 
 void ScaleWebServer::pushOtaStatus() {
     if (_ws.count() == 0) return;
+    if (!_stateRateDue("ota")) return;
     OtaConfig cfg; cfg.load();
     auto p = g_ota_checker.pending();
     JsonDocument doc(&g_psramJsonAlloc);

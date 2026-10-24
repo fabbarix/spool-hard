@@ -77,6 +77,7 @@ private:
     uint32_t        _peakQueueLen    = 0;
     uint32_t        _txAttempts      = 0;  // sendText() calls while connected
     uint32_t        _txFullSeen      = 0;  // sendText() observed queueIsFull
+    uint32_t        _lastStatsLogMs  = 0;  // throttle for ws-stats lines
     uint32_t        _statsSeq        = 0;  // tick counter
     std::function<void(const String&)> _onText;
     std::function<void(const String&)> _onConnected;
