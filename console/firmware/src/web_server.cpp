@@ -31,6 +31,7 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
+#include "spoolhard/spiffs_upload.h"
 #include <LittleFS.h>
 #include <SD.h>
 #include <Update.h>
@@ -1101,34 +1102,39 @@ void ConsoleWebServer::_setupRoutes() {
     // ── Frontend upload (web UI served from SPIFFS) ──────────
     // Path stays /api/upload/spiffs so older uploaders still work; only the
     // release filename and user-visible labels are renamed.
+    // Response contract: 400/409 {"ok":false,"error":..} on rejection/failure
+    // (FS formatted), 200 {"ok":true} if already verified, else
+    // 202 {"ok":true,"status":"verifying"} — verify (flash readback hash +
+    // remount + read every file) runs in a task, never on AsyncTCP; poll
+    // GET /api/upload/spiffs/status. Reboots ~2.5 s after phase "ok".
+    // Optional ?sha256=<hex> / X-Sha256 header checks the image bytes.
     _server.on("/api/upload/spiffs", HTTP_POST,
         [this](AsyncWebServerRequest* req) {
-            if (!_uploadAccepted) {
-                const char* reason = _uploadRejectReason ? _uploadRejectReason : "unknown";
-                Serial.printf("[Upload] Frontend response 400: %s\n", reason);
-                char body[160];
-                snprintf(body, sizeof(body),
-                         "{\"ok\":false,\"error\":\"upload rejected (%s) — expected "
-                         PRODUCT_NAME " frontend\"}", reason);
-                req->send(400, "application/json", body);
+            if (!_requireAuth(req)) return;
+            if (_spiffsBeginErr) {
+                Serial.printf("[Upload] Frontend response 409: %s\n", _spiffsBeginErr);
+                req->send(409, "application/json", String("{\"ok\":false,\"error\":\"") + _spiffsBeginErr + "\"}");
+                _spiffsBeginErr = nullptr;
                 return;
             }
-            Serial.println("[Upload] Frontend accepted — rebooting");
-            req->send(200, "application/json", "{\"ok\":true}");
-            spoolhardDeferredReboot();
+            if (!SpiffsUpload::isOwner(req) || SpiffsUpload::failed(req)) {
+                const char* reason = SpiffsUpload::isOwner(req) ? SpiffsUpload::error() : "unauthorized or incomplete upload";
+                Serial.printf("[Upload] Frontend response 400: %s\n", reason);
+                req->send(400, "application/json", String("{\"ok\":false,\"error\":\"") + reason + "\"}");
+                return;
+            }
+            if (SpiffsUpload::phase() == SpiffsUpload::Phase::Ok) {
+                req->send(200, "application/json", "{\"ok\":true}");
+            } else {
+                req->send(202, "application/json", "{\"ok\":true,\"status\":\"verifying\"}");
+            }
         },
         [this](AsyncWebServerRequest* req, const String& filename, size_t index,
            uint8_t* data, size_t len, bool final) {
             if (index == 0) {
-                if (!_requireAuth(req)) {
-                    _uploadAccepted = false;
-                    _uploadRejectReason = "unauthorized";
-                    Update.abort();
-                    return;
-                }
+                _spiffsBeginErr = nullptr;
+                if (!_requireAuth(req)) return;
                 Serial.printf("[Upload] Frontend begin: %s\n", filename.c_str());
-                _uploadAccepted = false;
-                _uploadRejectReason = "incomplete upload";
                 _uploadMatcher.reset();
                 _uploadVersion.reset();
                 _uploadContentLength = req->contentLength();
@@ -1136,12 +1142,16 @@ void ConsoleWebServer::_setupRoutes() {
                 _uploadLabel = filename;
                 if (_onUploadStarted) _onUploadStarted("spiffs");
                 if (_onUploadProgress) _onUploadProgress(0, "spiffs", _uploadLabel.c_str());
-                if (!Update.begin(0x300000, U_SPIFFS)) {
-                    Serial.printf("[Upload] Begin failed: %s\n", Update.errorString());
-                    _uploadRejectReason = "Update.begin failed";
+                _spiffsBeginErr = SpiffsUpload::begin(req);
+                if (_spiffsBeginErr) {
+                    Serial.printf("[Upload] Begin failed: %s\n", _spiffsBeginErr);
                     return;
                 }
+                String sh = req->hasParam("sha256") ? req->getParam("sha256")->value()
+                                                    : req->header("X-Sha256");
+                if (sh.length()) SpiffsUpload::setExpectedSha256(req, sh.c_str());
             }
+            if (!SpiffsUpload::owns(req)) return;
             _uploadMatcher.feed(data, len);
             // Scan the SPIFFS stream for the same marker we plant in the
             // firmware binary — release.sh writes a plain-text file into
@@ -1152,7 +1162,7 @@ void ConsoleWebServer::_setupRoutes() {
                 _uploadLabel = String("v") + _uploadVersion.version;
                 Serial.printf("[Upload] Frontend version detected: %s\n", _uploadLabel.c_str());
             }
-            if (Update.isRunning()) Update.write(data, len);
+            SpiffsUpload::write(req, data, len);
 
             if (_onUploadProgress && _uploadContentLength > 0) {
                 int pct = (int)((uint64_t)(index + len) * 100 / _uploadContentLength);
@@ -1168,24 +1178,23 @@ void ConsoleWebServer::_setupRoutes() {
                               (unsigned)(index + len),
                               _uploadMatcher.matched() ? "OK" : "MISSING");
                 if (!_uploadMatcher.matched()) {
-                    // SPIFFS bytes have already landed in the partition; wipe
-                    // it so next boot mounts clean rather than trying to read
-                    // a half-overwritten wrong-product image.
                     Serial.println("[Upload] Frontend rejected: product signature missing");
-                    Update.abort();
-                    SPIFFS.format();
-                    _uploadRejectReason = "wrong product";
-                    return;
+                    SpiffsUpload::fail(req, "wrong product - expected " PRODUCT_NAME " frontend");
                 }
-                if (!Update.end(true)) {
-                    Serial.printf("[Upload] Frontend commit failed: %s\n", Update.errorString());
-                    _uploadRejectReason = "commit failed";
-                    return;
-                }
-                _uploadAccepted = true;
+                SpiffsUpload::finish(req, true);
             }
         }
     );
+
+    _server.on("/api/upload/spiffs/status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        using P = SpiffsUpload::Phase;
+        P ph = SpiffsUpload::phase();
+        const char* n = ph == P::Writing ? "writing" : ph == P::Verifying ? "verifying"
+                      : ph == P::Ok ? "ok" : ph == P::Failed ? "failed" : "idle";
+        req->send(200, "application/json", String("{\"phase\":\"") + n + "\",\"error\":\""
+                  + (ph == P::Failed ? SpiffsUpload::error() : "") + "\"}");
+    });
 
     // ── Filaments library (SD-resident, flat JSONL) ──────────
     // User ships a `filaments.jsonl` generated by the build pipeline

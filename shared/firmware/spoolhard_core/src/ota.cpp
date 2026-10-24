@@ -10,6 +10,7 @@
 #include <time.h>
 #include <esp_heap_caps.h>
 #include "spoolhard/psram_task.h"
+#include "spoolhard/spiffs_upload.h"
 
 // NVS schema — canonical names. Both products use the same namespace
 // + keys, so the shared lib hardcodes them rather than parameterising.
@@ -397,11 +398,27 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
         return false;
     }
 
-    if (!Update.begin(total, partition)) {
+    // Frontend (SPIFFS) goes through SpiffsUpload: quiesce SPIFFS writers,
+    // unmount, checked writes, readback + remount verify, format on failure.
+    // We are on the ota_run task, so the blocking variants are fine.
+    const bool isFs = (partition == U_SPIFFS);
+    static const int kFsOwner = 0;   // any stable address
+    if (isFs) {
+        const char* e = SpiffsUpload::begin(&kFsOwner, (size_t)total);
+        if (e) {
+            Serial.printf("[OTA] SpiffsUpload::begin failed: %s\n", e);
+            http.end();
+            return false;
+        }
+    } else if (!Update.begin(total, partition)) {
         Serial.printf("[OTA] Update.begin failed: %s\n", Update.errorString());
         http.end();
         return false;
     }
+    auto abortUpdate = [&](const char* why) {
+        if (isFs) SpiffsUpload::abortBlocking(why);
+        else Update.abort();
+    };
 
     mbedtls_sha256_context shaCtx;
     mbedtls_sha256_init(&shaCtx);
@@ -418,7 +435,7 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
         if (!avail) {
             if (millis() - lastYield > 30000) {
                 Serial.println("[OTA] stream stalled — aborting");
-                Update.abort();
+                abortUpdate("ota aborted");
                 mbedtls_sha256_free(&shaCtx);
                 http.end();
                 return false;
@@ -428,9 +445,11 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
         }
         size_t n = stream->readBytes(buf.get(), avail > kBuf ? kBuf : avail);
         if (n == 0) continue;
-        if (Update.write(buf.get(), n) != n) {
+        bool wok = isFs ? SpiffsUpload::write(&kFsOwner, buf.get(), n)
+                        : (Update.write(buf.get(), n) == n);
+        if (!wok) {
             Serial.printf("[OTA] Update.write short: %s\n", Update.errorString());
-            Update.abort();
+            abortUpdate("ota aborted");
             mbedtls_sha256_free(&shaCtx);
             http.end();
             return false;
@@ -453,7 +472,7 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
 
     if (written != total) {
         Serial.printf("[OTA] short read: got %d expected %d\n", written, total);
-        Update.abort();
+        abortUpdate("ota aborted");
         http.end();
         return false;
     }
@@ -462,10 +481,18 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
         if (!got.equalsIgnoreCase(expectedSha256)) {
             Serial.printf("[OTA] sha256 mismatch: got %s expected %s\n",
                           got.c_str(), expectedSha256.c_str());
-            Update.abort();
+            abortUpdate("ota aborted");
             http.end();
             return false;
         }
+    }
+    if (isFs) {
+        http.end();
+        if (!SpiffsUpload::finishBlocking(expectedSha256.c_str())) {
+            Serial.printf("[OTA] frontend verify failed: %s (SPIFFS formatted)\n", SpiffsUpload::error());
+            return false;
+        }
+        return true;
     }
     if (!Update.end(true)) {
         Serial.printf("[OTA] Update.end failed: %s\n", Update.errorString());

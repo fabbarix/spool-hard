@@ -1,6 +1,7 @@
 #include "spoolhard/panic_persist.h"
 #include "spoolhard/ring_log.h"
 #include <SPIFFS.h>
+#include "spoolhard/spiffs_upload.h"
 #include <esp_system.h>
 #include <esp_idf_version.h>
 #include <esp_rom_sys.h>
@@ -94,11 +95,17 @@ void tick() {
     uint32_t now = millis();
     if (now - s_lastFlush_ms < kFlushIntervalMs) return;
     s_lastFlush_ms = now;
+    // Never touch SPIFFS while a frontend upload is raw-writing the
+    // partition (it would scribble over the new image).
+    if (!SpiffsUpload::tryLockFs()) return;
     _writePending();
+    SpiffsUpload::unlockFs();
 }
 
 void markGracefulExit() {
+    if (!SpiffsUpload::tryLockFs()) return;
     SPIFFS.remove(kPendingPath);
+    SpiffsUpload::unlockFs();
 }
 
 }  // namespace PanicPersist
