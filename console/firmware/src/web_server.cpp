@@ -17,6 +17,7 @@
 #include "spoolhard/deferred_reboot.h"
 #include "spoolhard/common_routes.h"
 #include "scale_link.h"
+#include "nfc_reader.h"
 #include "scale_secrets.h"
 #include "core_weights.h"
 #include "calibration_presets.h"
@@ -1351,6 +1352,7 @@ void ConsoleWebServer::_setupRoutes() {
         JsonDocument doc;
         doc["log_ams"] = _logAmsRaw;
         doc["lcd_debug"] = _lcdDebug;
+        doc["nfc_debug"] = _nfcDebug;
         String out; serializeJson(doc, out);
         req->send(200, "application/json", out);
     });
@@ -1369,7 +1371,9 @@ void ConsoleWebServer::_setupRoutes() {
                 _lcdDebug = body["lcd_debug"].as<bool>();
                 if (!_lcdDebug) ConsoleDisplay::snapshotRelease();
             }
+            if (body["nfc_debug"].is<bool>()) _nfcDebug = body["nfc_debug"].as<bool>();
             JsonDocument resp; resp["log_ams"] = _logAmsRaw; resp["lcd_debug"] = _lcdDebug;
+            resp["nfc_debug"] = _nfcDebug;
             String out; serializeJson(resp, out);
             req->send(200, "application/json", out);
         }
@@ -1437,6 +1441,95 @@ void ConsoleWebServer::_setupRoutes() {
             req->send(200, "application/json", "{\"ok\":true}");
         }
     );
+    // Read-only dump of the last tag nfc_task detected (seqlock snapshot; the
+    // handler never touches the PN532). Requires the session-only nfc_debug
+    // toggle (POST /api/debug/config {"nfc_debug":true}).
+    _server.on(AsyncURIMatcher::exact("/api/debug/nfc"), HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        NfcReader* n = NfcReader::instance();
+        if (!_nfcDebug) {
+            req->send(403, "application/json", "{\"error\":\"nfc_debug is off\"}");
+            return;
+        }
+        if (!n) {
+            req->send(503, "application/json", "{\"error\":\"nfc reader not started\"}");
+            return;
+        }
+        static NfcReader::DebugSnap sn;   // ~0.7 KB; AsyncTCP handlers are serialised
+        if (!n->debugSnapshot(sn)) {
+            req->send(503, "application/json", "{\"error\":\"snapshot busy\"}");
+            return;
+        }
+        auto hex = [](const uint8_t* d, size_t len) {
+            String o; o.reserve(len * 2);
+            char b[3];
+            for (size_t i = 0; i < len; i++) { snprintf(b, sizeof(b), "%02X", d[i]); o += b; }
+            return o;
+        };
+        JsonDocument doc(&g_psramJsonAlloc);
+        doc["available"]   = n->available();
+        doc["now_ms"]      = millis();
+        JsonObject c = doc["counters"].to<JsonObject>();
+        c["polls"] = n->pollCount(); c["page_reads"] = n->pageReads();
+        c["events"] = n->eventCount(); c["dropped"] = n->droppedCount();
+        doc["valid"] = sn.valid;
+        if (sn.valid) {
+            doc["uid"]       = sn.uid;
+            doc["uid_len"]   = sn.uidLen;
+            char t[8];
+            snprintf(t, sizeof(t), "0x%02X", sn.sak);   doc["sak"]  = t;
+            char a[8];
+            snprintf(a, sizeof(a), "0x%04X", sn.atqa);  doc["atqa"] = a;
+            doc["present"]   = sn.present;
+            doc["readable"]  = sn.readable;
+            static const char* const paths[] = {"none", "batch", "single", "failed"};
+            doc["read_path"] = paths[sn.path & 3];
+            doc["url"]       = sn.url;
+            doc["detect_ms"] = sn.detectMs;
+            doc["removed_ms"] = sn.removedMs;
+            JsonArray reads = doc["reads"].to<JsonArray>();
+            for (uint8_t i = 0; i < sn.nReads; i++) {
+                JsonObject r = reads.add<JsonObject>();
+                r["page"] = sn.reads[i].page;
+                r["ok"]   = (bool)sn.reads[i].ok;
+                r["raw"]  = hex(sn.reads[i].raw, sn.reads[i].len);
+            }
+            doc["raw_pages_4_19"] = hex(sn.raw, sn.rawLen);
+            // Tiny decode of the NDEF TLV + first record header at page 4.
+            JsonObject nd = doc["ndef"].to<JsonObject>();
+            const uint8_t* r = sn.raw;
+            size_t L = sn.rawLen;
+            nd["tlv_03"] = (L > 2 && r[0] == 0x03);
+            if (L > 2 && r[0] == 0x03) {
+                size_t i = 1; uint32_t msgLen = r[i++];
+                if (msgLen == 0xFF && L > 4) { msgLen = (r[i] << 8) | r[i + 1]; i += 2; }
+                nd["message_len"] = msgLen;
+                if (msgLen > 0 && i + 3 < L) {
+                    uint8_t fl = r[i++];
+                    uint8_t typeLen = r[i++];
+                    uint32_t payLen = 0;
+                    if (fl & 0x10) { payLen = r[i++]; }
+                    else if (i + 4 <= L) { payLen = ((uint32_t)r[i] << 24) | (r[i+1] << 16) | (r[i+2] << 8) | r[i+3]; i += 4; }
+                    uint8_t idLen = ((fl & 0x08) && i < L) ? r[i++] : 0;
+                    static const char* const tnfs[] = {"empty", "well-known", "mime", "absolute-uri", "external", "unknown", "unchanged", "reserved"};
+                    nd["tnf"]          = tnfs[fl & 7];
+                    nd["tnf_raw"]      = fl & 7;
+                    nd["header_flags"] = fl;
+                    nd["type_len"]     = typeLen;
+                    nd["payload_len"]  = payLen;
+                    nd["id_len"]       = idLen;
+                    if (i + typeLen <= L) {
+                        String ty;
+                        for (uint8_t k = 0; k < typeLen; k++)
+                            ty += (char)((r[i+k] >= 32 && r[i+k] < 127) ? r[i+k] : '.');
+                        nd["type"] = ty;
+                    }
+                }
+            }
+        }
+        String out; serializeJson(doc, out);
+        req->send(200, "application/json", out);
+    });
 
     // ── Static SPA from SPIFFS ───────────────────────────────
     // Root: serve the gzipped SPA index explicitly so we don't depend on

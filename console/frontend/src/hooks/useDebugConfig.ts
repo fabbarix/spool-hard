@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 export interface DebugConfig {
   log_ams: boolean;
   lcd_debug: boolean;
+  nfc_debug: boolean;
 }
 
 export function useDebugConfig() {

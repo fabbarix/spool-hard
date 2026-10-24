@@ -320,7 +320,11 @@ debounces by UID BEFORE any page reads (a held tag yields exactly one event;
 removal (8 empty polls, ~2 s; held NTAGs are presence-pinged with a page-3 READ because an ACTIVE tag ignores REQA) re-arms), reads NTAG pages 4..19 as 4 x 16-byte READs, and
 posts POD events (char buffers, no Strings) to a 4-deep queue. `NfcReader::update()`
 on loopTask drains the queue and fires the callback (LVGL/store access stays
-on loopTask). `[NFC]` log lines carry polls/pageReads/events counters.
+on loopTask). `GET /api/debug/nfc` (auth + session-only `nfc_debug` toggle via
+`POST /api/debug/config`, off by default) returns the last detected tag from a
+seqlock-published POD snapshot: uid, SAK/ATQA, per-READ results (page, ok, raw hex),
+pages 4..19 hex, url, NDEF TLV/record-header decode, counters. Read-only; the
+handler never touches the PN532.  `[NFC]` log lines carry polls/pageReads/events counters.
 
 ## Code navigation & editing — use Serena MCP
 

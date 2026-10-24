@@ -299,6 +299,8 @@ public:
     // Gates /api/debug/lcd.bmp + /api/debug/lcd/touch (session-only, off by
     // default). Off => both endpoints answer 403 and no LCD code runs.
     bool _lcdDebug  = false;
+    // Gates GET /api/debug/nfc (read-only dump of the last detected tag).
+    bool _nfcDebug = false;
 };
 
 extern ConsoleWebServer g_web;   // defined in main.cpp
