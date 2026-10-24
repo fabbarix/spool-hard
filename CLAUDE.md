@@ -161,7 +161,7 @@ the headers are `#include`d).
 - `spoolhard/path_route.h` — `spoolhard::addPathRoute(server, method, prefix,
   suffix, allowSlash, digitsOnly, onRequest[, onBody])` + `spoolhard::pathArg(req,
   prefix, suffix, allowSlash)`: regex-free `<prefix><arg><suffix>` routes (arg
-  1..64 chars, else falls through to 404). Replaces `-DASYNCWEBSERVER_REGEX` /
+  1..64 chars, else the route does not match and later handlers decide; `addPathReject` registers a 404 catch-all before each collection route so over-long or malformed ids never reach the collection handler). Replaces `-DASYNCWEBSERVER_REGEX` /
   `req->pathArg()`; do NOT re-enable the regex flag (std::regex was ~220 KB of
   console flash). Registration order is priority: specific before generic, and
   per-id routes BEFORE the literal collection routes (literal `on("/api/x")`
