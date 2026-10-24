@@ -21,6 +21,11 @@ a library bump can't silently drop the protection.
 """
 Import("env")
 import os
+import sys
+
+# stderr, not stdout: CI runs `pio run --silent`, which swallows script stdout.
+def log(msg):
+    print(msg, file=sys.stderr)
 
 MARKER = "SPOOLHARD_MAX_FORM_BODY"
 
@@ -48,7 +53,7 @@ def patch_asyncwebserver():
     lib_dir = env.subst("$PROJECT_LIBDEPS_DIR/$PIOENV/ESPAsyncWebServer")
     path = os.path.join(lib_dir, "src", "WebRequest.cpp")
     if not os.path.isfile(path):
-        print("[patch_asyncwebserver] WebRequest.cpp not found (lib not installed yet?) — skipped")
+        log("[patch_asyncwebserver] WebRequest.cpp not found (lib not installed yet?) — skipped")
         return
     with open(path) as f:
         src = f.read()
@@ -70,7 +75,7 @@ def patch_asyncwebserver():
     lines.insert(last_inc + 1, DEFINE)
     with open(path, "w") as f:
         f.write("\n".join(lines))
-    print("[patch_asyncwebserver] capped form-body param parsing at SPOOLHARD_MAX_FORM_BODY")
+    log("[patch_asyncwebserver] capped form-body param parsing at SPOOLHARD_MAX_FORM_BODY")
 
 
 patch_asyncwebserver()
