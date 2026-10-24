@@ -9,6 +9,8 @@
 #include "spoolhard/spiffs_upload.h"
 #include "spoolhard/common_routes.h"
 #include "load_cell.h"
+#include "nfc_reader.h"
+#include <atomic>
 #include "console_channel.h"
 #include "spoolhard/ring_log.h"
 #include <Preferences.h>
@@ -19,6 +21,9 @@
 #include "spoolhard/path_route.h"
 #include "spoolhard/vector_print.h"
 #include "spoolhard/state_rate_gate.h"
+extern NfcReader g_nfc;
+static std::atomic<bool> s_debugNfc{false};   // session-only, never persisted
+
 #include "spoolhard/serial_mirror.h"
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -248,6 +253,61 @@ void ScaleWebServer::_setupRoutes() {
         if (!SpoolhardAuth::requireAuth(req)) return;
         req->send(200, "application/json", "{\"status\":\"resetting\"}");
         spoolhardDeferredReboot();
+    });
+
+    // ── NFC debug (session-only toggle, off at every boot) ─────
+    // GET /api/debug/config, POST /api/debug/config?nfc=1|0 flips the flag;
+    // GET /api/debug/nfc returns the nfc_task's cached last-tag record
+    // (seqlock copy - the handler never touches the PN532). Read-only.
+    _server.on(AsyncURIMatcher::exact("/api/debug/config"), HTTP_ANY, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        if (req->method() == HTTP_POST && req->hasParam("nfc")) {
+            s_debugNfc.store(req->getParam("nfc")->value() == "1");
+        }
+        req->send(200, "application/json",
+                  s_debugNfc.load() ? "{\"nfc\":true}" : "{\"nfc\":false}");
+    });
+    _server.on(AsyncURIMatcher::exact("/api/debug/nfc"), HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        if (!s_debugNfc.load()) {
+            req->send(403, "application/json",
+                      "{\"error\":\"nfc debug disabled; POST /api/debug/config?nfc=1\"}");
+            return;
+        }
+        NfcDebug d;
+        if (!g_nfc.debugSnapshot(d)) {
+            req->send(503, "application/json", "{\"error\":\"busy\"}");
+            return;
+        }
+        char hex[2 * 7 + 1] = {0};
+        for (int i = 0; i < d.uid_len && i < 7; i++) snprintf(hex + 2 * i, 3, "%02X", d.uid[i]);
+        JsonDocument doc(&g_psramJsonAlloc);
+        doc["uid"] = hex;
+        doc["uidLen"] = d.uid_len;
+        doc["sak"] = d.sak;
+        doc["atqa"] = d.atqa;
+        doc["ndefOk"] = (bool)d.ndef_ok;
+        doc["pingable"] = (bool)d.pingable;
+        JsonArray pages = doc["pages"].to<JsonArray>();   // pages 4..19 actually read
+        for (int i = 0; i < 16; i++) {
+            if (!(d.page_mask & (1u << i))) continue;
+            char ph[9];
+            snprintf(ph, sizeof(ph), "%02X%02X%02X%02X", d.raw[i*4], d.raw[i*4+1], d.raw[i*4+2], d.raw[i*4+3]);
+            JsonObject o = pages.add<JsonObject>();
+            o["page"] = 4 + i;
+            o["hex"] = ph;
+        }
+        doc["polls"] = d.polls;
+        doc["pings"] = d.pings;
+        doc["pingFails"] = d.ping_fails;
+        doc["pageReads"] = d.page_reads;
+        doc["events"] = d.events;
+        doc["removals"] = d.removals;
+        doc["flapsAbsorbed"] = d.flaps_absorbed;
+        doc["lastSeenAgoMs"] = (uint32_t)(millis() - d.last_seen_ms);
+        String out;
+        serializeJson(doc, out);
+        req->send(200, "application/json", out);
     });
 
     // ── Crash log retrieval ────────────────────────────────────

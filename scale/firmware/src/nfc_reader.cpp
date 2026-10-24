@@ -2,6 +2,8 @@
 #include "config.h"
 #include <Preferences.h>
 #include <SPI.h>
+#include "spoolhard/ring_log.h"
+extern byte pn532_packetbuffer[];
 #include "spoolhard/serial_mirror.h"
 
 NfcReader::NfcReader()
@@ -24,8 +26,44 @@ bool NfcReader::begin() {
     return true;
 }
 
+// Removal window in wall time (poll period is ~50 ms: 30 ms PN532 timeout +
+// 20 ms task idle), plus a minimum miss count so one slow iteration can't
+// satisfy the time test alone.
+static constexpr uint32_t kRemovedMs      = 1500;
+static constexpr uint8_t  kRemovedMinMiss = 5;
+
+// Seqlock writer helpers: nfc_task is the only writer of _dbg.
+#define DBG_BEGIN() _dbgSeq.fetch_add(1, std::memory_order_acq_rel)
+#define DBG_END()   _dbgSeq.fetch_add(1, std::memory_order_release)
+
+bool NfcReader::debugSnapshot(NfcDebug& out) const {
+    for (int i = 0; i < 8; i++) {
+        uint32_t s1 = _dbgSeq.load(std::memory_order_acquire);
+        if (s1 & 1) { delay(1); continue; }
+        memcpy(&out, &_dbg, sizeof(out));
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (_dbgSeq.load(std::memory_order_acquire) == s1) return true;
+    }
+    return false;
+}
+
 void NfcReader::update() {
     if (!_available) return;
+    DBG_BEGIN(); _dbg.polls++; DBG_END();
+
+    // Presence ping while a readable NTAG is held: READ page 3 (CC) on the
+    // still-selected target. Runs only from nfc_task, which also owns the
+    // write/erase/emulate commands (drained before update()), so it can
+    // never interleave with them.
+    if (_tagPresent && _pingable) {
+        uint8_t cc[4];
+        bool ok = _pn532.ntag2xx_ReadPage(3, cc);
+        DBG_BEGIN();
+        _dbg.pings++;
+        if (ok) _dbg.last_seen_ms = millis(); else _dbg.ping_fails++;
+        DBG_END();
+        if (ok) { _misses = 0; _lastSeenMs = millis(); return; }
+    }
 
     uint8_t uid[7];
     uint8_t uid_len = 0;
@@ -42,20 +80,36 @@ void NfcReader::update() {
 
     if (!found) {
         if (_tagPresent) {
-            _tagPresent = false;
-            _setStatus(TagStatus::Idle);
-            Serial.println("[NFC] Tag removed");
+            if (_misses < 255) _misses++;
+            if (_misses >= kRemovedMinMiss && (millis() - _lastSeenMs) >= kRemovedMs) {
+                _tagPresent = false;
+                _pingable = false;
+                _misses = 0;
+                _setStatus(TagStatus::Idle);
+                DBG_BEGIN(); _dbg.removals++; DBG_END();
+                dlog("NFC", "Tag removed (polls=%u pings=%u pingFails=%u pageReads=%u events=%u)",
+                     (unsigned)_dbg.polls, (unsigned)_dbg.pings, (unsigned)_dbg.ping_fails,
+                     (unsigned)_dbg.page_reads, (unsigned)_dbg.events);
+            }
         }
         return;
     }
+    _misses = 0;
+    _lastSeenMs = millis();
 
     // Same tag still on the reader — don't re-report.
     if (_tagPresent && uid_len == _lastTag.uid_len &&
         memcmp(uid, _lastTag.uid, uid_len) == 0) {
+        DBG_BEGIN(); _dbg.flaps_absorbed++; _dbg.last_seen_ms = _lastSeenMs; DBG_END();
         return;
     }
 
+    // PN532 InListPassiveTarget response: ATQA at [9..10], SAK at [11].
+    uint16_t atqa = ((uint16_t)pn532_packetbuffer[9] << 8) | pn532_packetbuffer[10];
+    uint8_t  sak  = pn532_packetbuffer[11];
+
     _tagPresent = true;
+    _pingable = false;
     _tagGen++;
     _lastTag.uid_len = uid_len;
     memcpy(_lastTag.uid, uid, uid_len);
@@ -63,16 +117,43 @@ void NfcReader::update() {
     _lastTag.ndef_url = "";       // don't carry the previous tag's payload
     _lastTag.raw_message = "";
 
+    DBG_BEGIN();
+    memset(_dbg.uid, 0, sizeof(_dbg.uid));
+    memcpy(_dbg.uid, uid, uid_len);
+    _dbg.uid_len = uid_len;
+    _dbg.sak = sak;
+    _dbg.atqa = atqa;
+    _dbg.page_mask = 0;
+    memset(_dbg.raw, 0, sizeof(_dbg.raw));
+    _dbg.ndef_ok = 0;
+    _dbg.pingable = 0;
+    _dbg.events++;
+    _dbg.last_seen_ms = _lastSeenMs;
+    DBG_END();
+
     _setStatus(TagStatus::FoundTagNowReading);
 
-    if (_readNdef(_lastTag)) {
+    bool ok = _readNdef(_lastTag);
+    // Ping only a tag that answered a page READ (NTAG family); others keep
+    // the poll-only path, covered by the time-based removal window.
+    _pingable = ok || (_dbg.page_mask != 0);
+    DBG_BEGIN(); _dbg.ndef_ok = ok; _dbg.pingable = _pingable; DBG_END();
+
+    char hex[2 * 7 + 1] = {0};
+    for (int i = 0; i < uid_len && i < 7; i++) snprintf(hex + 2 * i, 3, "%02X", uid[i]);
+    char p4[9] = "--------";
+    if (_dbg.page_mask & 1) snprintf(p4, sizeof(p4), "%02X%02X%02X%02X",
+                                     _dbg.raw[0], _dbg.raw[1], _dbg.raw[2], _dbg.raw[3]);
+
+    if (ok) {
         _setStatus(TagStatus::ReadSuccess);
-        Serial.printf("[NFC] Read tag UID: ");
-        for (int i = 0; i < uid_len; i++) Serial.printf("%02X:", uid[i]);
-        Serial.println();
+        dlog("NFC", "Read tag UID=%s len=%u sak=0x%02X atqa=0x%04X format=%s page4=%s ndef=%uB",
+             hex, (unsigned)uid_len, sak, atqa, _formatLabel(_lastTag), p4,
+             (unsigned)_lastTag.raw_message.length());
     } else {
         _setStatus(TagStatus::Failure);
-        Serial.println("[NFC] Tag read timeout/error");
+        dlog("NFC", "Tag read timeout/error UID=%s len=%u sak=0x%02X atqa=0x%04X format=%s page4=%s",
+             hex, (unsigned)uid_len, sak, atqa, _formatLabel(_lastTag), p4);
     }
 }
 
@@ -80,7 +161,18 @@ bool NfcReader::_readNdef(SpoolTag& tag) {
     // Read NDEF message from NTAG (pages 4+)
     // NTAG21x: 4 bytes per page, NDEF starts at page 4
     uint8_t buf[4];
-    if (!_pn532.ntag2xx_ReadPage(4, buf)) return false;
+    auto readPg = [&](uint8_t pg) -> bool {
+        bool ok = _pn532.ntag2xx_ReadPage(pg, buf);
+        if (ok && pg >= 4 && pg <= 19) {
+            DBG_BEGIN();
+            memcpy(_dbg.raw + (pg - 4) * 4, buf, 4);
+            _dbg.page_mask |= (uint16_t)(1u << (pg - 4));
+            _dbg.page_reads++;
+            DBG_END();
+        }
+        return ok;
+    };
+    if (!readPg(4)) return false;
 
     // Check NDEF TLV header (0x03 = NDEF, next byte = length)
     if (buf[0] != 0x03) return false;
@@ -94,7 +186,7 @@ bool NfcReader::_readNdef(SpoolTag& tag) {
     uint16_t read = 0;
 
     while (read < msg_len) {
-        if (!_pn532.ntag2xx_ReadPage(page, buf)) return false;
+        if (!readPg(page)) return false;
         for (int i = byte_offset; i < 4 && read < msg_len; i++, read++) {
             ndef += (char)buf[i];
         }
@@ -199,6 +291,7 @@ bool NfcReader::emulateTag(const String& url) {
     Serial.printf("[NFC] Emulate tag URL: %s\n", url.c_str());
     // AsTarget() puts PN532 into card emulation mode (no args in this lib version)
     // Returns 0 on success
+    _pingable = false;   // PN532 leaves initiator mode: no ping until a fresh read
     uint8_t result = _pn532.AsTarget();
     if (result != 0) {
         Serial.println("[NFC] Emulate: tag not fully read");
