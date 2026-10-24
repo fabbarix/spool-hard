@@ -915,6 +915,7 @@ void loop() {
             s_lastCleanupMs = now;
             g_console.cleanupClients();
             g_web.cleanupClients();
+            g_wsBufPool.setConsoleClients(g_console.connectedCount());
             // DIAGNOSTIC: dump WS client queue/state every second so we
             // can correlate the cycle's progression with queue-fill or
             // drain-stall behaviour.
