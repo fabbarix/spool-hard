@@ -8,6 +8,25 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.12.15] - 2026-10-24
+
+Spool database compaction and two small build fixes.
+
+- fix(store): the spool and user-filament databases are now compacted
+  at boot. Every spool edit or consumption update rewrites the record
+  by appending a new line, and nothing ever cleaned up the old ones —
+  on a real console the spool DB had reached 501 KB for 11 spools
+  (899 superseded lines) and took ~6 s to load at boot. Compaction
+  runs once superseded lines outnumber live records; it writes a
+  complete temp copy before replacing the original, and a power cut
+  mid-way is recovered on the next boot. First boot after updating
+  takes a few seconds longer while it compacts.
+- fix(scale): the scale firmware image now carries its version
+  marker (it was dropped at link time), and firmware uploads log the
+  detected version.
+- build: the ESPAsyncWebServer security patch now reports on stderr,
+  so CI release logs show that it was applied.
+
 ## [0.12.14] - 2026-10-24
 
 H2-series external spool support, a working backup/restore, and the
