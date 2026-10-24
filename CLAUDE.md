@@ -266,6 +266,17 @@ documents whether the chip's RATE pin is wired for 80 Hz vs the 10 Hz
 default. The `sensor_task` polls at 100 Hz unconditionally; the
 constant is informational + drives the default `STABLE_COUNT_REQ`.
 
+## Console NFC task
+
+The console's own PN532 (`console/firmware/src/nfc_reader.cpp`) runs in a
+dedicated `nfc_task` (4 KB internal stack, core 1, prio 2, 200 ms poll). The
+task is the sole PN532/SPI user (the console never writes/erases tags),
+debounces by UID BEFORE any page reads (a held tag yields exactly one event;
+removal for ~600 ms re-arms), reads NTAG pages 4..19 as 4 x 16-byte READs, and
+posts POD events (char buffers, no Strings) to a 4-deep queue. `NfcReader::update()`
+on loopTask drains the queue and fires the callback (LVGL/store access stays
+on loopTask). `[NFC]` log lines carry polls/pageReads/events counters.
+
 ## Code navigation & editing — use Serena MCP
 
 This repo has the **Serena** MCP server attached. Prefer Serena's
