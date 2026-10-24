@@ -3,25 +3,30 @@
 #include <freertos/semphr.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
+#include <esp_heap_caps.h>
 
 namespace RingLog {
 
-// Cap at 80 entries × ~160 bytes ≈ 13 KB max steady-state. The deque
-// drops oldest when full so the buffer is bounded regardless of how
-// chatty dlog-using subsystems get. We DRASTICALLY reduced from
-// 200×256 in 0.6.x once the analyzer started OOM'ing during
-// gcode-body parse: with the H2S 32 KB MQTT buffer + 30 KB transient
-// JSON parse per 1.2 s + 30 KB TLS handshake for FTPS RETR, every
-// kilobyte of internal DRAM matters.
+// Fixed slot ring: kMaxEntries slots of kMaxLineLen chars, allocated ONCE
+// (first push) and never touched by the allocator again — push() does no
+// per-call heap work, so logging causes zero internal-DRAM churn. Prefers
+// PSRAM when present (console); on the scale (no PSRAM) it is one
+// ~13.5 KB internal block taken early at boot, which is no more than the
+// old deque<String> used at steady state (80 x (node + String + heap)).
+// Lines longer than kMaxLineLen-1 are tail-truncated and end in "...".
 static constexpr size_t kMaxEntries = 80;
 static constexpr size_t kMaxLineLen = 160;
-// Drop log pushes when internal free heap dips this low. Logging itself
-// must never starve a real allocation — the analyzer's gcode buffer or
-// MQTT's JsonDocument matters more than the ring's exhaustiveness.
-static constexpr size_t kMinFreeHeapForLog = 24 * 1024;
 
-static std::deque<Entry> s_buf;
-static uint32_t          s_seq = 0;
+struct Slot {
+    uint32_t seq;
+    uint32_t millis_at;
+    uint8_t  len;
+    char     text[kMaxLineLen + 1];
+};
+
+static Slot*     s_slots = nullptr;   // kMaxEntries, circular
+static uint32_t  s_seq = 0;           // seq of newest entry (0 = none)
 static SemaphoreHandle_t volatile s_mtx = nullptr;
 
 static SemaphoreHandle_t _lazyMutex(SemaphoreHandle_t volatile* slot) {
@@ -40,46 +45,64 @@ static SemaphoreHandle_t _lazyMutex(SemaphoreHandle_t volatile* slot) {
     return expected;
 }
 
-static void _ensureMutex() { _lazyMutex(&s_mtx); }
+static SemaphoreHandle_t _ensureMutex() { return _lazyMutex(&s_mtx); }
 
-void push(const String& line) {
-    // Self-throttle on heap pressure so logging never tips a marginal
-    // allocation (analyzer / MQTT JSON parse) into OOM panic.
-    if (ESP.getFreeHeap() < kMinFreeHeapForLog) return;
-    _ensureMutex();
-    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
+// Caller holds the mutex.
+static bool _ensureSlots() {
+    if (s_slots) return true;
+    size_t bytes = sizeof(Slot) * kMaxEntries;
+    void* p = nullptr;
+    if (psramFound()) p = heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_calloc(1, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_slots = (Slot*)p;
+    return s_slots != nullptr;
+}
 
-    String trimmed = line;
-    // Strip trailing newline + cap length. Long lines get tail-truncated
-    // because the head usually carries the "what" + tag and is more
-    // useful for grep.
-    while (trimmed.length() && (trimmed.endsWith("\n") || trimmed.endsWith("\r"))) {
-        trimmed.remove(trimmed.length() - 1);
+void push(const char* text, size_t len) {
+    if (!text) return;
+    // Strip trailing CR/LF.
+    while (len && (text[len - 1] == '\n' || text[len - 1] == '\r')) --len;
+    if (len == 0) return;
+    SemaphoreHandle_t m = _ensureMutex();
+    if (!m || xSemaphoreTake(m, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    if (_ensureSlots()) {
+        Slot& sl = s_slots[s_seq % kMaxEntries];   // slot of seq+1 == (seq+1-1)
+        bool trunc = len > kMaxLineLen;
+        size_t n = trunc ? kMaxLineLen : len;
+        memcpy(sl.text, text, n);
+        if (trunc) memcpy(sl.text + n - 3, "...", 3);
+        sl.text[n] = 0;
+        sl.len = (uint8_t)n;
+        sl.millis_at = millis();
+        sl.seq = ++s_seq;
     }
-    if (trimmed.length() > kMaxLineLen) {
-        trimmed = trimmed.substring(0, kMaxLineLen);
+    xSemaphoreGive(m);
+}
+
+void push(const String& line) { push(line.c_str(), line.length()); }
+
+void forEach(uint32_t since, size_t limit,
+             void (*fn)(void*, uint32_t, uint32_t, const char*), void* ctx) {
+    SemaphoreHandle_t m = _ensureMutex();
+    if (!m || xSemaphoreTake(m, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    if (s_slots && s_seq) {
+        uint32_t oldest = s_seq > kMaxEntries ? s_seq - kMaxEntries + 1 : 1;
+        uint32_t first  = since + 1 > oldest ? since + 1 : oldest;
+        size_t emitted = 0;
+        for (uint32_t q = first; q <= s_seq && emitted < limit; ++q, ++emitted) {
+            const Slot& sl = s_slots[(q - 1) % kMaxEntries];
+            fn(ctx, sl.seq, sl.millis_at, sl.text);
+        }
     }
-
-    Entry e;
-    e.seq       = ++s_seq;
-    e.millis_at = millis();
-    e.line      = std::move(trimmed);
-    s_buf.push_back(std::move(e));
-    while (s_buf.size() > kMaxEntries) s_buf.pop_front();
-
-    xSemaphoreGive(s_mtx);
+    xSemaphoreGive(m);
 }
 
 std::deque<Entry> snapshot(uint32_t since, size_t limit) {
     std::deque<Entry> out;
-    _ensureMutex();
-    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return out;
-    for (auto& e : s_buf) {
-        if (e.seq <= since) continue;
-        out.push_back(e);
-        if (out.size() >= limit) break;
-    }
-    xSemaphoreGive(s_mtx);
+    forEach(since, limit, [](void* c, uint32_t seq, uint32_t ms, const char* t) {
+        Entry e; e.seq = seq; e.millis_at = ms; e.line = t;
+        ((std::deque<Entry>*)c)->push_back(std::move(e));
+    }, &out);
     return out;
 }
 
@@ -96,15 +119,15 @@ uint32_t headSeq() {
 }  // namespace RingLog
 
 void dlog(const char* tag, const char* fmt, ...) {
-    char buf[280];
+    char buf[281];  // +1: room for the Serial newline
     int  n = 0;
     if (tag && *tag) {
         n = snprintf(buf, sizeof(buf), "[%s] ", tag);
-        if (n < 0 || (size_t)n >= sizeof(buf)) n = sizeof(buf) - 1;
+        if (n < 0 || (size_t)n >= sizeof(buf) - 1) n = sizeof(buf) - 2;
     }
     va_list args;
     va_start(args, fmt);
-    int m = vsnprintf(buf + n, sizeof(buf) - (size_t)n, fmt, args);
+    int m = vsnprintf(buf + n, sizeof(buf) - 1 - (size_t)n, fmt, args);
     va_end(args);
     (void)m;
 
@@ -118,8 +141,11 @@ void dlog(const char* tag, const char* fmt, ...) {
     // remote debugging. Even with the order swap we additionally
     // gate the Serial mirror on a host-connected check so we never
     // block here at all when running headless.
-    RingLog::push(String(buf));
-    if (Serial && Serial.availableForWrite() >= (int)strlen(buf) + 2) {
-        Serial.printf("%s\n", buf);
+    size_t blen = strlen(buf);
+    RingLog::push(buf, blen);
+    if (Serial && Serial.availableForWrite() >= (int)blen + 2) {
+        // Not Serial.printf: Print::printf mallocs for lines > 63 chars.
+        buf[blen] = '\n';
+        Serial.write((const uint8_t*)buf, blen + 1);
     }
 }
