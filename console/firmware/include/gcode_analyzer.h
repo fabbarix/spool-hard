@@ -81,7 +81,9 @@ private:
 
     // Line-accumulating state: incoming chunks can break mid-line so we
     // buffer until we hit '\n'.
-    String _lineBuf;
+    static constexpr int LINE_CAP = 1024;   // analyzer lives in PSRAM; +1 KiB is free
+    char   _line[LINE_CAP + 1];
+    int    _lineLen = 0;
 
     // Slicer header metadata (one entry per project-filament slot in
     // Bambu Studio). Populated as we encounter `; filament_ids =` /
@@ -91,10 +93,10 @@ private:
     SlicerSlot _slicerSlots[MAX_TOOLS];
     bool       _slicerHeaderParsed = false;
 
-    void _processLine(const String& line);
+    void _processLine(char* line);   // NUL-terminated, edited in place
     void _addExtrusion(float delta_mm);
     // Try to parse a header `; key = a;b;c[;d…]` line into slicer-slot
     // metadata. Returns true if the line matched and was consumed (so
     // _processLine can skip the normal G-code branch).
-    bool _maybeParseSlicerHeader(const String& rawLine);
+    bool _maybeParseSlicerHeader(char* rawLine);
 };
