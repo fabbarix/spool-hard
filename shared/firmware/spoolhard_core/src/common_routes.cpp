@@ -13,7 +13,7 @@
 namespace SpoolhardCommonRoutes {
 
 void registerRestart(AsyncWebServer& server) {
-    server.on("/api/restart", HTTP_POST, [](AsyncWebServerRequest* req) {
+    server.on(AsyncURIMatcher::exact("/api/restart"), HTTP_POST, [](AsyncWebServerRequest* req) {
         if (!SpoolhardAuth::requireAuth(req)) return;
         req->send(200, "application/json", "{\"ok\":true}");
         // send() only queues the response; rebooting from a detached
@@ -51,7 +51,7 @@ void registerLogs(AsyncWebServer& server) {
 }
 
 void registerHeap(AsyncWebServer& server) {
-    server.on("/api/heap", HTTP_GET, [](AsyncWebServerRequest* req) {
+    server.on(AsyncURIMatcher::exact("/api/heap"), HTTP_GET, [](AsyncWebServerRequest* req) {
         if (!SpoolhardAuth::requireAuth(req)) return;
         JsonDocument doc(&g_psramJsonAlloc);
 

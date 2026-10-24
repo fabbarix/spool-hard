@@ -78,4 +78,58 @@ def patch_asyncwebserver():
     log("[patch_asyncwebserver] capped form-body param parsing at SPOOLHARD_MAX_FORM_BODY")
 
 
+# ── Patch 2: bound the request line / header line length ───────────────────
+# The parser accumulates a line in a heap String (_temp) until it sees '\n',
+# with no limit: an endless request line or header line grows internal DRAM
+# until reserve() fails. Abort (clean connection drop) once a single line
+# exceeds SPOOLHARD_MAX_REQLINE (request line) / SPOOLHARD_MAX_HDRLINE
+# (header lines; cookies / Authorization fit comfortably). Checked only in
+# the "no newline in this chunk yet" branch, so overshoot is <= one TCP
+# segment. The check is per TCP segment, not per
+# byte: lines up to roughly limit + one segment (~1.4 KB) can still pass
+# (observed: ~2.9 KB request line OK, 4 KB reset). Good enough as a DoS bound. Body parsing is untouched.
+LINE_MARKER = "SPOOLHARD_MAX_REQLINE"
+LINE_DEFINE = """
+// ── SpoolHard patch: cap request/header line length ──
+#ifndef SPOOLHARD_MAX_REQLINE
+#define SPOOLHARD_MAX_REQLINE 2048
+#endif
+#ifndef SPOOLHARD_MAX_HDRLINE
+#define SPOOLHARD_MAX_HDRLINE 8192
+#endif
+"""
+LINE_OLD = """        if (!_temp.reserve(_temp.length() + len)) {"""
+LINE_NEW = """        if (_temp.length() + len > (_parseState == PARSE_REQ_START ? SPOOLHARD_MAX_REQLINE : SPOOLHARD_MAX_HDRLINE)) {
+          async_ws_log_e("Request/header line too long");
+          _parseState = PARSE_REQ_FAIL;
+          abort();
+          return;
+        }
+        if (!_temp.reserve(_temp.length() + len)) {"""
+
+
+def patch_line_limits():
+    lib_dir = env.subst("$PROJECT_LIBDEPS_DIR/$PIOENV/ESPAsyncWebServer")
+    path = os.path.join(lib_dir, "src", "WebRequest.cpp")
+    if not os.path.isfile(path):
+        return
+    with open(path) as f:
+        src = f.read()
+    if LINE_MARKER in src:
+        return
+    if src.count(LINE_OLD) != 1:
+        raise SystemExit(
+            "[patch_asyncwebserver] upstream code changed — line-accumulate anchor not found exactly once:\n  "
+            + LINE_OLD
+        )
+    src = src.replace(LINE_OLD, LINE_NEW)
+    lines = src.split("\n")
+    last_inc = max(i for i, l in enumerate(lines[:80]) if l.startswith("#include"))
+    lines.insert(last_inc + 1, LINE_DEFINE)
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    log("[patch_asyncwebserver] capped request line at SPOOLHARD_MAX_REQLINE / header line at SPOOLHARD_MAX_HDRLINE")
+
+
 patch_asyncwebserver()
+patch_line_limits()
