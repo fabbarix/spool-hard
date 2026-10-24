@@ -27,7 +27,7 @@ extern ScaleLink           g_scale;
 #define COL_BORDER      lv_color_hex(0x252830)
 #define COL_BRAND       lv_color_hex(0xf0b429)
 #define COL_TEXT        lv_color_hex(0xe2e8f0)
-#define COL_TEXT_MUTED  lv_color_hex(0x64748b)
+#define COL_TEXT_MUTED  lv_color_hex(0x94a3b8)   // >= 5.75:1 on every surface (was 0x64748b, 3.5:1)
 #define COL_CONNECTED   lv_color_hex(0x2dd4bf)
 
 // ── Wizard state machine ───────────────────────────────────
@@ -379,14 +379,14 @@ static void build_pick() {
     int cx = 16;
     for (int i = 0; i < 5; ++i) {
         lv_obj_t* chip = make_btn(s_scr_pick, chip_labels[i], false,
-                                  chip_ops[i], on_pick, cx, 46, 72, 30);
+                                  chip_ops[i], on_pick, cx, 42, 72, 44);
         (void)chip;
         cx += 80;
     }
 
     s_pick_list = lv_list_create(s_scr_pick);
-    lv_obj_set_pos(s_pick_list, 16, 84);
-    lv_obj_set_size(s_pick_list, 448, 142);
+    lv_obj_set_pos(s_pick_list, 16, 92);
+    lv_obj_set_size(s_pick_list, 448, 136);
     lv_obj_set_style_bg_color(s_pick_list, COL_CARD, 0);
     lv_obj_set_style_border_color(s_pick_list, COL_BORDER, 0);
     lv_obj_set_style_border_width(s_pick_list, 1, 0);
@@ -499,13 +499,13 @@ static void build_filament_pick() {
     int cx = 16;
     for (int i = 0; i < 5; ++i) {
         make_btn(s_scr_filapick, chip_labels[i], false,
-                 chip_ops[i], on_filament_pick, cx, 46, 72, 30);
+                 chip_ops[i], on_filament_pick, cx, 42, 72, 44);
         cx += 80;
     }
 
     s_filapick_list = lv_list_create(s_scr_filapick);
-    lv_obj_set_pos(s_filapick_list, 16, 84);
-    lv_obj_set_size(s_filapick_list, 448, 142);
+    lv_obj_set_pos(s_filapick_list, 16, 92);
+    lv_obj_set_size(s_filapick_list, 448, 136);
     lv_obj_set_style_bg_color(s_filapick_list, COL_CARD, 0);
     lv_obj_set_style_border_color(s_filapick_list, COL_BORDER, 0);
     lv_obj_set_style_border_width(s_filapick_list, 1, 0);
@@ -583,7 +583,7 @@ static void build_state() {
 
     lv_obj_t* hint = make_label(s_scr_state,
         "Place the spool on the scale; we'll learn the core weight "
-        "from the measurement.", COL_TEXT_MUTED, &spoolhard_mont_14);
+        "from the measurement.", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_pos(hint, 16, 50);
     lv_obj_set_width(hint, 448);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
@@ -738,7 +738,7 @@ static void build_used() {
         "Pick a known empty-core weight or take the current scale reading "
         "as the empty-core reference. If a template was chosen, its core "
         "is offered as a one-tap shortcut.",
-        COL_TEXT_MUTED, &spoolhard_mont_14);
+        COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_pos(hint, 16, 46);
     lv_obj_set_width(hint, 448);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
@@ -838,7 +838,7 @@ static void show_usedlist() {
     if (entries.empty()) {
         lv_obj_t* empty = make_label(s_usedlist_list,
             "(no core weights learned yet — use Measure core instead)",
-            COL_TEXT_MUTED, &spoolhard_mont_14);
+            COL_TEXT_MUTED, &spoolhard_mont_16);
         lv_obj_center(empty);
     } else {
         for (const auto& e : entries) {
@@ -892,7 +892,7 @@ static void build_empty() {
 
     lv_obj_t* hint = make_label(s_scr_empty,
         "Place the empty spool on the scale and wait for a stable reading.",
-        COL_TEXT_MUTED, &spoolhard_mont_14);
+        COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_pos(hint, 16, 54);
     lv_obj_set_width(hint, 448);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);

@@ -1355,13 +1355,12 @@ static void _refreshOtaBanner() {
 
     String text;
     if (consolePending && scalePending) {
-        text = "Console " + cp.firmware_latest +
-               " + Scale "  + sp.firmware_latest +
-               " — tap to install";
+        text = "Update: Console " + cp.firmware_latest +
+               " + Scale "  + sp.firmware_latest;
     } else if (consolePending) {
-        text = "Console " + cp.firmware_latest + " available — tap to install";
+        text = "Console " + cp.firmware_latest + " ready - tap to install";
     } else {
-        text = "Scale "   + sp.firmware_latest + " available — tap to install";
+        text = "Scale "   + sp.firmware_latest + " ready - tap to install";
     }
     if (text != _lastText) {
         ui_set_ota_banner(true, text.c_str());

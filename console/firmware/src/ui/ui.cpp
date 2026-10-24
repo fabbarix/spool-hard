@@ -17,7 +17,9 @@
 #define COL_BORDER      lv_color_hex(0x252830)
 #define COL_BRAND       lv_color_hex(0xf0b429)
 #define COL_TEXT        lv_color_hex(0xe2e8f0)
-#define COL_TEXT_MUTED  lv_color_hex(0x64748b)
+// 0x94a3b8: 7.36:1 on COL_BODY, 6.56:1 on COL_CARD, 7.17:1 on COL_INPUT,
+// 5.75:1 on COL_BORDER (old 0x64748b was 3.53:1 on COL_CARD).
+#define COL_TEXT_MUTED  lv_color_hex(0x94a3b8)
 #define COL_CONNECTED   lv_color_hex(0x2dd4bf)
 #define COL_DISCONN     lv_color_hex(0xf87171)
 
@@ -134,7 +136,12 @@ static lv_obj_t* s_printer_card       = nullptr;
 static lv_obj_t* s_led_printer        = nullptr;   // connection dot
 static lv_obj_t* s_lbl_printer_status = nullptr;   // "name · STATE · N 210°C · B 60°C"
 static lv_obj_t* s_bar_printer_prog   = nullptr;   // progress bar
-static lv_obj_t* s_lbl_printer_detail = nullptr;   // "42% · layer 120/250"
+static lv_obj_t* s_lbl_printer_detail = nullptr;   // "RUNNING · layer 120/250"
+static lv_obj_t* s_lbl_printer_pct    = nullptr;   // big "82%"
+static lv_obj_t* s_lbl_printer_temps  = nullptr;   // "N 255°C  B 60°C"
+static lv_obj_t* s_lbl_printer_offline = nullptr;  // offline card message
+static lv_obj_t* s_lbl_ams_empty      = nullptr;   // hint when no printer
+static lv_obj_t* s_ams_badge[5]       = {nullptr}; // FEEDING badge per tile
 static lv_obj_t* s_btn_printer_refresh = nullptr;  // top-right refresh icon
 static ui_printer_refresh_cb_t s_printer_refresh_cb = nullptr;
 static lv_obj_t* s_bar_ota        = nullptr;
@@ -233,16 +240,16 @@ static void build_onboarding() {
 
     lv_obj_t* card = make_card(s_onboard, 40, 110, 400, 170);
 
-    make_label(card, "AP SSID", COL_TEXT_MUTED, &spoolhard_mont_14);
+    make_label(card, "AP SSID", COL_TEXT_MUTED, &spoolhard_mont_16);
     s_lbl_ssid = make_label(card, "—", COL_BRAND, &spoolhard_mont_22);
     lv_obj_align(s_lbl_ssid, LV_ALIGN_TOP_LEFT, 0, 22);
 
-    lv_obj_t* keyL = make_label(card, "Security key", COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_t* keyL = make_label(card, "Security key", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(keyL, LV_ALIGN_TOP_LEFT, 0, 70);
     s_lbl_key = make_label(card, "—", COL_BRAND, &spoolhard_mont_22);
     lv_obj_align(s_lbl_key, LV_ALIGN_TOP_LEFT, 0, 90);
 
-    lv_obj_t* ipL = make_label(card, "Portal", COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_t* ipL = make_label(card, "Portal", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(ipL, LV_ALIGN_TOP_RIGHT, 0, 70);
     s_lbl_onboard_ip = make_label(card, "192.168.4.1", COL_TEXT, &spoolhard_mont_18);
     lv_obj_align(s_lbl_onboard_ip, LV_ALIGN_TOP_RIGHT, 0, 90);
@@ -252,132 +259,163 @@ static void build_home() {
     s_home = lv_obj_create(nullptr);
     style_screen(s_home);
 
-    // ── Top row (y=12..68, h=56): compact weight + scale ──────────
-    // The weight card used to be a hero-number block taking most of the
-    // vertical space; it's now a one-line "### g  (state)" strip so the
-    // reclaimed rows go to the printer card and a taller AMS panel.
-    lv_obj_t* weightCard = make_card(s_home, 12, 12, 280, 56);
-    lv_obj_set_style_pad_all(weightCard, 8, 0);
-    make_label(weightCard, "Weight", COL_TEXT_MUTED, &spoolhard_mont_14);
-    s_lbl_weight = make_label(weightCard, "— g", COL_BRAND, &spoolhard_mont_28);
-    lv_obj_align(s_lbl_weight, LV_ALIGN_LEFT_MID, 60, 4);
-    s_lbl_state = make_label(weightCard, "waiting", COL_TEXT_MUTED, &spoolhard_mont_14);
-    lv_obj_align(s_lbl_state, LV_ALIGN_RIGHT_MID, -4, 4);
+    // Printer-first home (480x320). Vertical budget:
+    //   y=  6.. 46  header: link LED + printer name (22pt) + big percent (36pt)
+    //   y= 50.. 66  progress bar, 16 px thick
+    //   y= 72.. 92  state / layer (left) + temps (right), 16pt
+    //   y= 96..140  scale strip (44 px, tappable -> scale settings)
+    //   y=144..272  five filament tiles, 88 x 128, 4 px gaps (5*88+4*4 = 456)
+    //   y=276..320  footer / OTA banner (44 px hit strip)
+    // When the printer is offline the offline card (y=44..92) replaces the
+    // bar + state rows and carries a 44 px Retry button.
 
-    lv_obj_t* scaleCard = make_card(s_home, 296, 12, 172, 56);
-    lv_obj_set_style_pad_all(scaleCard, 8, 0);
-    s_led_scale = lv_led_create(scaleCard);
-    lv_led_set_color(s_led_scale, COL_DISCONN);
-    lv_obj_set_size(s_led_scale, 14, 14);
-    lv_obj_align(s_led_scale, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_led_off(s_led_scale);
-    s_lbl_scale_text = make_label(scaleCard, "Scale", COL_TEXT, &spoolhard_mont_16);
-    lv_obj_align(s_lbl_scale_text, LV_ALIGN_LEFT_MID, 24, 0);
-    // Tap-to-open the scale settings + calibration screen. The card
-    // carries a small "⚙" hint on the right edge so users know it's
-    // interactive — the LED + name on the left stay the dominant
-    // affordance for status. Click forwards to s_scale_tap_cb (set by
-    // main.cpp via ui_set_scale_settings_tap_callback).
-    lv_obj_add_flag(scaleCard, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(scaleCard, [](lv_event_t*) {
-        if (s_scale_tap_cb) s_scale_tap_cb();
-    }, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t* gear = make_label(scaleCard, LV_SYMBOL_SETTINGS,
-                                COL_TEXT_MUTED, &spoolhard_mont_16);
-    lv_obj_align(gear, LV_ALIGN_RIGHT_MID, 0, 0);
-
-    // ── Printer card (y=76..142, h=66): link dot + status line +
-    //    progress bar + layer/temp detail. Populated by main.cpp's
-    //    periodic refresh via ui_set_printer_panel(). ────────────────
-    s_printer_card = make_card(s_home, 12, 76, 456, 66);
-    lv_obj_set_style_pad_all(s_printer_card, 8, 0);
-
-    s_led_printer = lv_led_create(s_printer_card);
+    // ── Header row ───────────────────────────────────────────────
+    s_led_printer = lv_led_create(s_home);
     lv_led_set_color(s_led_printer, COL_DISCONN);
-    lv_obj_set_size(s_led_printer, 12, 12);
-    lv_obj_align(s_led_printer, LV_ALIGN_TOP_LEFT, 0, 2);
+    lv_obj_set_size(s_led_printer, 14, 14);
+    lv_obj_set_pos(s_led_printer, 12, 16);
     lv_led_off(s_led_printer);
 
-    s_lbl_printer_status = make_label(s_printer_card,
-        "No printers connected", COL_TEXT_MUTED, &spoolhard_mont_16);
-    lv_obj_align(s_lbl_printer_status, LV_ALIGN_TOP_LEFT, 20, 0);
-    lv_obj_set_width(s_lbl_printer_status, 420);
+    // Name: x=32..282 (250 px). Percent "100%" at 36pt is ~90 px wide and
+    // right-aligned at x=468, so it starts at >= 378: no overlap.
+    s_lbl_printer_status = make_label(s_home, "No printer", COL_TEXT, &spoolhard_mont_22);
+    lv_obj_set_pos(s_lbl_printer_status, 32, 10);
+    lv_obj_set_width(s_lbl_printer_status, 250);
     lv_label_set_long_mode(s_lbl_printer_status, LV_LABEL_LONG_DOT);
 
-    s_bar_printer_prog = lv_bar_create(s_printer_card);
-    lv_obj_set_pos(s_bar_printer_prog, 0, 28);
-    lv_obj_set_size(s_bar_printer_prog, 280, 10);
-    lv_obj_set_style_bg_color(s_bar_printer_prog, COL_INPUT, 0);
+    s_lbl_printer_pct = make_label(s_home, "", COL_BRAND, &spoolhard_mont_36);
+    lv_obj_align(s_lbl_printer_pct, LV_ALIGN_TOP_RIGHT, -12, 2);
+    lv_obj_add_flag(s_lbl_printer_pct, LV_OBJ_FLAG_HIDDEN);
+
+    s_bar_printer_prog = lv_bar_create(s_home);
+    lv_obj_set_pos(s_bar_printer_prog, 12, 50);
+    lv_obj_set_size(s_bar_printer_prog, 456, 16);
+    lv_obj_set_style_bg_color(s_bar_printer_prog, COL_BORDER, 0);
     lv_obj_set_style_bg_color(s_bar_printer_prog, COL_BRAND, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(s_bar_printer_prog, 4, 0);
+    lv_obj_set_style_radius(s_bar_printer_prog, 8, 0);
+    lv_obj_set_style_radius(s_bar_printer_prog, 8, LV_PART_INDICATOR);
     lv_bar_set_range(s_bar_printer_prog, 0, 100);
     lv_bar_set_value(s_bar_printer_prog, 0, LV_ANIM_OFF);
     lv_obj_add_flag(s_bar_printer_prog, LV_OBJ_FLAG_HIDDEN);
 
-    s_lbl_printer_detail = make_label(s_printer_card, "",
-                                      COL_TEXT_MUTED, &spoolhard_mont_14);
-    lv_obj_set_pos(s_lbl_printer_detail, 288, 26);
-    lv_obj_set_width(s_lbl_printer_detail, 152);
+    // State/layer (left, <= 250 px: "RUNNING  .  layer 123/456" ~ 25 chars
+    // x ~9.3 px = 232 px) and temps (right, 200 px: "N 255C  B 110C" ~ 16
+    // chars = 150 px).
+    s_lbl_printer_detail = make_label(s_home, "", COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_set_pos(s_lbl_printer_detail, 12, 72);
+    lv_obj_set_width(s_lbl_printer_detail, 250);
     lv_label_set_long_mode(s_lbl_printer_detail, LV_LABEL_LONG_DOT);
 
-    // Reconnect button — only shown when the printer card is rendering
-    // its offline placeholder (see ui_set_printer_panel). Brand-coloured
-    // and large enough to feel like a primary action since it's the
-    // user's only on-device way to nudge a stuck connection. Sits on
-    // the right side of the card, vertically centred — the offline
-    // status text sits on the left and never reaches it. Hidden by
-    // default; toggled visible/invisible from ui_set_printer_panel.
+    s_lbl_printer_temps = make_label(s_home, "", COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_set_pos(s_lbl_printer_temps, 268, 72);
+    lv_obj_set_width(s_lbl_printer_temps, 200);
+    lv_obj_set_style_text_align(s_lbl_printer_temps, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(s_lbl_printer_temps, LV_LABEL_LONG_DOT);
+
+    // Offline card: reddish card with message (left) + Retry (right, 128 x
+    // 44). Card is 456 x 48 so the button has 2 px above/below. Hidden
+    // unless ui_set_printer_panel reports offline / no printer.
+    s_printer_card = make_card(s_home, 12, 44, 456, 48);
+    lv_obj_set_style_pad_all(s_printer_card, 0, 0);
+    lv_obj_set_style_bg_color(s_printer_card, lv_color_hex(0x1a1416), 0);
+    lv_obj_set_style_border_color(s_printer_card, lv_color_hex(0x6b2a30), 0);
+    s_lbl_printer_offline = make_label(s_printer_card, "Printer offline", COL_TEXT, &spoolhard_mont_18);
+    lv_obj_align(s_lbl_printer_offline, LV_ALIGN_LEFT_MID, 12, 0);
+    lv_obj_set_width(s_lbl_printer_offline, 290);
+    lv_label_set_long_mode(s_lbl_printer_offline, LV_LABEL_LONG_DOT);
+
     s_btn_printer_refresh = lv_btn_create(s_printer_card);
-    lv_obj_set_size(s_btn_printer_refresh, 140, 42);
-    lv_obj_align(s_btn_printer_refresh, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_size(s_btn_printer_refresh, 128, 44);
+    lv_obj_align(s_btn_printer_refresh, LV_ALIGN_RIGHT_MID, -2, 0);
     lv_obj_set_style_bg_color(s_btn_printer_refresh, COL_BRAND, 0);
     lv_obj_set_style_bg_opa(s_btn_printer_refresh, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_btn_printer_refresh, 0, 0);
-    lv_obj_set_style_radius(s_btn_printer_refresh, 6, 0);
+    lv_obj_set_style_radius(s_btn_printer_refresh, 8, 0);
     lv_obj_set_style_pad_all(s_btn_printer_refresh, 0, 0);
     lv_obj_t* refresh_lbl = lv_label_create(s_btn_printer_refresh);
-    lv_label_set_text(refresh_lbl, LV_SYMBOL_REFRESH "  Reconnect");
-    lv_obj_set_style_text_color(refresh_lbl, COL_INPUT, 0);
-    lv_obj_set_style_text_font(refresh_lbl, &spoolhard_mont_16, 0);
+    lv_label_set_text(refresh_lbl, LV_SYMBOL_REFRESH "  Retry");
+    lv_obj_set_style_text_color(refresh_lbl, COL_BODY, 0);
+    lv_obj_set_style_text_font(refresh_lbl, &spoolhard_mont_18, 0);
     lv_obj_center(refresh_lbl);
     lv_obj_add_event_cb(s_btn_printer_refresh, [](lv_event_t*) {
         if (s_printer_refresh_cb) s_printer_refresh_cb();
     }, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_flag(s_btn_printer_refresh, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_printer_card, LV_OBJ_FLAG_HIDDEN);
 
-    // ── AMS panel (y=150..282, h=132): bigger tiles, no header —
-    //    the printer card above already carries printer/status. ─────
-    s_ams_panel = make_card(s_home, 12, 150, 456, 132);
-    lv_obj_set_style_pad_all(s_ams_panel, 6, 0);
+    // ── Scale strip (y=96..140, 44 px, tappable) ─────────────────
+    // LED 14 px @x=12, name x=34..154 (120 px, 16pt), weight x=166..336
+    // (22pt; "12345.6789 g" worst case ~165 px), state x=340..444 (16pt,
+    // right-aligned; "uncalibrated" ~112 px).
+    lv_obj_t* scaleCard = make_card(s_home, 12, 96, 456, 44);
+    lv_obj_set_style_pad_all(scaleCard, 0, 0);
+    s_led_scale = lv_led_create(scaleCard);
+    lv_led_set_color(s_led_scale, COL_DISCONN);
+    lv_obj_set_size(s_led_scale, 14, 14);
+    lv_obj_align(s_led_scale, LV_ALIGN_LEFT_MID, 11, 0);
+    lv_led_off(s_led_scale);
+    s_lbl_scale_text = make_label(scaleCard, "Scale", COL_TEXT, &spoolhard_mont_16);
+    lv_obj_set_width(s_lbl_scale_text, 120);
+    lv_label_set_long_mode(s_lbl_scale_text, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_lbl_scale_text, LV_ALIGN_LEFT_MID, 33, 0);
+    s_lbl_weight = make_label(scaleCard, "— g", COL_BRAND, &spoolhard_mont_22);
+    lv_obj_align(s_lbl_weight, LV_ALIGN_LEFT_MID, 165, 0);
+    lv_obj_set_width(s_lbl_weight, 170);
+    lv_label_set_long_mode(s_lbl_weight, LV_LABEL_LONG_CLIP);
+    s_lbl_state = make_label(scaleCard, "waiting", COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_set_width(s_lbl_state, 112);
+    lv_obj_set_style_text_align(s_lbl_state, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(s_lbl_state, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_lbl_state, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_add_flag(scaleCard, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(scaleCard, [](lv_event_t*) {
+        if (s_scale_tap_cb) s_scale_tap_cb();
+    }, LV_EVENT_CLICKED, nullptr);
+
+    // ── Filament tiles (y=144..272) ──────────────────────────────
+    // Transparent container; 5 tiles of 88 x 128 with 4 px gaps.
+    s_ams_panel = lv_obj_create(s_home);
+    lv_obj_set_pos(s_ams_panel, 12, 144);
+    lv_obj_set_size(s_ams_panel, 456, 128);
+    lv_obj_set_style_bg_opa(s_ams_panel, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_ams_panel, 0, 0);
+    lv_obj_set_style_pad_all(s_ams_panel, 0, 0);
+    lv_obj_clear_flag(s_ams_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_ams_panel, LV_OBJ_FLAG_HIDDEN);
 
-    // Kept as a hidden placeholder so existing status-setter calls don't
-    // crash. If we ever need a transient banner inside the AMS panel, we
-    // can un-hide and reposition this one label without another API change.
-    s_lbl_ams_status = make_label(s_ams_panel, "", COL_TEXT_MUTED, &spoolhard_mont_14);
+    // Hint shown in the same area while no printer is connected.
+    s_lbl_ams_empty = make_label(s_home, "Filament slots appear when the printer is connected",
+                                 COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_set_width(s_lbl_ams_empty, 400);
+    lv_obj_set_style_text_align(s_lbl_ams_empty, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lbl_ams_empty, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_lbl_ams_empty, LV_ALIGN_TOP_MID, 0, 188);
+
+    // Kept as a hidden placeholder so existing status-setter calls stay valid.
+    s_lbl_ams_status = make_label(s_ams_panel, "", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_add_flag(s_lbl_ams_status, LV_OBJ_FLAG_HIDDEN);
 
-    // Tile strip — five fixed slots (AMS 1.1..1.4 + Ext), now 87×120:
-    // a tall swatch, a big material/weight pair, and K at the bottom.
-    const int tileW    = 87;
-    const int tileH    = 120;
-    const int tileGapX = 2;
-    const int tileY    = 0;
+    // Tile content area is 84 x 124 (2 px border, constant width so the
+    // active tile doesn't shift its children): swatch 84x40, material 18pt
+    // @y=44, weight 22pt @y=68 (worst "1000 g" ~75 px of 80), K or FEEDING
+    // badge @y=98 (16pt, 19 px line / 22 px badge -> ends y=120 <= 124).
+    const int tileW    = 88;
+    const int tileH    = 128;
+    const int tileGapX = 4;
     int       x        = 0;
     for (int i = 0; i < AMS_TILE_COUNT; ++i) {
         lv_obj_t* tile = lv_obj_create(s_ams_panel);
-        lv_obj_set_pos(tile, x, tileY);
+        lv_obj_set_pos(tile, x, 0);
         lv_obj_set_size(tile, tileW, tileH);
         lv_obj_set_style_bg_color(tile, COL_INPUT, 0);
         lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
         lv_obj_set_style_border_color(tile, COL_BORDER, 0);
-        lv_obj_set_style_border_width(tile, 1, 0);
-        lv_obj_set_style_radius(tile, 6, 0);
+        lv_obj_set_style_border_width(tile, 2, 0);
+        lv_obj_set_style_radius(tile, 8, 0);
         lv_obj_set_style_pad_all(tile, 0, 0);
         lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
         // Tap-to-open the slot detail screen. The slot index rides along as
-        // user_data; the handler extracts it and forwards to the registered
-        // C callback owned by main.cpp (resolves state + SpoolRecord there).
+        // user_data; the handler forwards to the registered C callback owned
+        // by main.cpp (resolves state + SpoolRecord there).
         lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(tile, [](lv_event_t* e) {
             int idx = (int)(intptr_t)lv_event_get_user_data(e);
@@ -385,67 +423,78 @@ static void build_home() {
         }, LV_EVENT_CLICKED, (void*)(intptr_t)i);
         s_ams_tile[i] = tile;
 
-        // Colour swatch strip (top). 36px tall — the dominant visual.
         lv_obj_t* sw = lv_obj_create(tile);
         lv_obj_set_pos(sw, 0, 0);
-        lv_obj_set_size(sw, tileW, 36);
+        lv_obj_set_size(sw, 84, 40);
         lv_obj_set_style_bg_color(sw, COL_INPUT, 0);
         lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(sw, 0, 0);
         lv_obj_set_style_radius(sw, 0, 0);
         lv_obj_set_style_pad_all(sw, 0, 0);
         lv_obj_clear_flag(sw, LV_OBJ_FLAG_SCROLLABLE);
-        // Let clicks on the swatch bubble up to the tile so the entire
-        // card is tappable, not just the body below the swatch.
+        // Let clicks on the swatch bubble up so the whole tile is tappable.
         lv_obj_clear_flag(sw, LV_OBJ_FLAG_CLICKABLE);
         s_ams_swatch[i] = sw;
 
-        s_ams_lbl_tag[i] = make_label(sw, "—", COL_TEXT_MUTED, &spoolhard_mont_14);
-        lv_obj_align(s_ams_lbl_tag[i], LV_ALIGN_LEFT_MID, 4, 0);
+        s_ams_lbl_tag[i] = make_label(sw, "—", COL_TEXT_MUTED, &spoolhard_mont_16);
+        lv_obj_align(s_ams_lbl_tag[i], LV_ALIGN_LEFT_MID, 6, 0);
 
-        // Body — bigger fonts: material 18pt, weight 22pt hero, K 14pt.
         s_ams_lbl_material[i] = make_label(tile, "", COL_TEXT, &spoolhard_mont_18);
-        lv_obj_align(s_ams_lbl_material[i], LV_ALIGN_TOP_LEFT, 6, 40);
+        lv_obj_set_pos(s_ams_lbl_material[i], 4, 44);
+        lv_obj_set_width(s_ams_lbl_material[i], 78);
+        lv_label_set_long_mode(s_ams_lbl_material[i], LV_LABEL_LONG_DOT);
         s_ams_lbl_weight[i]   = make_label(tile, "", COL_BRAND, &spoolhard_mont_22);
-        lv_obj_align(s_ams_lbl_weight[i], LV_ALIGN_TOP_LEFT, 6, 62);
-        s_ams_lbl_k[i]        = make_label(tile, "", COL_TEXT_MUTED, &spoolhard_mont_14);
-        lv_obj_align(s_ams_lbl_k[i], LV_ALIGN_TOP_LEFT, 6, 96);
+        lv_obj_set_pos(s_ams_lbl_weight[i], 4, 68);
+        lv_obj_set_width(s_ams_lbl_weight[i], 80);
+        lv_label_set_long_mode(s_ams_lbl_weight[i], LV_LABEL_LONG_CLIP);
+        s_ams_lbl_k[i]        = make_label(tile, "", COL_TEXT_MUTED, &spoolhard_mont_16);
+        lv_obj_set_pos(s_ams_lbl_k[i], 4, 98);
+        lv_obj_set_width(s_ams_lbl_k[i], 80);
+        lv_label_set_long_mode(s_ams_lbl_k[i], LV_LABEL_LONG_CLIP);
+
+        // "FEEDING" badge for the active tray (replaces the K line).
+        lv_obj_t* badge = lv_obj_create(tile);
+        lv_obj_set_pos(badge, 1, 98);
+        lv_obj_set_size(badge, 82, 22);
+        lv_obj_set_style_bg_color(badge, COL_BRAND, 0);
+        lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(badge, 0, 0);
+        lv_obj_set_style_radius(badge, 4, 0);
+        lv_obj_set_style_pad_all(badge, 0, 0);
+        lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(badge, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* bl = make_label(badge, "FEEDING", COL_BODY, &spoolhard_mont_16);
+        lv_obj_center(bl);
+        lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+        s_ams_badge[i] = badge;
 
         x += tileW + tileGapX;
     }
 
-    // ── Footer row: hostname (left) / version (centre) / IP (right) ─
-    // Hostname and IP are driven by the periodic WiFi state — mDNS and
-    // DHCP respectively — via ui_set_hostname() / ui_set_ip(). Version is
-    // static so we bake it straight in here.
-    //
-    // The hostname line is actually two labels: a coloured WiFi glyph
-    // whose tint reflects link state (green/yellow/orange/grey), and the
-    // hostname text in plain white right after it.
+    // ── Footer row (labels at y~289..308) ────────────────────────
+    // WiFi glyph + hostname (<=140 px) left, gear + version centre
+    // (~110 px, x~185..295), IP right (~140 px, x~328..468).
     s_lbl_wifi_icon = make_label(s_home, LV_SYMBOL_WIFI,
-                                 COL_TEXT_MUTED, &spoolhard_mont_14);
-    lv_obj_align(s_lbl_wifi_icon, LV_ALIGN_BOTTOM_LEFT, 12, -6);
-    s_lbl_hostname = make_label(s_home, "—",
-                                COL_TEXT, &spoolhard_mont_14);
+                                 COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_align(s_lbl_wifi_icon, LV_ALIGN_BOTTOM_LEFT, 12, -12);
+    s_lbl_hostname = make_label(s_home, "—", COL_TEXT, &spoolhard_mont_16);
+    lv_obj_set_width(s_lbl_hostname, 140);
+    lv_label_set_long_mode(s_lbl_hostname, LV_LABEL_LONG_DOT);
     lv_obj_align_to(s_lbl_hostname, s_lbl_wifi_icon,
                     LV_ALIGN_OUT_RIGHT_MID, 8, 0);
 
-    // Gear glyph prefix hints that the footer is tappable → device config.
     lv_obj_t* foot = make_label(s_home, LV_SYMBOL_SETTINGS "  V " FW_VERSION,
-                                COL_TEXT_MUTED, &spoolhard_mont_14);
-    lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -6);
+                                COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -12);
 
-    s_lbl_ip = make_label(s_home, "—", COL_TEXT, &spoolhard_mont_14);
-    lv_obj_align(s_lbl_ip, LV_ALIGN_BOTTOM_RIGHT, -12, -6);
+    s_lbl_ip = make_label(s_home, "—", COL_TEXT, &spoolhard_mont_16);
+    lv_obj_align(s_lbl_ip, LV_ALIGN_BOTTOM_RIGHT, -12, -12);
 
-    // Transparent hit-strip across the whole footer. Created BEFORE the OTA
-    // banner below so the banner (when an update is pending) sits on top and
-    // keeps its own tap behaviour; when the banner is hidden this strip
-    // receives footer taps and opens device-config. The footer labels under
-    // it aren't clickable, so there's no tap conflict.
+    // Transparent hit-strip across the footer (44 px). Created BEFORE the OTA
+    // banner so the banner sits on top while visible.
     s_footer_hit = lv_obj_create(s_home);
-    lv_obj_set_pos(s_footer_hit, 0, 284);
-    lv_obj_set_size(s_footer_hit, 480, 36);
+    lv_obj_set_pos(s_footer_hit, 0, 276);
+    lv_obj_set_size(s_footer_hit, 480, 44);
     lv_obj_set_style_bg_opa(s_footer_hit, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_footer_hit, 0, 0);
     lv_obj_set_style_pad_all(s_footer_hit, 0, 0);
@@ -455,12 +504,12 @@ static void build_home() {
         if (s_devcfg_open_cb) s_devcfg_open_cb();
     }, LV_EVENT_CLICKED, nullptr);
 
-    // Developer-Mode warning triangle (hidden until a printer reports it),
-    // left of the centred version text. Created after the footer hit-strip
-    // so its own tap wins; the OTA banner below still covers it.
+    // Developer-Mode warning triangle in the header row (x=292..312, between
+    // the name (ends x=282) and the percent (starts >= x=378)). 14 px extra
+    // click area -> ~48 px target. Hidden until a printer reports it.
     s_lbl_devmode_icon = make_label(s_home, LV_SYMBOL_WARNING,
-                                    lv_color_hex(0xfacc15), &spoolhard_mont_16);
-    lv_obj_align(s_lbl_devmode_icon, LV_ALIGN_BOTTOM_MID, -110, -4);
+                                    lv_color_hex(0xfacc15), &spoolhard_mont_18);
+    lv_obj_set_pos(s_lbl_devmode_icon, 292, 14);
     lv_obj_add_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(s_lbl_devmode_icon, 14);
@@ -468,30 +517,30 @@ static void build_home() {
         if (s_devmode_panel) lv_obj_clear_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
     }, LV_EVENT_CLICKED, nullptr);
 
-    // OTA banner — hidden until main.cpp asks us to show it. Sits across
-    // the bottom of the screen, OVER the footer text (which becomes
-    // less important the moment there's an update to apply). Brand-amber
-    // background so the user can't miss it from across the room.
+    // OTA banner: full-width 44 px amber strip over the footer.
     s_ota_banner = lv_obj_create(s_home);
-    lv_obj_set_pos(s_ota_banner, 0, 286);
-    lv_obj_set_size(s_ota_banner, 480, 34);
+    lv_obj_set_pos(s_ota_banner, 0, 276);
+    lv_obj_set_size(s_ota_banner, 480, 44);
     lv_obj_set_style_radius(s_ota_banner, 0, 0);
     lv_obj_set_style_bg_color(s_ota_banner, COL_BRAND, 0);
     lv_obj_set_style_bg_opa(s_ota_banner, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_ota_banner, 0, 0);
     lv_obj_set_style_pad_all(s_ota_banner, 0, 0);
+    lv_obj_clear_flag(s_ota_banner, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_ota_banner, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(s_ota_banner, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_ota_banner, [](lv_event_t*) {
         if (s_ota_banner_cb) s_ota_banner_cb();
     }, LV_EVENT_CLICKED, nullptr);
 
-    s_ota_banner_label = make_label(s_ota_banner, "", COL_BODY, &spoolhard_mont_16);
+    s_ota_banner_label = make_label(s_ota_banner, "", COL_BODY, &spoolhard_mont_18);
+    lv_obj_set_width(s_ota_banner_label, 456);
+    lv_obj_set_style_text_align(s_ota_banner_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_ota_banner_label, LV_LABEL_LONG_DOT);
     lv_obj_center(s_ota_banner_label);
 
-    // Developer-Mode explanation: a card over the AMS area, tap anywhere on
-    // it to dismiss. Created last so it sits on top.
-    s_devmode_panel = make_card(s_home, 12, 150, 456, 96);
+    // Developer-Mode explanation: a card over the tile area, tap to dismiss.
+    s_devmode_panel = make_card(s_home, 12, 144, 456, 96);
     lv_obj_set_style_border_color(s_devmode_panel, lv_color_hex(0xfacc15), 0);
     lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_CLICKABLE);
@@ -552,42 +601,44 @@ static void build_spool() {
 
     s_lbl_spool_title = make_label(s_spool, "Spool", COL_TEXT, &spoolhard_mont_22);
     lv_obj_set_pos(s_lbl_spool_title, 54, 12);
-    s_lbl_spool_subtitle = make_label(s_spool, "", COL_TEXT_MUTED, &spoolhard_mont_14);
+    s_lbl_spool_subtitle = make_label(s_spool, "", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_pos(s_lbl_spool_subtitle, 54, 36);
     lv_obj_set_width(s_lbl_spool_subtitle, 414);
     lv_label_set_long_mode(s_lbl_spool_subtitle, LV_LABEL_LONG_DOT);
 
     // Weight card (left): big current weight + small trio
     lv_obj_t* wCard = make_card(s_spool, 12, 56, 280, 118);
-    make_label(wCard, "Current", COL_TEXT_MUTED, &spoolhard_mont_14);
+    make_label(wCard, "Current", COL_TEXT_MUTED, &spoolhard_mont_16);
     s_lbl_spool_current = make_label(wCard, "— g", COL_BRAND, &spoolhard_mont_36);
     lv_obj_align(s_lbl_spool_current, LV_ALIGN_CENTER, 0, -8);
-    s_lbl_spool_since = make_label(wCard, "", COL_TEXT_MUTED, &spoolhard_mont_14);
+    s_lbl_spool_since = make_label(wCard, "", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(s_lbl_spool_since, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
     // Detail card (right): advertised / core / new
     lv_obj_t* dCard = make_card(s_spool, 300, 56, 168, 118);
-    make_label(dCard, "Advertised",   COL_TEXT_MUTED, &spoolhard_mont_14);
+    make_label(dCard, "Advertised",   COL_TEXT_MUTED, &spoolhard_mont_16);
     s_lbl_spool_advert = make_label(dCard, "—", COL_TEXT, &spoolhard_mont_16);
     lv_obj_align(s_lbl_spool_advert, LV_ALIGN_TOP_RIGHT, 0, 0);
 
-    lv_obj_t* lblCore = make_label(dCard, "Empty core", COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_t* lblCore = make_label(dCard, "Empty core", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(lblCore, LV_ALIGN_TOP_LEFT, 0, 32);
     s_lbl_spool_core = make_label(dCard, "—", COL_TEXT, &spoolhard_mont_16);
     lv_obj_align(s_lbl_spool_core, LV_ALIGN_TOP_RIGHT, 0, 32);
 
-    lv_obj_t* lblNew = make_label(dCard, "New",         COL_TEXT_MUTED, &spoolhard_mont_14);
+    lv_obj_t* lblNew = make_label(dCard, "New",         COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(lblNew, LV_ALIGN_TOP_LEFT, 0, 64);
     s_lbl_spool_new = make_label(dCard, "—", COL_TEXT, &spoolhard_mont_16);
     lv_obj_align(s_lbl_spool_new, LV_ALIGN_TOP_RIGHT, 0, 64);
 
     // Live scale readout strip
-    s_lbl_spool_scale = make_label(s_spool, "Scale: --", COL_TEXT_MUTED, &spoolhard_mont_14);
+    s_lbl_spool_scale = make_label(s_spool, "Scale: --", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_pos(s_lbl_spool_scale, 12, 180);
+    lv_obj_set_width(s_lbl_spool_scale, 204);
+    lv_label_set_long_mode(s_lbl_spool_scale, LV_LABEL_LONG_DOT);
 
     // AMS auto-assignment status (right of the scale label). Hidden until
     // the PendingAms latch arms it on a tag scan.
-    s_lbl_spool_ams = make_label(s_spool, "", COL_BRAND, &spoolhard_mont_14);
+    s_lbl_spool_ams = make_label(s_spool, "", COL_BRAND, &spoolhard_mont_16);
     lv_obj_set_pos(s_lbl_spool_ams, 220, 180);
     lv_obj_set_width(s_lbl_spool_ams, 248);
     lv_label_set_long_mode(s_lbl_spool_ams, LV_LABEL_LONG_DOT);
@@ -779,24 +830,24 @@ static void build_weight_confirm() {
 
     lv_obj_t* sub = make_label(s_weight_confirm,
         "Filament-only — empty core already subtracted",
-        COL_TEXT_MUTED, &spoolhard_mont_14);
+        COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_pos(sub, 12, 44);
 
     // Two side-by-side cards: existing on the left, new on the right.
     lv_obj_t* lCard = make_card(s_weight_confirm,  18, 80, 218, 130);
-    make_label(lCard, "Existing", COL_TEXT_MUTED, &spoolhard_mont_14);
+    make_label(lCard, "Existing", COL_TEXT_MUTED, &spoolhard_mont_16);
     s_lbl_wc_existing = make_label(lCard, "— g", COL_TEXT, &spoolhard_mont_36);
     lv_obj_align(s_lbl_wc_existing, LV_ALIGN_CENTER, 0, 4);
 
     lv_obj_t* rCard = make_card(s_weight_confirm, 244, 80, 218, 130);
-    make_label(rCard, "New", COL_TEXT_MUTED, &spoolhard_mont_14);
+    make_label(rCard, "New", COL_TEXT_MUTED, &spoolhard_mont_16);
     s_lbl_wc_new = make_label(rCard, "— g", COL_BRAND, &spoolhard_mont_36);
     lv_obj_align(s_lbl_wc_new, LV_ALIGN_CENTER, 0, 4);
 
     // Warning (no-core case). Hidden when a real number is shown.
     s_lbl_wc_warn = make_label(s_weight_confirm,
         "Capture an empty spool first so we can subtract the core.",
-        COL_TEXT_MUTED, &spoolhard_mont_14);
+        COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_pos(s_lbl_wc_warn, 18, 218);
     lv_obj_set_width(s_lbl_wc_warn, 444);
     lv_label_set_long_mode(s_lbl_wc_warn, LV_LABEL_LONG_WRAP);
@@ -962,7 +1013,7 @@ static void devcfg_select_tab(bool settings) {
 static lv_obj_t* devcfg_header_btn(const char* text, int w, lv_event_cb_t cb,
                                    bool primary) {
     lv_obj_t* b = lv_btn_create(s_devcfg);
-    lv_obj_set_size(b, w, 34);
+    lv_obj_set_size(b, w, 44);
     lv_obj_set_style_radius(b, 8, 0);
     lv_obj_set_style_bg_color(b, primary ? COL_BRAND : COL_CARD, 0);
     lv_obj_set_style_border_color(b, COL_TEXT_MUTED, 0);
@@ -1006,17 +1057,17 @@ static void build_devcfg() {
     s_btn_devcfg_tab_set = devcfg_header_btn("Settings", 92, [](lv_event_t*) {
         lv_lock(); devcfg_select_tab(true); lv_unlock();
     }, true);
-    lv_obj_align(s_btn_devcfg_tab_set, LV_ALIGN_TOP_MID, -48, 8);
+    lv_obj_align(s_btn_devcfg_tab_set, LV_ALIGN_TOP_MID, -48, 4);
 
     s_btn_devcfg_tab_info = devcfg_header_btn("Info", 70, [](lv_event_t*) {
         lv_lock(); devcfg_select_tab(false); lv_unlock();
     }, false);
-    lv_obj_align(s_btn_devcfg_tab_info, LV_ALIGN_TOP_MID, 52, 8);
+    lv_obj_align(s_btn_devcfg_tab_info, LV_ALIGN_TOP_MID, 52, 4);
 
-    lv_obj_t* closeBtn = devcfg_header_btn(LV_SYMBOL_CLOSE, 48, [](lv_event_t*) {
+    lv_obj_t* closeBtn = devcfg_header_btn(LV_SYMBOL_CLOSE, 56, [](lv_event_t*) {
         ui_show_home();
     }, false);
-    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -12, 8);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -12, 4);
 
     // ── Settings container ──────────────────────────────────
     s_devcfg_set_cont = lv_obj_create(s_devcfg);
@@ -1028,10 +1079,10 @@ static void build_devcfg() {
     lv_obj_clear_flag(s_devcfg_set_cont, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t* sleepLbl = make_label(s_devcfg_set_cont, "Sleep after",
-                                    COL_TEXT_MUTED, &spoolhard_mont_14);
+                                    COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(sleepLbl, LV_ALIGN_TOP_LEFT, 0, 0);
     s_lbl_devcfg_sleep_cur = make_label(s_devcfg_set_cont, "",
-                                        COL_TEXT_MUTED, &spoolhard_mont_14);
+                                        COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(s_lbl_devcfg_sleep_cur, LV_ALIGN_TOP_RIGHT, 0, 0);
 
     // Six preset chips in one row across the 456px content width.
@@ -1048,14 +1099,14 @@ static void build_devcfg() {
             uint32_t secs = (uint32_t)(intptr_t)lv_event_get_user_data(e);
             if (s_devcfg_sleep_cb) s_devcfg_sleep_cb(secs);
         }, LV_EVENT_CLICKED, (void*)(intptr_t)s_devcfg_sleep_presets[i]);
-        lv_obj_t* l = make_label(chip, s_devcfg_sleep_labels[i], COL_TEXT, &spoolhard_mont_14);
+        lv_obj_t* l = make_label(chip, s_devcfg_sleep_labels[i], COL_TEXT, &spoolhard_mont_16);
         lv_obj_center(l);
         s_devcfg_sleep_chip[i] = chip;
     }
 
     // OTA status line.
     s_lbl_devcfg_status = make_label(s_devcfg_set_cont, "",
-                                     COL_TEXT_MUTED, &spoolhard_mont_14);
+                                     COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(s_lbl_devcfg_status, LV_ALIGN_TOP_LEFT, 0, 72);
     lv_obj_set_width(s_lbl_devcfg_status, 456);
     lv_label_set_long_mode(s_lbl_devcfg_status, LV_LABEL_LONG_DOT);
@@ -1121,7 +1172,7 @@ static void build_slot_detail() {
     lv_obj_set_width(s_slot_title, 380);
     lv_label_set_long_mode(s_slot_title, LV_LABEL_LONG_DOT);
 
-    s_slot_subtitle = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_14);
+    s_slot_subtitle = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(s_slot_subtitle, LV_ALIGN_TOP_LEFT, 12, 38);
     lv_obj_set_width(s_slot_subtitle, 380);
     lv_label_set_long_mode(s_slot_subtitle, LV_LABEL_LONG_DOT);
@@ -1130,8 +1181,8 @@ static void build_slot_detail() {
     // stands out against the screen's darker body colour — COL_INPUT looked
     // dark-on-dark from a normal viewing distance.
     lv_obj_t* closeBtn = lv_btn_create(s_slot);
-    lv_obj_set_size(closeBtn, 48, 34);
-    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -12, 8);
+    lv_obj_set_size(closeBtn, 64, 46);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -12, 6);
     lv_obj_set_style_radius(closeBtn, 8, 0);
     lv_obj_set_style_bg_color(closeBtn, COL_CARD, 0);
     lv_obj_set_style_border_color(closeBtn, COL_TEXT_MUTED, 0);
@@ -1160,7 +1211,7 @@ static void build_slot_detail() {
                                     COL_BRAND, &spoolhard_mont_36);
     lv_obj_align(s_slot_weight_hero, LV_ALIGN_TOP_LEFT, 12, 178);
     s_slot_weight_sub = make_label(s_slot, "",
-                                   COL_TEXT_MUTED, &spoolhard_mont_14);
+                                   COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(s_slot_weight_sub, LV_ALIGN_TOP_LEFT, 12, 224);
     lv_obj_set_width(s_slot_weight_sub, 140);
     lv_label_set_long_mode(s_slot_weight_sub, LV_LABEL_LONG_WRAP);
@@ -1189,8 +1240,8 @@ static void build_slot_detail() {
     // the LCD. Hidden by ui_show_slot_detail when no spool is mapped to
     // the slot (firmware import helper would 409 anyway).
     s_slot_import_btn = lv_btn_create(s_slot);
-    lv_obj_set_pos(s_slot_import_btn, 164, 246);
-    lv_obj_set_size(s_slot_import_btn, 130, 36);
+    lv_obj_set_pos(s_slot_import_btn, 164, 244);
+    lv_obj_set_size(s_slot_import_btn, 140, 46);
     lv_obj_set_style_radius(s_slot_import_btn, 8, 0);
     lv_obj_set_style_bg_color(s_slot_import_btn, COL_INPUT, 0);
     lv_obj_set_style_border_color(s_slot_import_btn, COL_TEXT_MUTED, 0);
@@ -1201,19 +1252,19 @@ static void build_slot_detail() {
     lv_obj_t* importLbl = lv_label_create(s_slot_import_btn);
     lv_label_set_text(importLbl, LV_SYMBOL_DOWNLOAD "  Import");
     lv_obj_set_style_text_color(importLbl, COL_TEXT, 0);
-    lv_obj_set_style_text_font(importLbl, &spoolhard_mont_14, 0);
+    lv_obj_set_style_text_font(importLbl, &spoolhard_mont_16, 0);
     lv_obj_center(importLbl);
 
     // Notice text to the right of the button — populated by
     // ui_slot_detail_set_import_notice from main.cpp after the helper
     // runs. Two-line wrap so "Imported 4 fields: …" can spell out which.
-    s_slot_import_notice = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_14);
-    lv_obj_align(s_slot_import_notice, LV_ALIGN_TOP_LEFT, 304, 252);
-    lv_obj_set_size(s_slot_import_notice, 164, 32);
+    s_slot_import_notice = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_align(s_slot_import_notice, LV_ALIGN_TOP_LEFT, 312, 246);
+    lv_obj_set_size(s_slot_import_notice, 156, 40);
     lv_label_set_long_mode(s_slot_import_notice, LV_LABEL_LONG_WRAP);
 
     // Note line at the very bottom, spans full width.
-    s_slot_note = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_14);
+    s_slot_note = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(s_slot_note, LV_ALIGN_BOTTOM_LEFT, 12, -8);
     lv_obj_set_width(s_slot_note, 456);
     lv_label_set_long_mode(s_slot_note, LV_LABEL_LONG_DOT);
@@ -1263,8 +1314,8 @@ static void build_scale_settings() {
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 10);
 
     lv_obj_t* closeBtn = lv_btn_create(s_scale_set);
-    lv_obj_set_size(closeBtn, 48, 34);
-    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -12, 8);
+    lv_obj_set_size(closeBtn, 64, 46);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -12, 6);
     lv_obj_set_style_radius(closeBtn, 8, 0);
     lv_obj_set_style_bg_color(closeBtn, COL_CARD, 0);
     lv_obj_set_style_border_color(closeBtn, COL_TEXT_MUTED, 0);
@@ -1289,7 +1340,7 @@ static void build_scale_settings() {
 
     // Calibration status line.
     s_lbl_scaleset_status = make_label(s_scale_set, "Calibration: —",
-                                       COL_TEXT_MUTED, &spoolhard_mont_14);
+                                       COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(s_lbl_scaleset_status, LV_ALIGN_TOP_LEFT, 12, 164);
 
     // Three action buttons (Tare / Add point / Clear) in one row.
@@ -1319,10 +1370,10 @@ static void build_scale_settings() {
     lv_obj_t* hint = make_label(s_scale_set,
         "Tare with empty scale. Add point with a known weight. "
         "Clear wipes calibration.",
-        COL_TEXT_MUTED, &spoolhard_mont_14);
+        COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_width(hint, 456);
     lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 12, -8);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_DOT);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
 }
 
 // Step 1 — pick a known reference weight from the configured presets.
@@ -1336,9 +1387,9 @@ static void build_calwiz_pick() {
     lv_obj_align(s_lbl_calwiz_pick_title, LV_ALIGN_TOP_LEFT, 12, 10);
 
     lv_obj_t* cancel = make_text_btn(s_calwiz_pick, "Cancel", false,
-                                     368, 8, 100, 34);
+                                     358, 6, 110, 44);
     lv_obj_set_style_text_font(lv_obj_get_child(cancel, 0),
-                               &spoolhard_mont_14, 0);
+                               &spoolhard_mont_16, 0);
     lv_obj_add_event_cb(cancel, [](lv_event_t*) { ui_show_scale_settings(); },
                         LV_EVENT_CLICKED, nullptr);
 
@@ -1407,9 +1458,9 @@ static void build_calwiz_capture() {
     lv_obj_align(s_lbl_calwiz_capture_title, LV_ALIGN_TOP_LEFT, 12, 10);
 
     lv_obj_t* cancel = make_text_btn(s_calwiz_capture, "Cancel", false,
-                                     368, 8, 100, 34);
+                                     358, 6, 110, 44);
     lv_obj_set_style_text_font(lv_obj_get_child(cancel, 0),
-                               &spoolhard_mont_14, 0);
+                               &spoolhard_mont_16, 0);
     lv_obj_add_event_cb(cancel, [](lv_event_t*) { ui_show_scale_settings(); },
                         LV_EVENT_CLICKED, nullptr);
 
@@ -1437,7 +1488,7 @@ static void build_calwiz_capture() {
     // Helper line right under the card.
     lv_obj_t* help = make_label(s_calwiz_capture,
         "Wait for stable, then tap Capture",
-        COL_TEXT_MUTED, &spoolhard_mont_14);
+        COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(help, LV_ALIGN_TOP_LEFT, 12, 208);
 
     // Back + Capture buttons.
@@ -1483,7 +1534,7 @@ static void build_calwiz_done() {
     lv_obj_t* hint = make_label(s_calwiz_done,
         "Add more points for a more accurate curve, "
         "or finish to return to Scale settings.",
-        COL_TEXT_MUTED, &spoolhard_mont_14);
+        COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_set_width(hint, 456);
     lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 12, 144);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
@@ -1688,7 +1739,7 @@ void ui_set_scale_state(scale_lcd_state_t state, const char* scale_name) {
     if (s_lbl_scale_text) {
         const bool has_name = scale_name && *scale_name;
         lv_label_set_long_mode(s_lbl_scale_text, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(s_lbl_scale_text, 118);
+        lv_obj_set_width(s_lbl_scale_text, 120);
         lv_label_set_text(s_lbl_scale_text, has_name ? scale_name : "No scale");
     }
     lv_unlock();
@@ -1874,65 +1925,63 @@ void ui_set_printer_panel(const UiPrinterSnapshot* snap) {
     lv_lock();
 
     if (!snap || !snap->connected) {
-        // Placeholder: red LED, muted "no printer" line, hide bar/detail,
-        // SHOW the Reconnect button — it's the only on-device path to
-        // nudge a stuck MQTT connect, so it gets prime real estate
-        // exactly while the user has reason to want it.
+        // Offline / none: red LED, offline card with a 44 px Retry button
+        // (the only on-device path to nudge a stuck MQTT connect); bar,
+        // percent, state and temps rows are hidden underneath.
         lv_led_set_color(s_led_printer, COL_DISCONN);
         lv_led_off(s_led_printer);
-        lv_obj_set_style_text_color(s_lbl_printer_status, COL_TEXT_MUTED, 0);
         lv_label_set_text(s_lbl_printer_status,
-                          snap ? "Printer offline" : "No printer");
+                          (snap && snap->name[0]) ? snap->name : "No printer");
+        lv_label_set_text(s_lbl_printer_offline,
+                          snap ? "Printer offline - retrying" : "No printer connected");
         lv_obj_add_flag(s_bar_printer_prog, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_lbl_printer_pct, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(s_lbl_printer_detail, "");
-        if (s_btn_printer_refresh) lv_obj_clear_flag(s_btn_printer_refresh, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_lbl_printer_temps, "");
+        lv_obj_clear_flag(s_printer_card, LV_OBJ_FLAG_HIDDEN);
         lv_unlock();
         return;
     }
 
     lv_led_set_color(s_led_printer, COL_CONNECTED);
     lv_led_on(s_led_printer);
-    if (s_btn_printer_refresh) lv_obj_add_flag(s_btn_printer_refresh, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_printer_card, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_lbl_printer_status, snap->name);
 
-    // Status line: name + state + temps (one row, dot-truncated). Temps
-    // appear inline so they're visible even when the progress bar is
-    // hidden (IDLE / FINISH). Using LV_SYMBOL_CHARGE for the "running"
-    // state would be nice but we only have the FA symbols we compiled in.
-    char status[96];
-    const bool have_temps = snap->has_temps;
-    if (snap->gcode_state[0]) {
-        if (have_temps) {
-            snprintf(status, sizeof(status),
-                     "%s  " LV_SYMBOL_BULLET "  %s  " LV_SYMBOL_BULLET
-                     "  N %.0f" "\xC2\xB0" "C  " LV_SYMBOL_BULLET "  B %.0f" "\xC2\xB0" "C",
-                     snap->name, snap->gcode_state,
-                     snap->nozzle_temp, snap->bed_temp);
-        } else {
-            snprintf(status, sizeof(status), "%s  " LV_SYMBOL_BULLET "  %s",
-                     snap->name, snap->gcode_state);
-        }
+    // State + layer (left) and temps (right) on one 16pt row.
+    char det[48];
+    const bool have_layers = snap->layer_num >= 0 && snap->total_layers > 0;
+    if (snap->gcode_state[0] && have_layers) {
+        snprintf(det, sizeof(det), "%s  " LV_SYMBOL_BULLET "  layer %d/%d",
+                 snap->gcode_state, snap->layer_num, snap->total_layers);
+    } else if (snap->gcode_state[0]) {
+        snprintf(det, sizeof(det), "%s", snap->gcode_state);
     } else {
-        snprintf(status, sizeof(status), "%s", snap->name);
+        det[0] = 0;
     }
-    lv_obj_set_style_text_color(s_lbl_printer_status, COL_TEXT, 0);
-    lv_label_set_text(s_lbl_printer_status, status);
+    lv_label_set_text(s_lbl_printer_detail, det);
 
-    // Progress bar + layer detail only while there's something to report.
+    if (snap->has_temps) {
+        char tb[40];
+        snprintf(tb, sizeof(tb), "N %.0f" "\xC2\xB0" "C  B %.0f" "\xC2\xB0" "C",
+                 snap->nozzle_temp, snap->bed_temp);
+        lv_label_set_text(s_lbl_printer_temps, tb);
+    } else {
+        lv_label_set_text(s_lbl_printer_temps, "");
+    }
+
+    // Big percent + 16 px bar only while there's progress to report.
     const bool printing = snap->progress_pct >= 0;
     if (printing) {
+        char pb[8];
+        snprintf(pb, sizeof(pb), "%d%%", snap->progress_pct);
+        lv_label_set_text(s_lbl_printer_pct, pb);
+        lv_obj_clear_flag(s_lbl_printer_pct, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_bar_printer_prog, LV_OBJ_FLAG_HIDDEN);
         lv_bar_set_value(s_bar_printer_prog, snap->progress_pct, LV_ANIM_OFF);
-        char det[48];
-        if (snap->layer_num >= 0 && snap->total_layers > 0) {
-            snprintf(det, sizeof(det), "%d%%  " LV_SYMBOL_BULLET "  layer %d/%d",
-                     snap->progress_pct, snap->layer_num, snap->total_layers);
-        } else {
-            snprintf(det, sizeof(det), "%d%%", snap->progress_pct);
-        }
-        lv_label_set_text(s_lbl_printer_detail, det);
     } else {
+        lv_obj_add_flag(s_lbl_printer_pct, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_bar_printer_prog, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_lbl_printer_detail, "");
     }
 
     lv_unlock();
@@ -1961,10 +2010,12 @@ void ui_set_ams_panel(const char* status, const UiAmsSlot* slots) {
     const bool show = status && *status;
     if (!show) {
         lv_obj_add_flag(s_ams_panel, LV_OBJ_FLAG_HIDDEN);
+        if (s_lbl_ams_empty) lv_obj_clear_flag(s_lbl_ams_empty, LV_OBJ_FLAG_HIDDEN);
         lv_unlock();
         return;
     }
     lv_obj_clear_flag(s_ams_panel, LV_OBJ_FLAG_HIDDEN);
+    if (s_lbl_ams_empty) lv_obj_add_flag(s_lbl_ams_empty, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(s_lbl_ams_status, status);
 
     for (int i = 0; i < AMS_TILE_COUNT; ++i) {
@@ -1977,7 +2028,8 @@ void ui_set_ams_panel(const char* status, const UiAmsSlot* slots) {
             s_ams_tile[i],
             (s && s->active) ? COL_BRAND : COL_BORDER,
             0);
-        lv_obj_set_style_border_width(s_ams_tile[i], (s && s->active) ? 2 : 1, 0);
+        // Border width stays constant (2) so children don't shift; the
+        // FEEDING badge below is the non-colour cue for the active tray.
 
         // Swatch colour + tag text colour.
         uint32_t rgb = occupied ? (s->color_rgb ? s->color_rgb : 0x303540) : 0x1a1d27;
@@ -2005,6 +2057,16 @@ void ui_set_ams_panel(const char* status, const UiAmsSlot* slots) {
         if (occupied && s->k > 0.f) snprintf(kbuf, sizeof(kbuf), "K %.3f", (double)s->k);
         else                        kbuf[0] = 0;
         lv_label_set_text(s_ams_lbl_k[i], kbuf);
+
+        // FEEDING badge replaces the K line on the active tray.
+        const bool feeding = s && s->active;
+        if (feeding) {
+            lv_obj_clear_flag(s_ams_badge[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_ams_lbl_k[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_ams_badge[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_ams_lbl_k[i], LV_OBJ_FLAG_HIDDEN);
+        }
     }
     lv_unlock();
 }
@@ -2400,13 +2462,13 @@ static void _slot_row(const char* key, const char* value) {
     lv_obj_t* k = lv_label_create(row);
     lv_label_set_text(k, key);
     lv_obj_set_style_text_color(k, COL_TEXT_MUTED, 0);
-    lv_obj_set_style_text_font(k, &spoolhard_mont_14, 0);
-    lv_obj_set_width(k, 100);
+    lv_obj_set_style_text_font(k, &spoolhard_mont_16, 0);
+    lv_obj_set_width(k, 118);
 
     lv_obj_t* v = lv_label_create(row);
     lv_label_set_text(v, value && *value ? value : "—");
     lv_obj_set_style_text_color(v, COL_TEXT, 0);
-    lv_obj_set_style_text_font(v, &spoolhard_mont_14, 0);
+    lv_obj_set_style_text_font(v, &spoolhard_mont_16, 0);
     lv_obj_set_flex_grow(v, 1);
     lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
 }

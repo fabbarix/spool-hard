@@ -438,3 +438,23 @@ pick calls `BambuPrinter::claimPendingExplicit()` — the same validate+queue
 function behind `POST /api/printers/<serial>/claim-pending`; the MQTT publish
 still happens on loopTask via `_maybeAssignPendingSpool`. LVGL callbacks run
 on the `lvgl` task, so they must only validate/queue, never publish or block.
+
+## Console LCD design rules (480x320, `console/firmware/src/ui/`)
+
+Printer-first home: header (LED + printer name 22pt + big 36pt percent),
+16 px progress bar, state/layer + temps row, a 44 px tappable scale strip
+(opens scale settings), five 88x128 filament tiles (AMS 1.1-1.4 + Ext; the
+active tray shows a **FEEDING** badge in place of the K line), 44 px footer
+(host / version / IP, tap -> device config). Offline / no printer: a red
+card at y=44..92 with message + 44 px **Retry** button (reconnect all +
+re-probe) replaces bar/state rows; the tile area shows a hint. The OTA banner
+is a 44 px amber strip over the footer.
+
+Rules for any new LCD UI: text >= 16pt (fonts shipped: 16/18/22/28/36; no
+new sizes needed so far — `console/scripts/build_fonts.sh` has them);
+`COL_TEXT_MUTED` is `0x94a3b8` (>= 5.75:1 on every surface, 6.56:1 on
+`COL_CARD`; the old `0x64748b` was 3.5:1 and fails AA); touch targets >= 44 px
+(destination slots/External >= 64 px); keep tile border width constant so
+children don't shift; set a label's width BEFORE `lv_obj_align` on
+right/mid alignments. Debug: `GET /api/debug/lcd.bmp`, `POST
+/api/debug/lcd/touch` (see lcd_debug toggle).
