@@ -196,6 +196,22 @@ the headers are `#include`d).
   ring-log tail file exists, it's promoted to `/crash_<seq>.txt`. The
   pending file is rewritten every 120 s during normal operation (skipped when the ring is unchanged; `PanicPersist::pause()/resume()` suspend it). Each
   product registers its own `/api/crashes` route to surface the files.
+- `spoolhard/vector_print.h` — `VectorPrint`: `Print` sink appending into
+  a `std::vector<uint8_t>` (header-only). Used to `serializeJson` straight
+  into a `g_wsBufPool` slot.
+- `spoolhard/state_rate_gate.h` — `StateRateLimit` row + `StateRateGate`
+  (`pass()` consuming check, `due()` non-consuming peek) for the
+  `broadcastState` per-resource min-interval gate. The TABLE stays
+  per-product in each `web_server.cpp`; only the lookup logic is shared.
+- `spoolhard/wifi_util.h` / `src/wifi_util.cpp` — `SpoolhardWifi::`
+  helpers used by both `WifiProvisioning` classes: `installEventLogger()`
+  (WiFi event ring-log), `reasonTag()`, `parseBssid()`,
+  `startProvisioningAp(prefix)` / `stopProvisioningAp()`,
+  `loadPinnedBssid()`, `saveCredentials()` (wifi_cfg NVS writes). The
+  per-product `WifiProvisioning` state machine, connect timeouts
+  (console 45 s / scale 15 s), discovery hooks (console mDNS only, scale
+  mDNS + SSDP NOTIFY), CrashLogger flush, captive-portal HTML and the
+  scan/config routes are deliberately NOT shared.
 
 **Per-product identity**: the library has no per-product config header
 on its include path. Identity comes in as `-D` build flags from each

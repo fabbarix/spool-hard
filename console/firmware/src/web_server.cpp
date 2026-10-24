@@ -37,6 +37,8 @@
 #include <SD.h>
 #include <Update.h>
 #include "spoolhard/path_route.h"
+#include "spoolhard/vector_print.h"
+#include "spoolhard/state_rate_gate.h"
 #include "spoolhard/serial_mirror.h"
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -172,23 +174,6 @@ void ConsoleWebServer::start()  { _server.begin(); Serial.println("[WebServer] L
 // again. Net per-broadcast internal-DRAM allocation: ZERO under
 // steady state.
 
-namespace {
-// Print sink that writes into a vector<uint8_t> by reference. Lets
-// `serializeJson(env, sink)` populate the shared buffer in-place.
-struct VectorPrint : public Print {
-    std::vector<uint8_t>* v;
-    explicit VectorPrint(std::vector<uint8_t>* dst) : v(dst) {}
-    size_t write(uint8_t b) override {
-        v->push_back(b);
-        return 1;
-    }
-    size_t write(const uint8_t* buffer, size_t size) override {
-        v->insert(v->end(), buffer, buffer + size);
-        return size;
-    }
-};
-}  // namespace
-
 void ConsoleWebServer::broadcastDebug(const String& type, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
     auto buf = g_wsBufPool.acquire();
@@ -209,7 +194,6 @@ void ConsoleWebServer::broadcastDebug(const String& type, const JsonDocument& pa
 // scale-link transitions, OTA phase changes) are absent from the table
 // and bypass the gate entirely.
 namespace {
-struct StateRateLimit { const char* key; uint32_t min_interval_ms; uint32_t last_ms; };
 static StateRateLimit s_stateRates[] = {
     {"printers",          500, 0},     // MQTT pushall ~1 Hz; UI doesn't need >2 Hz
     {"printer_analysis",  250, 0},     // FTPS chunk callbacks 5–20 Hz
@@ -219,22 +203,13 @@ static StateRateLimit s_stateRates[] = {
     {"discovery_printers", 2000, 0},   // SSDP NOTIFY can burst on flap
     {"discovery_scales",   2000, 0},
 };
+static StateRateGate s_stateGate(s_stateRates, sizeof(s_stateRates) / sizeof(s_stateRates[0]));
 
-static bool _stateRateGate(const char* resource) {
-    uint32_t now = millis();
-    for (auto& r : s_stateRates) {
-        if (strcmp(r.key, resource) != 0) continue;
-        if (r.last_ms != 0 && (now - r.last_ms) < r.min_interval_ms) return false;
-        r.last_ms = now;
-        return true;
-    }
-    return true;   // not in table = no gate
-}
 }  // namespace
 
 void ConsoleWebServer::broadcastState(const char* resource, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
-    if (!_stateRateGate(resource)) return;
+    if (!s_stateGate.pass(resource)) return;
     auto buf = g_wsBufPool.acquire();
     if (!buf) return;
     char typeBuf[40];
