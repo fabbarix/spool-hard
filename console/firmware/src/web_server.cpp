@@ -3347,27 +3347,24 @@ void ConsoleWebServer::_handlePrinterClaimPending(AsyncWebServerRequest* req,
     }
     int ams_unit = doc["ams_unit"];
     int slot_id  = doc["slot_id"];
-    if (!normalizeAmsSlot(ams_unit, slot_id)) {
+    String pending;
+    switch (p->claimPendingExplicit(ams_unit, slot_id, &pending)) {
+    case BambuPrinter::ClaimResult::Queued: break;
+    case BambuPrinter::ClaimResult::BadSlot:
         req->send(400, "application/json",
                   "{\"error\":\"ams_unit 0..3 with slot_id 0..3, or ams_unit 254 (external, slot 0)\"}");
         return;
-    }
-    const PrinterState& s = p->state();
-    if (s.link != BambuLinkState::Connected) {
+    case BambuPrinter::ClaimResult::NotConnected:
         req->send(409, "application/json", "{\"error\":\"printer not connected\"}");
         return;
-    }
-    if (ams_unit == 254 ? !s.has_vt_tray : ams_unit >= s.ams_count) {
+    case BambuPrinter::ClaimResult::NoSuchTray:
         req->send(404, "application/json", "{\"error\":\"no such tray on this printer\"}");
         return;
-    }
-    String pending = PendingAms::peek();
-    if (pending.isEmpty()) {
+    case BambuPrinter::ClaimResult::NothingPending:
         req->send(409, "application/json",
                   "{\"error\":\"no scanned spool pending -- scan a tag first\"}");
         return;
-    }
-    if (!p->requestClaimPending(ams_unit, slot_id)) {
+    case BambuPrinter::ClaimResult::Busy:
         req->send(409, "application/json", "{\"error\":\"another claim is already queued\"}");
         return;
     }

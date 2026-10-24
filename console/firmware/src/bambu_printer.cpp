@@ -6,6 +6,7 @@
 #include "gcode_analyzer.h"
 #include "scale_link.h"
 #include "pending_ams.h"
+#include "ams_slot.h"
 #include "printer_config.h"
 #include "web_server.h"
 #include "ui/ui.h"
@@ -1090,6 +1091,19 @@ void BambuPrinter::_parseAms(const JsonObjectConst& amsObj, PrinterState& out) {
 bool BambuPrinter::requestClaimPending(int ams_unit, int slot_id) {
     int expected = -1;
     return _claimReq.compare_exchange_strong(expected, (ams_unit << 8) | (slot_id & 0xFF));
+}
+
+BambuPrinter::ClaimResult BambuPrinter::claimPendingExplicit(int& ams_unit, int& slot_id,
+                                                             String* spool_id_out) {
+    if (!normalizeAmsSlot(ams_unit, slot_id)) return ClaimResult::BadSlot;
+    if (_state.link != BambuLinkState::Connected) return ClaimResult::NotConnected;
+    if (ams_unit == 254 ? !_state.has_vt_tray : ams_unit >= _state.ams_count)
+        return ClaimResult::NoSuchTray;
+    String pending = PendingAms::peek();
+    if (pending.isEmpty()) return ClaimResult::NothingPending;
+    if (!requestClaimPending(ams_unit, slot_id)) return ClaimResult::Busy;
+    if (spool_id_out) *spool_id_out = pending;
+    return ClaimResult::Queued;
 }
 
 bool BambuPrinter::_maybeAssignPendingSpool(int ams_unit, int slot_id) {
