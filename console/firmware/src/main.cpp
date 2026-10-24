@@ -1101,6 +1101,9 @@ static void _refreshHomeFooter() {
 // front of me right now"; cycling between printers on the LCD is a future
 // nicety.
 static void _refreshHomeAmsPanel() {
+    // Nothing visible while the LCD is asleep; the next 1 s tick after wake
+    // repaints (ui_set_*_panel also skip identical snapshots).
+    if (ConsoleDisplay::isAsleep()) return;
     for (const auto& pp : g_bambu.printers()) {
         if (!pp) continue;
         const PrinterState& s = pp->state();

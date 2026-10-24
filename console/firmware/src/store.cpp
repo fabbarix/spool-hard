@@ -2,13 +2,16 @@
 #include "config.h"
 #include "spoolhard/serial_mirror.h"
 
+SpoolStore::SpoolStore() { _mtx = xSemaphoreCreateRecursiveMutex(); }
+
 void SpoolStore::begin(fs::FS& fs, const String& path) {
+    Lock lk(_mtx);
     _fs        = &fs;
     _path      = path;
     _status    = Status::Ready;
     _lastError = "";
     _recoverPack();
-    _rebuildIndexes();
+    _rebuildIndexes();   // also invalidates the cache
     Serial.printf("[Store] Loaded %u spool records from %s (%u tombstoned lines)\n",
                   (unsigned)_idIndex.size(), _path.c_str(), (unsigned)_deadLines);
     // Every upsert tombstones the old line and appends a new one, so the
@@ -39,6 +42,8 @@ void SpoolStore::_recoverPack() {
 }
 
 void SpoolStore::beginUnavailable(const String& reason) {
+    Lock lk(_mtx);
+    _invalidate();
     _fs        = nullptr;
     _path      = "";
     _status    = Status::NoBackend;
@@ -49,6 +54,7 @@ void SpoolStore::beginUnavailable(const String& reason) {
 }
 
 void SpoolStore::_rebuildIndexes() {
+    _invalidate();
     _idIndex.clear();
     _tagIndex.clear();
     _deadLines = 0;
@@ -117,6 +123,7 @@ bool SpoolStore::_tombstone(size_t offset) {
 }
 
 bool SpoolStore::findByTagId(const String& tag_id, SpoolRecord& out) {
+    Lock lk(_mtx);
     if (!ready()) return false;
     auto it = _tagIndex.find(tag_id);
     if (it == _tagIndex.end()) return false;
@@ -124,15 +131,37 @@ bool SpoolStore::findByTagId(const String& tag_id, SpoolRecord& out) {
 }
 
 bool SpoolStore::findById(const String& id, SpoolRecord& out) {
+    Lock lk(_mtx);
     if (!ready()) return false;
+    for (auto& e : _cache) {
+        if (e.used && e.id == id) {
+            e.stamp = ++_cacheTick;
+            out = e.rec;
+            return true;
+        }
+    }
     auto it = _idIndex.find(id);
     if (it == _idIndex.end()) return false;
-    return _readAt(it->second, out);
+    if (!_readAt(it->second, out)) return false;
+    // Fill: take a free slot, else evict the least-recently-used one.
+    CacheEnt* victim = &_cache[0];
+    for (auto& e : _cache) {
+        if (!e.used) { victim = &e; break; }
+        if (e.stamp < victim->stamp) victim = &e;
+    }
+    victim->used  = true;
+    victim->id    = id;
+    victim->rec   = out;
+    victim->stamp = ++_cacheTick;
+    return true;
 }
 
 bool SpoolStore::upsert(const SpoolRecord& rec) {
+    {
+    Lock lk(_mtx);
     if (!ready()) return false;
     if (rec.id.isEmpty()) return false;
+    _invalidate();   // before any disk change; also covers a failed append
 
     // Tombstone the existing record if present.
     auto it = _idIndex.find(rec.id);
@@ -145,42 +174,67 @@ bool SpoolStore::upsert(const SpoolRecord& rec) {
 
     _idIndex[rec.id] = offset;
     if (rec.tag_id.length()) _tagIndex[rec.tag_id] = rec.id;
+    _invalidate();
+    }
     if (_onChange) _onChange();
     return true;
 }
 
 bool SpoolStore::remove(const String& id) {
+    {
+    Lock lk(_mtx);
     if (!ready()) return false;
+    _invalidate();
     auto it = _idIndex.find(id);
     if (it == _idIndex.end()) return false;
-    _tombstone(it->second);
-
-    // Also remove from tag index.
+    // Read BEFORE tombstoning (a tombstoned line fails _readAt) so the tag
+    // index entry is actually dropped.
     SpoolRecord rec;
-    if (_readAt(it->second, rec) && rec.tag_id.length()) {
+    bool haveRec = _readAt(it->second, rec);
+    _tombstone(it->second);
+    if (haveRec && rec.tag_id.length()) {
         _tagIndex.erase(rec.tag_id);
     }
     _idIndex.erase(it);
+    _invalidate();
+    }
     if (_onChange) _onChange();
     return true;
 }
 
 std::vector<SpoolRecord> SpoolStore::list(size_t offset, size_t limit, const String& material_filter) {
     std::vector<SpoolRecord> out;
+    Lock lk(_mtx);
     if (!ready()) return out;
+    // One open for the whole listing (was one open per record).
+    File f = _fs->open(_path.c_str(), "r");
+    if (!f) return out;
     size_t skipped = 0, returned = 0;
     for (auto& kv : _idIndex) {
         SpoolRecord rec;
-        if (!_readAt(kv.second, rec)) continue;
+        if (!f.seek(kv.second)) continue;
+        String line = f.readStringUntil('\n');
+        if (line.startsWith("x ") || !rec.fromLine(line)) continue;
         if (material_filter.length() && rec.material_type != material_filter) continue;
         if (skipped < offset) { skipped++; continue; }
         out.push_back(std::move(rec));
         if (++returned >= limit) break;
     }
+    f.close();
     return out;
 }
 
 bool SpoolStore::pack() {
+    bool ok;
+    {
+        Lock lk(_mtx);
+        ok = _packLocked();
+    }
+    if (ok && _onChange) _onChange();
+    return ok;
+}
+
+bool SpoolStore::_packLocked() {
     if (!ready()) return false;
     File in = _fs->open(_path.c_str(), "r");
     if (!in) return true;  // nothing to pack
@@ -225,18 +279,18 @@ bool SpoolStore::pack() {
     }
     _rebuildIndexes();
     Serial.printf("[Store] Packed, %u records remain\n", (unsigned)_idIndex.size());
-    if (_onChange) _onChange();
     return true;
 }
 
 bool SpoolStore::migrateTo(fs::FS& dst_fs, const String& dst_path) {
+    Lock lk(_mtx);
     if (!ready()) {
         _lastError = "store not ready — nothing to migrate";
         return false;
     }
     // Pack first so we don't carry tombstones across — keeps the migrated
     // file tight and the index trivial to rebuild on the destination.
-    pack();
+    _packLocked();   // (no onChange here: migrate rebinds + rebuilds below)
 
     String dst_tmp = dst_path + ".tmp";
     File in = _fs->open(_path.c_str(), "r");

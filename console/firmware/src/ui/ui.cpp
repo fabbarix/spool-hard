@@ -1695,6 +1695,20 @@ static lv_color_t _textColorFor(uint32_t rgb) {
 
 void ui_set_printer_panel(const UiPrinterSnapshot* snap) {
     if (!s_printer_card) return;
+    // Skip identical updates: main.cpp pushes this once a second and every
+    // lv_label_set_text() invalidates + re-lays-out even when text is equal.
+    // snap==nullptr is encoded as a zeroed snapshot with connected=false
+    // plus s_prn_null so "No printer" vs "Printer offline" stay distinct.
+    static UiPrinterSnapshot s_prn_last;
+    static bool s_prn_valid = false, s_prn_null = false;
+    {
+        const bool isNull = (snap == nullptr);
+        UiPrinterSnapshot cur = {};
+        if (snap) cur = *snap;
+        if (s_prn_valid && s_prn_null == isNull &&
+            memcmp(&s_prn_last, &cur, sizeof(cur)) == 0) return;
+        s_prn_last = cur; s_prn_null = isNull; s_prn_valid = true;
+    }
     lv_lock();
 
     if (!snap || !snap->connected) {
@@ -1764,6 +1778,22 @@ void ui_set_printer_panel(const UiPrinterSnapshot* snap) {
 
 void ui_set_ams_panel(const char* status, const UiAmsSlot* slots) {
     if (!s_ams_panel) return;
+
+    // Skip identical updates (called once a second from main.cpp).
+    static UiAmsSlot s_ams_last[AMS_TILE_COUNT];
+    static char      s_ams_last_status[48];
+    static bool      s_ams_valid = false;
+    {
+        UiAmsSlot cur[AMS_TILE_COUNT] = {};
+        if (slots) memcpy(cur, slots, sizeof(cur));
+        char st[sizeof(s_ams_last_status)] = {};
+        if (status) snprintf(st, sizeof(st), "%s", status);
+        if (s_ams_valid && memcmp(st, s_ams_last_status, sizeof(st)) == 0 &&
+            memcmp(cur, s_ams_last, sizeof(cur)) == 0) return;
+        memcpy(s_ams_last, cur, sizeof(cur));
+        memcpy(s_ams_last_status, st, sizeof(st));
+        s_ams_valid = true;
+    }
 
     lv_lock();
     const bool show = status && *status;
