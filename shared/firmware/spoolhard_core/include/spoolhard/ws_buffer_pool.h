@@ -4,6 +4,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <vector>
+#include <atomic>
 
 // Pre-allocated `AsyncWebSocketSharedBuffer` pool. Eliminates the
 // per-broadcast `make_shared<std::vector<uint8_t>>` in mathieucarbou's
@@ -52,6 +53,13 @@ public:
     // it. No-op in eager mode. Never blocks > 20 ms.
     void maintain(size_t wsClientCount);
 
+    // Client-count telemetry for /api/heap. wsClients is refreshed by
+    // maintain() (1 Hz); consoleClients is set by the product's loop.
+    void setConsoleClients(size_t n) { _consoleClients.store((uint32_t)n); }
+    size_t wsClients() const { return _wsClients.load(); }
+    size_t consoleClients() const { return _consoleClients.load(); }
+    bool isLazy() const { return _lazy; }
+
     static constexpr size_t kLazyFloorBytes = 12288;
 
     // Returns a shared_ptr whose pointee is safe to mutate (only the
@@ -91,6 +99,9 @@ private:
     size_t _count = 0;
     bool _lazy = false;
     uint32_t _lastWarnMs = 0;
+    uint32_t _lastLogMs = 0;
+    std::atomic<uint32_t> _wsClients{0};
+    std::atomic<uint32_t> _consoleClients{0};
 };
 
 extern WsBufferPool g_wsBufPool;

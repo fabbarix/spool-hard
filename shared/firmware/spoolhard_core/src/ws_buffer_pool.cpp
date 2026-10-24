@@ -41,6 +41,12 @@ AsyncWebSocketSharedBuffer WsBufferPool::acquire() {
                 _slots.push_back(std::move(buf));
                 n = _slots.size();
                 _next = n - 1;
+                uint32_t now = millis();
+                if (_lastLogMs == 0 || now - _lastLogMs > 5000) {
+                    _lastLogMs = now;
+                    Serial.printf("[WsPool] slot allocated: total=%u ws_clients=%u\n",
+                                  (unsigned)n, (unsigned)_wsClients.load());
+                }
             } else {
                 uint32_t now = millis();
                 if (_lastWarnMs == 0 || now - _lastWarnMs > 60000) {
@@ -108,8 +114,10 @@ size_t WsBufferPool::psramSlots() {
 
 void WsBufferPool::maintain(size_t wsClientCount) {
     if (!_mtx || !_lazy) return;
+    _wsClients.store((uint32_t)wsClientCount);
     if (xSemaphoreTake(_mtx, pdMS_TO_TICKS(20)) != pdTRUE) return;
     if (wsClientCount == 0) {
+        size_t before = _slots.size();
         // Erase only slots nobody else references (use_count()==1); a slot
         // still queued in a dying client, or just handed to a caller, is
         // retried on the next tick.
@@ -117,6 +125,9 @@ void WsBufferPool::maintain(size_t wsClientCount) {
             if (_slots[i].use_count() == 1) _slots.erase(_slots.begin() + i);
             else ++i;
         }
+        if (_slots.size() != before)
+            Serial.printf("[WsPool] freed %u slot(s), %u remain (busy), ws_clients=0\n",
+                          (unsigned)(before - _slots.size()), (unsigned)_slots.size());
         if (_slots.empty()) std::vector<AsyncWebSocketSharedBuffer>().swap(_slots);
         _next = 0;
     } else {

@@ -5,6 +5,7 @@
 #include "spoolhard/psram_json_alloc.h"
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
+#include "spoolhard/ws_buffer_pool.h"
 #include <esp_idf_version.h>
 #if ESP_IDF_VERSION_MAJOR >= 5
 #include <esp_memory_utils.h>
@@ -66,6 +67,14 @@ void registerHeap(AsyncWebServer& server) {
         };
         fillCaps("internal", MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         fillCaps("psram",    MALLOC_CAP_SPIRAM   | MALLOC_CAP_8BIT);
+        // WS pool / client telemetry (lazy-pool products only; the eager
+        // console pool has no client tracking, so omit rather than lie).
+        if (g_wsBufPool.isLazy()) {
+            doc["ws_clients"]         = (uint32_t)g_wsBufPool.wsClients();
+            doc["ws_console_clients"] = (uint32_t)g_wsBufPool.consoleClients();
+            doc["ws_pool_total"]      = (uint32_t)g_wsBufPool.totalSlots();
+            doc["ws_pool_free"]       = (uint32_t)g_wsBufPool.freeSlots();
+        }
 
 #if (configUSE_TRACE_FACILITY == 1)
         // Per-task stack high-water marks — the data that says which
