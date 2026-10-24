@@ -278,3 +278,15 @@ is separate from the `~/.claude/projects/.../memory/` auto-memory above.
 Don't duplicate; only write a Serena memory if a fact is specifically
 useful to future Serena symbol-navigation sessions (e.g. "the protocol
 enum lives at `*/firmware/src/protocol.h`").
+
+## Console SpoolStore concurrency + caching
+
+`SpoolStore` (`console/firmware/include/store.h`) is hit from loopTask,
+AsyncTCP, the LVGL task and printer tasks. All public ops take a recursive
+mutex (created in the constructor); `onChange` fires after the lock is
+released. `findById` is served from an 8-entry LRU cache that is cleared on
+every mutation (upsert/remove/pack/migrate/begin/rebuild); `generation()`
+increments on each mutation. `list()` opens the file once. The LVGL
+`ui_set_ams_panel` / `ui_set_printer_panel` skip identical snapshots, the
+lvgl task sleeps per `lv_timer_handler()`'s return (5..30 ms awake, <=50 ms
+asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
