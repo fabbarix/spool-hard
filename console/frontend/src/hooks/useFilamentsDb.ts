@@ -64,9 +64,10 @@ function entryFromJsonRow(row: FilamentJsonRow): FilamentEntry {
 // Open the uploaded library, parse line-by-line. Cached for the lifetime
 // of the tab — the file's small (~32KB / ~100 rows) but parse + dedup
 // still costs a few ms; one query keeps it sticky across tab switches.
-export function useFilamentsDb() {
+export function useFilamentsDb(opts?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ['filaments-db'],
+    enabled: opts?.enabled ?? true,
     staleTime: Infinity,
     gcTime: Infinity,
     retry: false,
