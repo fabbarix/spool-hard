@@ -1,5 +1,5 @@
 import { Wifi, WifiOff } from 'lucide-react';
-import { useDeviceName } from '../../hooks/useDeviceName';
+import { useDeviceName } from '@spoolhard/ui/hooks/useDeviceName';
 import { useFirmwareInfo } from '../../hooks/useFirmwareInfo';
 import { useWifiStatus } from '../../hooks/useWifiStatus';
 import { useScaleLink } from '../../hooks/useScaleLink';
