@@ -2,7 +2,20 @@
 #include "config.h"
 #include <SPI.h>
 #include <Adafruit_PN532.h>
+#include <string.h>
 #include "spoolhard/serial_mirror.h"
+
+// nfc_task: owns the PN532 (_pn / _spi) after begin(). 4 KB internal-DRAM
+// stack (same as the scale's nfc_task): the deepest path is
+// readPassiveTargetID / inDataExchange (shared global packet buffer in the
+// lib) + a 64-byte page buffer + one Serial.printf. The first events log the
+// stack high-water mark so the choice can be checked against /api/logs.
+static constexpr uint32_t kNfcTaskStack = 4096;
+static constexpr uint32_t kPollMs       = 200;
+// Consecutive empty polls (~600 ms) before a tag counts as removed and the
+// UID debounce re-arms. Absorbs a single missed poll on a held tag.
+static constexpr uint8_t  kRemovedMisses = 3;
+static constexpr uint8_t  kEvqDepth      = 4;
 
 void NfcReader::begin() {
     pinMode(PN532_IRQ_PIN, INPUT_PULLUP);
@@ -21,68 +34,118 @@ void NfcReader::begin() {
     }
     Serial.printf("[NFC] PN532 fw 0x%08X\n", ver);
     _pn->SAMConfig();
-    _pn->setPassiveActivationRetries(0x05);  // low retries so update() is non-blocking
+    _pn->setPassiveActivationRetries(0x05);  // low retries so each poll stays short
     _available = true;
+
+    _evq = xQueueCreate(kEvqDepth, sizeof(Event));
+    if (!_evq ||
+        xTaskCreatePinnedToCore(_taskBody, "nfc_task", kNfcTaskStack, this,
+                                2, &_task, 1) != pdPASS) {
+        Serial.println("[NFC] task/queue creation failed — reader disabled");
+        _available = false;
+        _task = nullptr;
+    } else {
+        Serial.println("[NFC] nfc_task started (PN532 owned by task)");
+    }
 }
 
+// loopTask: deliver queued events.
 void NfcReader::update() {
-    if (!_available) return;
-    uint32_t now = millis();
-    if (now - _lastPollMs < 200) return;   // 5 Hz poll
-    _lastPollMs = now;
-
-    SpoolTag tag;
-    if (!_pollOnce(tag)) return;
-
-    // Debounce: ignore repeat reads of the same UID within 3 seconds.
-    static uint32_t lastFireMs = 0;
-    if (tag.uid_hex == _lastUid && (now - lastFireMs) < 3000) return;
-    _lastUid = tag.uid_hex;
-    lastFireMs = now;
-
-    if (_cb) _cb(tag);
-}
-
-bool NfcReader::_pollOnce(SpoolTag& tag) {
-    uint8_t uid[7] = {0};
-    uint8_t uidLen = 0;
-    if (!_pn->readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) return false;
-
-    tag.uid_hex = _uidHex(uid, uidLen);
-    tag.format  = "Unknown";
-    tag.tag_type = (uidLen == 7) ? "NTAG2xx" : "Mifare";
-
-    // Attempt to read an NDEF URI record off an NTAG (pages 4..).
-    // This is intentionally minimal — full Bambu Lab and OpenPrintTag parsing
-    // lives in a later milestone.
-    if (uidLen == 7) {
-        uint8_t buf[16];
-        String raw;
-        for (uint8_t page = 4; page < 20; page++) {
-            if (!_pn->ntag2xx_ReadPage(page, buf)) break;
-            for (int i = 0; i < 4; i++) raw += (char)buf[i];
-        }
-        // Look for the NDEF URI prefix byte 0x03 (well-known type U) — tolerant scan.
-        int uStart = raw.indexOf("https://");
-        if (uStart < 0) uStart = raw.indexOf("http://");
-        if (uStart >= 0) {
-            int end = uStart;
-            while (end < (int)raw.length() && raw[end] >= 32 && raw[end] < 127) end++;
-            tag.ndef_url = raw.substring(uStart, end);
+    if (!_available || !_evq) return;
+    Event ev;
+    while (xQueueReceive(_evq, &ev, 0) == pdTRUE) {
+        SpoolTag tag;
+        tag.uid_hex  = ev.uid;
+        tag.format   = "Unknown";
+        tag.tag_type = (ev.uidLen == 7) ? "NTAG2xx" : "Mifare";
+        if (ev.url[0]) {
+            tag.ndef_url = ev.url;
             SpoolTag::parseUrl(tag.ndef_url, tag);
         }
+        if (_cb) _cb(tag);
     }
-    return true;
 }
 
-String NfcReader::_uidHex(const uint8_t* uid, uint8_t len) {
-    char buf[32];
+void NfcReader::_taskBody(void* arg) {
+    auto* self = static_cast<NfcReader*>(arg);
+    TickType_t last = xTaskGetTickCount();
+    for (;;) {
+        self->_pollStep();
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(kPollMs));
+    }
+}
+
+void NfcReader::_pollStep() {
+    _polls.fetch_add(1);
+    uint8_t uid[7] = {0};
+    uint8_t uidLen = 0;
+    if (!_pn->readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) {
+        if (_present && ++_misses >= kRemovedMisses) {
+            _present = false;
+            _lastUid[0] = 0;
+            Serial.printf("[NFC] tag removed, re-armed (polls=%u pageReads=%u events=%u)\n",
+                          (unsigned)_polls.load(), (unsigned)_pageReads.load(),
+                          (unsigned)_events.load());
+        }
+        return;
+    }
+    _misses = 0;
+
+    Event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.uidLen = uidLen;
     int n = 0;
-    for (uint8_t i = 0; i < len && n + 2 < (int)sizeof(buf); i++) {
-        n += snprintf(buf + n, sizeof(buf) - n, "%02X", uid[i]);
+    for (uint8_t i = 0; i < uidLen && n + 3 < (int)sizeof(ev.uid); i++)
+        n += snprintf(ev.uid + n, sizeof(ev.uid) - n, "%02X", uid[i]);
+
+    // Debounce by UID BEFORE any page reads: same tag still on the reader
+    // -> nothing to do. Removal (above) or a different UID re-arms.
+    if (_present && strcmp(ev.uid, _lastUid) == 0) return;
+    _present = true;
+    strncpy(_lastUid, ev.uid, sizeof(_lastUid) - 1);
+
+    if (uidLen == 7) _readNdefUrl(ev.url, sizeof(ev.url));
+
+    _events.fetch_add(1);
+    Serial.printf("[NFC] new tag %s url=%s (polls=%u pageReads=%u events=%u stackHWM=%u)\n",
+                  ev.uid, ev.url, (unsigned)_polls.load(), (unsigned)_pageReads.load(),
+                  (unsigned)_events.load(),
+                  (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    if (xQueueSend(_evq, &ev, 0) != pdTRUE) {
+        _dropped.fetch_add(1);
+        Serial.println("[NFC] event queue full, dropped (retrying next poll)");
+        _present = false;   // let the next poll retry instead of losing the tag
+        _lastUid[0] = 0;
     }
-    return String(buf);
 }
 
-// (URL parsing now lives in SpoolTag::parseUrl — shared with the scale-
-//  forwarded tag pipeline so both readers behave identically.)
+// Reads pages 4..19 (NTAG user area start) with 4 READ commands of 16 bytes
+// (= 4 pages each) and extracts a printable http(s):// run. Intentionally
+// minimal — full Bambu Lab / OpenPrintTag parsing lives elsewhere.
+bool NfcReader::_readNdefUrl(char* out, size_t outLen) {
+    uint8_t raw[64];
+    size_t have = 0;
+    for (uint8_t page = 4; page < 20; page += 4) {
+        uint8_t cmd[2] = {0x30 /*MIFARE READ*/, page};
+        uint8_t resp[18];
+        uint8_t rlen = sizeof(resp);
+        _pageReads.fetch_add(1);
+        if (!_pn->inDataExchange(cmd, 2, resp, &rlen) || rlen < 16) break;
+        memcpy(raw + have, resp, 16);
+        have += 16;
+    }
+    const uint8_t* p = nullptr;
+    static const char* const pats[2] = {"https://", "http://"};
+    for (const char* pat : pats) {
+        p = (const uint8_t*)memmem(raw, have, pat, strlen(pat));
+        if (p) break;
+    }
+    if (!p) return false;
+    size_t i = 0;
+    while (p + i < raw + have && p[i] >= 32 && p[i] < 127 && i + 1 < outLen) {
+        out[i] = (char)p[i];
+        i++;
+    }
+    out[i] = 0;
+    return i > 0;
+}
