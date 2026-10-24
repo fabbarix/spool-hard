@@ -220,6 +220,28 @@ schema; do not re-define those keys in the per-product `config.h`.
 When adding new shared code, prefer extending the lib over duplicating
 between `console/` and `scale/`.
 
+## Debug LCD access (console only)
+
+Session-only toggle `lcd_debug` (Config -> Debug "LCD remote access", or
+`POST /api/debug/config {"lcd_debug":true}`; also reported by GET). Off by
+default on every boot; while off both endpoints return 403 and no LCD code
+runs. Both need auth (`?key=` / Bearer).
+
+- `GET /api/debug/lcd.bmp` — 480x320 24-bit BMP (negative height, top-down)
+  of `lv_screen_active()` (top/sys layers excluded). First call returns
+  `202 {"state":"capturing"}` and spawns a one-shot `lcd_snap` task that
+  renders (`lv_snapshot_take`, `LV_USE_SNAPSHOT=1`) into one PSRAM RGB565
+  buffer (~300 KB); poll again for `200 image/bmp`, streamed through a
+  chunked fill callback that converts RGB565->BGR24 per chunk (no big
+  internal alloc). Buffer freed on last chunk / disconnect / 30 s stale.
+  A stream in progress -> 409. Implemented in `display.cpp`.
+- `POST /api/debug/lcd/touch {"x":0..479,"y":0..319,"action":"tap|press|release"}`
+  — packed atomic command word consumed by `touch_cb` (LVGL task). tap =
+  press ~100 ms then release; press holds until release (auto-release 5 s).
+  400 bad input, 409 if the previous injection is still unconsumed. Real
+  touch takes precedence; injected touches wake a sleeping screen without
+  the wake-swallow.
+
 ## Scale firmware task model (0.8.0+)
 
 The scale used to run everything serially in `loop()`. As of 0.8.0

@@ -296,6 +296,9 @@ public:
     // a function call. When enabled, the producer forwards the raw JSON to
     // the /ws debug channel — the Config → Debug UI subscribes and renders.
     bool _logAmsRaw = false;
+    // Gates /api/debug/lcd.bmp + /api/debug/lcd/touch (session-only, off by
+    // default). Off => both endpoints answer 403 and no LCD code runs.
+    bool _lcdDebug  = false;
 };
 
 extern ConsoleWebServer g_web;   // defined in main.cpp

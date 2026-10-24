@@ -1375,6 +1375,7 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         JsonDocument doc;
         doc["log_ams"] = _logAmsRaw;
+        doc["lcd_debug"] = _lcdDebug;
         String out; serializeJson(doc, out);
         req->send(200, "application/json", out);
     });
@@ -1389,9 +1390,72 @@ void ConsoleWebServer::_setupRoutes() {
             // Only patch keys that are present — leaves other flags alone if
             // we add more later.
             if (body["log_ams"].is<bool>()) _logAmsRaw = body["log_ams"].as<bool>();
-            JsonDocument resp; resp["log_ams"] = _logAmsRaw;
+            if (body["lcd_debug"].is<bool>()) _lcdDebug = body["lcd_debug"].as<bool>();
+            JsonDocument resp; resp["log_ams"] = _logAmsRaw; resp["lcd_debug"] = _lcdDebug;
             String out; serializeJson(resp, out);
             req->send(200, "application/json", out);
+        }
+    );
+
+    // ── Debug LCD access (needs auth AND Config -> Debug "lcd_debug" on) ──
+    // GET: 202 while the snapshot task renders (poll again), 200 BMP when
+    // ready, 409 if another stream is active, 403 toggle off.
+    _server.on(AsyncURIMatcher::exact("/api/debug/lcd.bmp"), HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        if (!_lcdDebug) { req->send(403, "application/json", "{\"error\":\"lcd_debug off\"}"); return; }
+        switch (ConsoleDisplay::snapshotRequest()) {
+        case ConsoleDisplay::SNAP_PENDING:
+            req->send(202, "application/json", "{\"state\":\"capturing\"}");
+            return;
+        case ConsoleDisplay::SNAP_BUSY:
+            req->send(409, "application/json", "{\"error\":\"snapshot stream busy\"}");
+            return;
+        case ConsoleDisplay::SNAP_FAILED:
+            req->send(500, "application/json", "{\"error\":\"snapshot failed\"}");
+            return;
+        case ConsoleDisplay::SNAP_READY: break;
+        }
+        auto* resp = req->beginChunkedResponse("image/bmp",
+            [](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
+                return ConsoleDisplay::snapshotFill(buf, maxLen, index);
+            });
+        resp->addHeader("Cache-Control", "no-store");
+        req->onDisconnect([]() { ConsoleDisplay::snapshotAbort(); });
+        req->send(resp);
+    });
+    _server.on(AsyncURIMatcher::exact("/api/debug/lcd/touch"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+            if (!_requireAuth(req)) return;
+            if (!_lcdDebug) { req->send(403, "application/json", "{\"error\":\"lcd_debug off\"}"); return; }
+            if (index != 0 || len != total) {
+                req->send(400, "application/json", "{\"error\":\"body too fragmented\"}");
+                return;
+            }
+            JsonDocument body;
+            if (deserializeJson(body, data, len)) {
+                req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+                return;
+            }
+            if (!body["x"].is<int>() || !body["y"].is<int>() || !body["action"].is<const char*>()) {
+                req->send(400, "application/json", "{\"error\":\"need x,y,action\"}");
+                return;
+            }
+            int x = body["x"].as<int>(), y = body["y"].as<int>();
+            const char* a = body["action"].as<const char*>();
+            uint8_t act;
+            if      (!strcmp(a, "tap"))     act = 0;
+            else if (!strcmp(a, "press"))   act = 1;
+            else if (!strcmp(a, "release")) act = 2;
+            else { req->send(400, "application/json", "{\"error\":\"bad action\"}"); return; }
+            if (x < 0 || x > 479 || y < 0 || y > 319) {
+                req->send(400, "application/json", "{\"error\":\"x 0..479, y 0..319\"}");
+                return;
+            }
+            if (!ConsoleDisplay::injectTouch((uint16_t)x, (uint16_t)y, act)) {
+                req->send(409, "application/json", "{\"error\":\"touch busy\"}");
+                return;
+            }
+            req->send(200, "application/json", "{\"ok\":true}");
         }
     );
 

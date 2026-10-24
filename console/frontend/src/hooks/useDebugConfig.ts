@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 // traffic every couple of seconds.
 export interface DebugConfig {
   log_ams: boolean;
+  lcd_debug: boolean;
 }
 
 export function useDebugConfig() {

@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 // Brings up the WT32-SC01-Plus LCD + touch via LovyanGFX, wires it into
 // LVGL 9, and spawns an LVGL task pinned to Core 1. After begin() returns,
@@ -41,4 +42,27 @@ public:
     static void wakeIfAsleep();
 
     static bool isAsleep();
+
+    // ── Debug LCD access (gated by the web-layer debug toggle) ──────────
+    // Snapshot: the screen is rendered by a one-shot task into a single
+    // lazily-allocated PSRAM buffer (RGB565, ~300 KB), then streamed as a
+    // 24-bit BMP (negative height = top-down) through snapshotFill() and
+    // freed on the last chunk / disconnect / 30 s staleness. All calls
+    // are made from the AsyncTCP task (serialised), none block.
+    enum SnapStatus : uint8_t { SNAP_PENDING, SNAP_READY, SNAP_BUSY, SNAP_FAILED };
+    static constexpr size_t SNAP_BMP_BYTES = 54 + 480 * 320 * 3;
+    // IDLE: starts a capture -> PENDING. PENDING: still rendering.
+    // READY: claims the buffer for streaming (caller must then stream via
+    // snapshotFill). BUSY: a stream is in progress. FAILED: capture failed.
+    static SnapStatus snapshotRequest();
+    // AsyncWebServer chunked-response fill callback; returns 0 at end.
+    static size_t     snapshotFill(uint8_t* out, size_t maxLen, size_t index);
+    // Release a claimed buffer early (client disconnected).
+    static void       snapshotAbort();
+
+    // Touch injection into the LVGL indev. action: 0 = tap (press, ~100 ms,
+    // release), 1 = press (held until release; auto-released after 5 s),
+    // 2 = release. Returns false if a previous injection is still pending
+    // (caller replies 409). Coordinates must already be validated.
+    static bool injectTouch(uint16_t x, uint16_t y, uint8_t action);
 };

@@ -6,6 +6,7 @@
 #include <LovyanGFX.hpp>
 #include <esp_heap_caps.h>
 #include <Preferences.h>
+#include <atomic>
 #include "spoolhard/serial_mirror.h"
 
 // ── LovyanGFX board definition for the WT32-SC01-Plus ────────
@@ -159,9 +160,13 @@ static bool s_touch_was_pressed = false;
 // on lift — exactly the behaviour the swallow was meant to prevent.
 static bool s_swallow_until_release = false;
 
+static bool inj_poll(uint16_t* x, uint16_t* y);   // debug touch injection, below
+
 static void touch_cb(lv_indev_t*, lv_indev_data_t* data) {
     uint16_t x, y;
     bool pressed = lcd.getTouch(&x, &y);
+    bool injected = false;
+    if (!pressed && inj_poll(&x, &y)) { pressed = true; injected = true; }
     if (pressed) {
         // If the screen was asleep, arm the full-gesture swallow — the user
         // tapped to wake, not to interact with whatever happened to be
@@ -169,7 +174,8 @@ static void touch_cb(lv_indev_t*, lv_indev_data_t* data) {
         // while the swallow is still armed is harmless.
         if (s_display_asleep) {
             apply_wake();
-            s_swallow_until_release = true;
+            // Injected (debug) touches wake the screen but are not swallowed.
+            if (!injected) s_swallow_until_release = true;
         }
         s_last_interaction_ms = millis();
         if (s_swallow_until_release) {
@@ -192,6 +198,133 @@ static void touch_cb(lv_indev_t*, lv_indev_data_t* data) {
         }
         data->state = LV_INDEV_STATE_RELEASED;
     }
+}
+
+
+// ── Debug touch injection ───────────────────────────────────
+// One packed command word (bit31 valid | action<<20 | y<<10 | x), written
+// by the web handler (compare-exchange from 0, so a second injection while
+// one is unconsumed is refused) and consumed by touch_cb on the LVGL task.
+// No heap, no queue. Zero cost when unused: a single relaxed atomic load.
+static std::atomic<uint32_t> s_inj_cmd{0};
+static constexpr uint32_t INJ_TAP_MS  = 100;
+static constexpr uint32_t INJ_HOLD_MAX_MS = 5000;
+
+bool ConsoleDisplay::injectTouch(uint16_t x, uint16_t y, uint8_t action) {
+    uint32_t want = (1u << 31) | ((uint32_t)(action & 3) << 20) | ((uint32_t)y << 10) | x;
+    uint32_t expected = 0;
+    return s_inj_cmd.compare_exchange_strong(expected, want);
+}
+
+// Called only from touch_cb (LVGL task). Returns true while an injected
+// finger is down; fills x/y.
+static bool inj_poll(uint16_t* x, uint16_t* y) {
+    static bool held = false;
+    static uint16_t hx = 0, hy = 0;
+    static uint32_t release_at = 0;
+    uint32_t cmd = s_inj_cmd.load(std::memory_order_relaxed);
+    uint32_t now = millis();
+    if (!held) {
+        if (!cmd) return false;
+        uint8_t action = (cmd >> 20) & 3;
+        s_inj_cmd.store(0);
+        if (action == 2) return false;           // release with nothing held
+        held = true;
+        hx = cmd & 0x3FF; hy = (cmd >> 10) & 0x3FF;
+        release_at = now + (action == 0 ? INJ_TAP_MS : INJ_HOLD_MAX_MS);
+    } else {
+        if (cmd && ((cmd >> 20) & 3) == 2) { s_inj_cmd.store(0); held = false; return false; }
+        if ((int32_t)(now - release_at) >= 0) { held = false; return false; }
+    }
+    *x = hx; *y = hy;
+    return true;
+}
+
+// ── Debug LCD snapshot ──────────────────────────────────────
+// IDLE -> CAPTURING (task) -> READY -> STREAMING -> IDLE. All transitions
+// except CAPTURING->READY/FAILED happen on the AsyncTCP task.
+enum : uint8_t { SN_IDLE, SN_CAPTURING, SN_READY, SN_STREAMING, SN_FAILED };
+static std::atomic<uint8_t> s_snap_state{SN_IDLE};
+static lv_draw_buf_t*       s_snap_buf = nullptr;
+static volatile uint32_t    s_snap_ts  = 0;
+static constexpr uint32_t   SNAP_STALE_MS = 30000;
+
+static void snap_free() {
+    if (s_snap_buf) { lv_draw_buf_destroy(s_snap_buf); s_snap_buf = nullptr; }
+    s_snap_state.store(SN_IDLE);
+}
+
+static void snap_task(void*) {
+    lv_lock();
+    lv_draw_buf_t* b = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+    lv_unlock();
+    if (b && (b->header.w != 480 || b->header.h != 320)) { lv_draw_buf_destroy(b); b = nullptr; }
+    s_snap_buf = b;
+    s_snap_ts = millis();
+    s_snap_state.store(b ? SN_READY : SN_FAILED);
+    vTaskDelete(nullptr);
+}
+
+ConsoleDisplay::SnapStatus ConsoleDisplay::snapshotRequest() {
+    switch (s_snap_state.load()) {
+    case SN_CAPTURING: return SNAP_PENDING;
+    case SN_FAILED:    s_snap_state.store(SN_IDLE); return SNAP_FAILED;
+    case SN_READY:
+        if (millis() - s_snap_ts < SNAP_STALE_MS) {
+            s_snap_ts = millis();
+            s_snap_state.store(SN_STREAMING);
+            return SNAP_READY;
+        }
+        snap_free();
+        break;                                   // stale: recapture below
+    case SN_STREAMING:
+        if (millis() - s_snap_ts < SNAP_STALE_MS) return SNAP_BUSY;
+        snap_free();                             // abandoned stream
+        break;
+    default: break;
+    }
+    s_snap_state.store(SN_CAPTURING);
+    if (xTaskCreatePinnedToCore(snap_task, "lcd_snap", 8192, nullptr, 1, nullptr, 1) != pdPASS) {
+        s_snap_state.store(SN_IDLE);
+        return SNAP_FAILED;
+    }
+    return SNAP_PENDING;
+}
+
+void ConsoleDisplay::snapshotAbort() {
+    if (s_snap_state.load() == SN_STREAMING) snap_free();
+}
+
+size_t ConsoleDisplay::snapshotFill(uint8_t* out, size_t maxLen, size_t index) {
+    if (s_snap_state.load() != SN_STREAMING || !s_snap_buf) return 0;
+    if (index >= SNAP_BMP_BYTES) { snap_free(); return 0; }
+    s_snap_ts = millis();
+    size_t n = 0;
+    if (index < 54) {
+        uint8_t h[54] = {0};
+        auto le32 = [&](int o, uint32_t v) { for (int i = 0; i < 4; i++) h[o + i] = (v >> (8 * i)) & 0xFF; };
+        h[0] = 'B'; h[1] = 'M';
+        le32(2, SNAP_BMP_BYTES); le32(10, 54); le32(14, 40);
+        le32(18, 480); le32(22, (uint32_t)(int32_t)-320);   // negative = top-down
+        h[26] = 1; h[28] = 24;
+        le32(34, 480 * 320 * 3);
+        n = 54 - index; if (n > maxLen) n = maxLen;
+        memcpy(out, h + index, n);
+        index += n;
+    }
+    const uint8_t* base = s_snap_buf->data;
+    const uint32_t stride = s_snap_buf->header.stride;
+    while (n < maxLen && index < SNAP_BMP_BYTES) {
+        size_t p = index - 54;
+        size_t px = p / 3; int c = p % 3;
+        uint32_t row = px / 480, col = px % 480;
+        const uint8_t* q = base + row * stride + col * 2;
+        uint16_t v = q[0] | (q[1] << 8);
+        uint8_t r = (v >> 11) & 31, g = (v >> 5) & 63, b = v & 31;
+        uint8_t comp[3] = { (uint8_t)((b << 3) | (b >> 2)), (uint8_t)((g << 2) | (g >> 4)), (uint8_t)((r << 3) | (r >> 2)) };
+        for (; c < 3 && n < maxLen; c++) { out[n++] = comp[c]; index++; }
+    }
+    return n;
 }
 
 static uint32_t tick_cb() { return millis(); }

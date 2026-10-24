@@ -65,6 +65,10 @@
 #define LV_USE_ASSERT_MEM_INTEGRITY 0
 #define LV_USE_ASSERT_OBJ           0
 
+/* Debug LCD snapshot (GET /api/debug/lcd.bmp, display.cpp). Code is only
+ * exercised while the Config -> Debug toggle is on. */
+#define LV_USE_SNAPSHOT         1
+
 #define LV_USE_PERF_MONITOR     0
 #define LV_USE_MEM_MONITOR      0
 

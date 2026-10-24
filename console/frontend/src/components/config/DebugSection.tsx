@@ -62,6 +62,10 @@ export function DebugSection() {
     update.mutate({ log_ams: !cfg?.log_ams });
   }, [cfg?.log_ams, update]);
 
+  const toggleLcdDebug = useCallback(() => {
+    update.mutate({ lcd_debug: !cfg?.lcd_debug });
+  }, [cfg?.lcd_debug, update]);
+
   const copyAll = useCallback(() => {
     const text = entries
       .map((e) => `[${e.ts}] ${e.type}\n${JSON.stringify(e.data, null, 2)}`)
@@ -94,6 +98,22 @@ export function DebugSection() {
           on={!!cfg?.log_ams}
           disabled={isLoading || update.isPending}
           onClick={toggleAmsLog}
+        />
+      </div>
+
+      <div className="flex items-center justify-between gap-3 py-2 border-b border-surface-border">
+        <div>
+          <div className="text-sm text-text-primary">LCD remote access</div>
+          <div className="text-xs text-text-muted mt-0.5">
+            Enables <span className="font-mono">GET /api/debug/lcd.bmp</span> (screen snapshot) and{' '}
+            <span className="font-mono">POST /api/debug/lcd/touch</span> (inject taps) for
+            automated testing. Resets to off on reboot.
+          </div>
+        </div>
+        <Toggle
+          on={!!cfg?.lcd_debug}
+          disabled={isLoading || update.isPending}
+          onClick={toggleLcdDebug}
         />
       </div>
 
