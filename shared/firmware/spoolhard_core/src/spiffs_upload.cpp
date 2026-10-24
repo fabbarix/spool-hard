@@ -8,12 +8,14 @@
 #include <freertos/semphr.h>
 #include <freertos/timers.h>
 #include <string.h>
+#include <atomic>
 
 namespace SpiffsUpload {
 namespace {
 
-constexpr uint32_t kStallMs = 20000;
-constexpr size_t   kSector  = 4096;
+constexpr size_t kSector = 4096;
+constexpr size_t kStage  = 4096;   // staged in RAM before the FS is touched
+const char kMarker[] = "SPOOLHARD-PRODUCT=";
 
 SemaphoreHandle_t fsSem() {
     // Binary semaphore (no owner): taken by begin() on the AsyncTCP task,
@@ -29,16 +31,25 @@ SemaphoreHandle_t fsSem() {
 }
 
 volatile Phase s_phase = Phase::Idle;
-const void*    s_owner = nullptr;      // active upload
-const void*    s_lastOwner = nullptr;  // compare-only, for result lookup
+uint32_t       s_gen = 0;              // token generator
+uint32_t       s_tok = 0;              // active upload (0 = none)
+uint32_t       s_lastTok = 0;          // most recent upload (for results)
 char           s_err[96] = "";
 bool           s_failed = false;
+bool           s_committed = false;    // FS unmounted + Update.begin done
 size_t         s_written = 0;
 size_t         s_imageSize = 0;
 char           s_expected[65] = "";
+char           s_sig[48] = "";
+uint8_t*       s_stage = nullptr;
+size_t         s_stageLen = 0;
+uint32_t       s_stallMs = 0;
 mbedtls_sha256_context s_sha;
 TimerHandle_t  s_timer = nullptr;
 bool           s_reboot = false;
+std::atomic<bool> s_claimed{false};    // finish/abandon runs exactly once
+TaskFunction_t s_pendingFn = nullptr;  // spawn retry (OOM)
+const char*    s_pendingName = nullptr;
 
 void latch(const char* why) {
     if (!s_failed) {
@@ -58,6 +69,31 @@ String hexOf(const uint8_t* d) {
 const esp_partition_t* part() {
     return esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
                                     ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+}
+
+void freeStage() {
+    free(s_stage);
+    s_stage = nullptr;
+    s_stageLen = 0;
+}
+
+// Point of no return: unmount, start the raw write, flush staged bytes.
+bool commit() {
+    SPIFFS.end();                       // never raw-write a mounted FS
+    if (!Update.begin(s_imageSize, U_SPIFFS)) {
+        Serial.printf("[SpiffsUp] Update.begin failed: %s\n", Update.errorString());
+        SPIFFS.begin(true);
+        latch("Update.begin failed");
+        freeStage();
+        return false;
+    }
+    s_committed = true;
+    if (s_stageLen) {
+        size_t n = Update.write(s_stage, s_stageLen);
+        if (n != s_stageLen) { latch("short write to flash"); freeStage(); return false; }
+    }
+    freeStage();
+    return true;
 }
 
 bool remountAndWalk(const char** why) {
@@ -83,7 +119,7 @@ bool remountAndWalk(const char** why) {
 }
 
 // Everything after the last byte arrived. Returns true iff verified.
-// Always leaves SPIFFS mounted (formatted on failure). Caller releases lock.
+// Leaves SPIFFS mounted (formatted if it had been erased and failed).
 bool completeAndVerify(const char* clientSha) {
     const char* why = nullptr;
     uint8_t digest[32];
@@ -91,9 +127,10 @@ bool completeAndVerify(const char* clientSha) {
     mbedtls_sha256_free(&s_sha);
     bool ok = !s_failed;
 
+    if (ok && !s_committed && !commit()) ok = false;
     if (ok) {
         if (!Update.end(true)) { latch("Update.end failed"); ok = false; }
-    } else {
+    } else if (s_committed) {
         Update.abort();
     }
     if (ok && s_written == 0) { latch("empty upload"); ok = false; }
@@ -138,17 +175,20 @@ bool completeAndVerify(const char* clientSha) {
     }
     if (ok && !remountAndWalk(&why)) { latch(why); ok = false; }
 
-    if (!ok) {
-        Serial.printf("[SpiffsUp] FAILED (%s) — formatting SPIFFS\n", s_err);
+    if (!ok && s_committed) {
+        Serial.printf("[SpiffsUp] FAILED (%s) - formatting SPIFFS\n", s_err);
         SPIFFS.end();
         SPIFFS.format();
         SPIFFS.begin(true);
+    } else if (!ok) {
+        Serial.printf("[SpiffsUp] rejected before erase (%s) - old FS intact\n", s_err);
     }
     return ok;
 }
 
 void release(bool ok) {
-    s_owner = nullptr;
+    freeStage();
+    s_tok = 0;
     s_phase = ok ? Phase::Ok : Phase::Failed;
     xSemaphoreGive(fsSem());
 }
@@ -163,27 +203,41 @@ void finishTask(void*) {
 }
 
 void abandonTask(void*) {
-    Serial.println("[SpiffsUp] upload stalled — abandoning, formatting SPIFFS");
+    Serial.println("[SpiffsUp] upload stalled - abandoning");
     latch("upload stalled");
     completeAndVerify(nullptr);
     release(false);
     vTaskDelete(nullptr);
 }
 
-void spawn(TaskFunction_t fn, const char* name) {
+bool trySpawn(TaskFunction_t fn, const char* name) {
+    return xTaskCreate(fn, name, 6144, nullptr, 1, nullptr) == pdPASS;
+}
+
+// Claim the (single) completion slot and start it. Never runs the work
+// inline: on OOM the timer retries every second (FS stays quiesced).
+bool spawn(TaskFunction_t fn, const char* name) {
+    if (s_claimed.exchange(true)) return false;
     s_phase = Phase::Verifying;
-    if (xTaskCreate(fn, name, 6144, nullptr, 1, nullptr) != pdPASS) {
-        // OOM: do the work inline rather than leave the FS unmounted.
-        Serial.println("[SpiffsUp] task create failed, running inline");
-        bool ok = completeAndVerify(nullptr);
-        bool reboot = s_reboot;
-        release(ok);
-        if (ok && reboot) spoolhardDeferredReboot(2500);
+    if (!trySpawn(fn, name)) {
+        Serial.println("[SpiffsUp] task create failed, retrying in 1 s");
+        s_pendingFn = fn; s_pendingName = name;
+        if (s_timer) xTimerChangePeriod(s_timer, pdMS_TO_TICKS(1000), 0);
+    }
+    return true;
+}
+
+void onStall(TimerHandle_t) {   // timer-service task: spawn only, no work
+    if (s_pendingFn) {
+        if (trySpawn(s_pendingFn, s_pendingName)) s_pendingFn = nullptr;
+        else xTimerChangePeriod(s_timer, pdMS_TO_TICKS(1000), 0);
+    } else if (s_phase == Phase::Writing) {
+        spawn(abandonTask, "spiffs_abn");
     }
 }
 
-void onStall(TimerHandle_t) {
-    if (s_phase == Phase::Writing) spawn(abandonTask, "spiffs_abn");
+void touch() {
+    if (s_timer && s_stallMs) xTimerChangePeriod(s_timer, pdMS_TO_TICKS(s_stallMs), 0);
 }
 
 }  // namespace
@@ -196,78 +250,117 @@ size_t partitionSize() {
 bool tryLockFs() { return xSemaphoreTake(fsSem(), 0) == pdTRUE; }
 void unlockFs()  { xSemaphoreGive(fsSem()); }
 
-const char* begin(const void* owner, size_t imageSize) {
+uint32_t begin(const char** err, const char* productSig, size_t imageSize, uint32_t stallMs) {
     const esp_partition_t* p = part();
-    if (!p) return "no spiffs partition";
+    if (!p) { *err = "no spiffs partition"; return 0; }
     size_t sz = imageSize ? imageSize : p->size;
-    if (sz > p->size) return "image larger than frontend partition";
-    if (xSemaphoreTake(fsSem(), pdMS_TO_TICKS(2000)) != pdTRUE)
-        return "frontend upload already in progress";
+    if (sz > p->size) { *err = "image larger than frontend partition"; return 0; }
+    if (xSemaphoreTake(fsSem(), pdMS_TO_TICKS(2000)) != pdTRUE) {
+        *err = "frontend upload already in progress";
+        return 0;
+    }
     s_failed = false; s_err[0] = 0; s_written = 0; s_imageSize = sz;
-    s_expected[0] = 0; s_reboot = false;
-    SPIFFS.end();                       // never raw-write a mounted FS
+    s_expected[0] = 0; s_reboot = false; s_committed = false;
+    s_pendingFn = nullptr; s_claimed = false; s_stallMs = stallMs;
+    freeStage();
+    s_sig[0] = 0;
     mbedtls_sha256_init(&s_sha);
     mbedtls_sha256_starts(&s_sha, 0);
-    if (!Update.begin(sz, U_SPIFFS)) {
-        Serial.printf("[SpiffsUp] Update.begin failed: %s\n", Update.errorString());
-        mbedtls_sha256_free(&s_sha);
-        SPIFFS.begin(true);
-        xSemaphoreGive(fsSem());
-        return "Update.begin failed";
-    }
-    s_owner = owner;
-    s_lastOwner = owner;
+    ++s_gen;
+    if (s_gen == 0) ++s_gen;
+    s_tok = s_lastTok = s_gen;
     s_phase = Phase::Writing;
-    if (!s_timer) s_timer = xTimerCreate("spiffs_wd", pdMS_TO_TICKS(kStallMs), pdFALSE, nullptr, onStall);
-    if (s_timer) xTimerReset(s_timer, 0);
-    return nullptr;
+    bool stage = productSig && *productSig && strlen(productSig) < sizeof(s_sig);
+    if (stage) {
+        strcpy(s_sig, productSig);
+        s_stage = (uint8_t*)malloc(kStage);
+        stage = s_stage != nullptr;
+    }
+    if (!stage && !commit()) {
+        mbedtls_sha256_free(&s_sha);
+        s_tok = 0;
+        s_phase = Phase::Failed;
+        xSemaphoreGive(fsSem());
+        *err = "Update.begin failed";
+        return 0;
+    }
+    if (stallMs && !s_timer)
+        s_timer = xTimerCreate("spiffs_wd", pdMS_TO_TICKS(stallMs), pdFALSE, nullptr, onStall);
+    touch();
+    return s_tok;
 }
 
-bool owns(const void* owner) { return owner && s_owner == owner && s_phase == Phase::Writing; }
+bool owns(uint32_t tok) { return tok && s_tok == tok && s_phase == Phase::Writing; }
 
-void setExpectedSha256(const void* owner, const char* hex) {
-    if (!owns(owner) || !hex) return;
+void setExpectedSha256(uint32_t tok, const char* hex) {
+    if (!owns(tok) || !hex) return;
     strncpy(s_expected, hex, 64);
     s_expected[64] = 0;
 }
 
-bool write(const void* owner, const uint8_t* data, size_t len) {
-    if (!owns(owner) || s_failed) return false;
+bool write(uint32_t tok, const uint8_t* data, size_t len) {
+    if (!owns(tok) || s_failed) return false;
     if (s_written + len > s_imageSize) { latch("image larger than partition"); return false; }
-    size_t n = Update.write(const_cast<uint8_t*>(data), len);
-    if (n != len) {
-        Serial.printf("[SpiffsUp] short write %u/%u: %s\n", (unsigned)n, (unsigned)len, Update.errorString());
-        latch("short write to flash");
-        return false;
-    }
     mbedtls_sha256_update(&s_sha, data, len);
     s_written += len;
-    if (s_timer) xTimerReset(s_timer, 0);
+    touch();
+    if (!s_committed) {
+        size_t take = kStage - s_stageLen < len ? kStage - s_stageLen : len;
+        memcpy(s_stage + s_stageLen, data, take);
+        s_stageLen += take; data += take; len -= take;
+        size_t sl = strlen(s_sig), ml = sizeof(kMarker) - 1;
+        bool decide = s_stageLen == kStage;
+        for (size_t i = 0; i + ml <= s_stageLen; ++i) {
+            if (memcmp(s_stage + i, kMarker, ml) != 0) continue;
+            if (i + sl <= s_stageLen) {
+                if (memcmp(s_stage + i, s_sig, sl) != 0) {
+                    // FS not touched yet: the old frontend survives.
+                    latch("wrong product - signature mismatch (old frontend kept)");
+                    return false;
+                }
+                decide = true;       // right product: safe to erase
+            }
+            break;
+        }
+        if (decide && !commit()) return false;
+        if (!s_committed) return true;   // still staging
+    }
+    if (len) {
+        size_t n = Update.write(const_cast<uint8_t*>(data), len);
+        if (n != len) {
+            Serial.printf("[SpiffsUp] short write %u/%u: %s\n", (unsigned)n, (unsigned)len, Update.errorString());
+            latch("short write to flash");
+            return false;
+        }
+    }
     return true;
 }
 
-void fail(const void* owner, const char* reason) {
-    if (owns(owner)) latch(reason);
+void fail(uint32_t tok, const char* reason) {
+    if (owns(tok)) latch(reason);
 }
 
-void finish(const void* owner, bool reboot) {
-    if (!owns(owner)) return;
+void finish(uint32_t tok, bool reboot) {
+    if (!owns(tok)) return;
     if (s_timer) xTimerStop(s_timer, 0);
     s_reboot = reboot;
     spawn(finishTask, "spiffs_fin");
 }
 
-bool finishBlocking(const char* expectedSha256Hex) {
+bool finishBlocking(uint32_t tok, const char* expectedSha256Hex) {
+    if (!owns(tok)) return false;
     if (s_timer) xTimerStop(s_timer, 0);
+    if (s_claimed.exchange(true)) return false;
     s_phase = Phase::Verifying;
     bool ok = completeAndVerify(expectedSha256Hex);
     release(ok);
     return ok;
 }
 
-void abortBlocking(const char* reason) {
+void abortBlocking(uint32_t tok, const char* reason) {
+    if (!owns(tok)) return;
     if (s_timer) xTimerStop(s_timer, 0);
-    if (s_phase != Phase::Writing) return;
+    if (s_claimed.exchange(true)) return;
     latch(reason ? reason : "aborted");
     s_phase = Phase::Verifying;
     completeAndVerify(nullptr);
@@ -276,7 +369,7 @@ void abortBlocking(const char* reason) {
 
 Phase       phase() { return s_phase; }
 const char* error() { return s_err; }
-bool        failed(const void* owner) { return owner && owner == s_lastOwner && s_failed; }
-bool        isOwner(const void* owner) { return owner && owner == s_lastOwner; }
+bool        failed(uint32_t tok) { return tok && tok == s_lastTok && s_failed; }
+bool        isCurrent(uint32_t tok) { return tok && tok == s_lastTok; }
 
 }  // namespace SpiffsUpload

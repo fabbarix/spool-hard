@@ -21,8 +21,16 @@
 // Abandoned uploads (client vanished mid-stream) are detected by a
 // 20 s no-progress timer and recovered the same way (format + remount).
 //
-// Requests are identified by an opaque owner pointer (the request) so a
-// rejected/unauthenticated second upload can't write into the active one.
+// Uploads are identified by a generation token (never a raw request
+// pointer, which can be reused), returned by begin().
+//
+// Product check before destruction: begin() only arms the upload and
+// stages the first 4 KB in RAM. If the staged bytes contain a
+// "SPOOLHARD-PRODUCT=" marker for a different product the upload is
+// rejected with the old FS untouched. The FS is quiesced/erased only once
+// the right marker is seen (mkspiffs puts it in the first file, ~offset 500)
+// or 4 KB went by without any marker (then the final-chunk check in the
+// handler remains the last line of defence, and a wrong image wipes the FS).
 namespace SpiffsUpload {
 
 enum class Phase : uint8_t { Idle, Writing, Verifying, Ok, Failed };
@@ -30,37 +38,39 @@ enum class Phase : uint8_t { Idle, Writing, Verifying, Ok, Failed };
 // Size of the SPIFFS data partition per the partition table (0 = none).
 size_t partitionSize();
 
-// Start an upload. Returns nullptr on success, else a short static error
-// string (no quotes — safe to embed in JSON). `imageSize` 0 = whole partition.
-const char* begin(const void* owner, size_t imageSize = 0);
+// Start an upload. Returns a nonzero token on success; on refusal returns 0
+// and sets *err to a short static string (no quotes; JSON-safe).
+// `productSig` e.g. "SPOOLHARD-PRODUCT=console" (nullptr = no early check).
+// `imageSize` 0 = whole partition. `stallMs` 0 disables the abandon timer
+// (callers already supervised, e.g. otaRun).
+uint32_t begin(const char** err, const char* productSig = nullptr,
+               size_t imageSize = 0, uint32_t stallMs = 20000);
 
 // Optional expected sha256 (64 hex chars) of the uploaded image bytes.
-void setExpectedSha256(const void* owner, const char* hex);
+void setExpectedSha256(uint32_t tok, const char* hex);
 
-// Append bytes. Returns false (and latches an error) on a short write.
-bool write(const void* owner, const uint8_t* data, size_t len);
+// Append bytes. Returns false (and latches an error) on failure.
+bool write(uint32_t tok, const uint8_t* data, size_t len);
 
-// True while `owner` holds the active (Writing) upload.
-bool owns(const void* owner);
+// True while `tok` is the active upload still accepting bytes.
+bool owns(uint32_t tok);
 
-// Latch a failure (e.g. wrong product signature); finish() will clean up.
-void fail(const void* owner, const char* reason);
+// Latch a failure (e.g. wrong product at the final check).
+void fail(uint32_t tok, const char* reason);
 
-// Async finish: spawns the verify task and returns immediately. On success
-// reboots (deferred) when `reboot` is true.
-void finish(const void* owner, bool reboot);
+// Async finish: spawns the verify task and returns immediately.
+void finish(uint32_t tok, bool reboot);
 
 // Blocking finish for callers already on their own task (otaRun).
-// Returns true iff the written image verified. Never reboots.
-bool finishBlocking(const char* expectedSha256Hex);
+bool finishBlocking(uint32_t tok, const char* expectedSha256Hex);
 
-// Abort an in-progress upload on the caller's task (format + remount).
-void abortBlocking(const char* reason);
+// Abort on the caller's task (formats if the FS was already erased).
+void abortBlocking(uint32_t tok, const char* reason);
 
 Phase       phase();
-const char* error();                    // latched error of the last upload
-bool        failed(const void* owner);  // error latched for this owner's upload
-bool        isOwner(const void* owner); // owner of the most recent upload
+const char* error();                  // latched error of the last upload
+bool        failed(uint32_t tok);     // error latched for upload `tok`
+bool        isCurrent(uint32_t tok);  // tok is the most recent upload
 
 // FS lock for SPIFFS writers other than the uploader. Non-blocking;
 // returns false while an upload owns the filesystem. Pair with unlockFs().

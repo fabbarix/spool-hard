@@ -1111,16 +1111,15 @@ void ConsoleWebServer::_setupRoutes() {
     _server.on("/api/upload/spiffs", HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             if (!_requireAuth(req)) return;
-            if (_spiffsBeginErr) {
-                Serial.printf("[Upload] Frontend response 409: %s\n", _spiffsBeginErr);
-                req->send(409, "application/json", String("{\"ok\":false,\"error\":\"") + _spiffsBeginErr + "\"}");
+            if (req != _spiffsReq || !SpiffsUpload::isCurrent(_spiffsTok)) {
+                const char* e = _spiffsBeginErr ? _spiffsBeginErr : "no upload in progress";
+                req->send(_spiffsBeginErr ? 409 : 400, "application/json",
+                          String("{\"ok\":false,\"error\":\"") + e + "\"}");
                 _spiffsBeginErr = nullptr;
                 return;
             }
-            if (!SpiffsUpload::isOwner(req) || SpiffsUpload::failed(req)) {
-                const char* reason = SpiffsUpload::isOwner(req) ? SpiffsUpload::error() : "unauthorized or incomplete upload";
-                Serial.printf("[Upload] Frontend response 400: %s\n", reason);
-                req->send(400, "application/json", String("{\"ok\":false,\"error\":\"") + reason + "\"}");
+            if (SpiffsUpload::failed(_spiffsTok)) {
+                req->send(400, "application/json", String("{\"ok\":false,\"error\":\"") + SpiffsUpload::error() + "\"}");
                 return;
             }
             if (SpiffsUpload::phase() == SpiffsUpload::Phase::Ok) {
@@ -1142,16 +1141,21 @@ void ConsoleWebServer::_setupRoutes() {
                 _uploadLabel = filename;
                 if (_onUploadStarted) _onUploadStarted("spiffs");
                 if (_onUploadProgress) _onUploadProgress(0, "spiffs", _uploadLabel.c_str());
-                _spiffsBeginErr = SpiffsUpload::begin(req);
-                if (_spiffsBeginErr) {
-                    Serial.printf("[Upload] Begin failed: %s\n", _spiffsBeginErr);
+                const char* berr = nullptr;
+                uint32_t tok = SpiffsUpload::begin(&berr, SPOOLHARD_PRODUCT_SIGNATURE);
+                if (!tok) {
+                    _spiffsBeginErr = berr;
+                    if (req == _spiffsReq) _spiffsReq = nullptr;
+                    Serial.printf("[Upload] Begin failed: %s\n", berr);
                     return;
                 }
+                _spiffsReq = req;
+                _spiffsTok = tok;
                 String sh = req->hasParam("sha256") ? req->getParam("sha256")->value()
                                                     : req->header("X-Sha256");
-                if (sh.length()) SpiffsUpload::setExpectedSha256(req, sh.c_str());
+                if (sh.length()) SpiffsUpload::setExpectedSha256(_spiffsTok, sh.c_str());
             }
-            if (!SpiffsUpload::owns(req)) return;
+            if (req != _spiffsReq || !SpiffsUpload::owns(_spiffsTok)) return;
             _uploadMatcher.feed(data, len);
             // Scan the SPIFFS stream for the same marker we plant in the
             // firmware binary — release.sh writes a plain-text file into
@@ -1162,7 +1166,7 @@ void ConsoleWebServer::_setupRoutes() {
                 _uploadLabel = String("v") + _uploadVersion.version;
                 Serial.printf("[Upload] Frontend version detected: %s\n", _uploadLabel.c_str());
             }
-            SpiffsUpload::write(req, data, len);
+            SpiffsUpload::write(_spiffsTok, data, len);
 
             if (_onUploadProgress && _uploadContentLength > 0) {
                 int pct = (int)((uint64_t)(index + len) * 100 / _uploadContentLength);
@@ -1179,9 +1183,9 @@ void ConsoleWebServer::_setupRoutes() {
                               _uploadMatcher.matched() ? "OK" : "MISSING");
                 if (!_uploadMatcher.matched()) {
                     Serial.println("[Upload] Frontend rejected: product signature missing");
-                    SpiffsUpload::fail(req, "wrong product - expected " PRODUCT_NAME " frontend");
+                    SpiffsUpload::fail(_spiffsTok, "wrong product - expected " PRODUCT_NAME " frontend");
                 }
-                SpiffsUpload::finish(req, true);
+                SpiffsUpload::finish(_spiffsTok, true);
             }
         }
     );

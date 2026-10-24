@@ -402,10 +402,12 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
     // unmount, checked writes, readback + remount verify, format on failure.
     // We are on the ota_run task, so the blocking variants are fine.
     const bool isFs = (partition == U_SPIFFS);
-    static const int kFsOwner = 0;   // any stable address
+    uint32_t fsTok = 0;
     if (isFs) {
-        const char* e = SpiffsUpload::begin(&kFsOwner, (size_t)total);
-        if (e) {
+        const char* e = nullptr;
+        // stallMs=0: otaRun supervises its own stalls (30 s); no abandon timer.
+        fsTok = SpiffsUpload::begin(&e, nullptr, (size_t)total, 0);
+        if (!fsTok) {
             Serial.printf("[OTA] SpiffsUpload::begin failed: %s\n", e);
             http.end();
             return false;
@@ -416,7 +418,7 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
         return false;
     }
     auto abortUpdate = [&](const char* why) {
-        if (isFs) SpiffsUpload::abortBlocking(why);
+        if (isFs) SpiffsUpload::abortBlocking(fsTok, why);
         else Update.abort();
     };
 
@@ -445,7 +447,7 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
         }
         size_t n = stream->readBytes(buf.get(), avail > kBuf ? kBuf : avail);
         if (n == 0) continue;
-        bool wok = isFs ? SpiffsUpload::write(&kFsOwner, buf.get(), n)
+        bool wok = isFs ? SpiffsUpload::write(fsTok, buf.get(), n)
                         : (Update.write(buf.get(), n) == n);
         if (!wok) {
             Serial.printf("[OTA] Update.write short: %s\n", Update.errorString());
@@ -488,7 +490,7 @@ bool _streamToUpdate(const String& url, uint32_t expectedSize,
     }
     if (isFs) {
         http.end();
-        if (!SpiffsUpload::finishBlocking(expectedSha256.c_str())) {
+        if (!SpiffsUpload::finishBlocking(fsTok, expectedSha256.c_str())) {
             Serial.printf("[OTA] frontend verify failed: %s (SPIFFS formatted)\n", SpiffsUpload::error());
             return false;
         }

@@ -106,6 +106,8 @@ private:
     VersionMarkerParser     _uploadVersion;   // log-only on the scale
     bool _uploadRejectedProduct = false;  // set on signature mismatch
     bool _uploadIsSpiffs        = false;  // remembered for the response path
+    const void* _spiffsReq = nullptr;       // request that owns the SPIFFS upload
+    uint32_t    _spiffsTok = 0;             // SpiffsUpload generation token
     const char* _spiffsBeginErr = nullptr;  // SpiffsUpload::begin() refusal for the response
 
     std::function<void(const char*)> _onUploadStarted;
