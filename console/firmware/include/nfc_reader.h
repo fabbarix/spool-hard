@@ -58,6 +58,7 @@ private:
     uint8_t  _misses      = 0;
 
     std::atomic<uint32_t> _polls{0};
+    std::atomic<uint32_t> _pings{0};
     std::atomic<uint32_t> _pageReads{0};
     std::atomic<uint32_t> _events{0};
     std::atomic<uint32_t> _dropped{0};
