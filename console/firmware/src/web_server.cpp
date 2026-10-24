@@ -492,13 +492,13 @@ void ConsoleWebServer::_setupRoutes() {
     _server.addHandler(&_ws);
 
     // Auth + device-name routes — shared lib registrations.
-    _server.on("/api/auth-status", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/auth-status"), HTTP_GET, [](AsyncWebServerRequest* req) {
         SpoolhardAuth::handleAuthStatus(req, "SpoolHardConsole", "console");
     });
-    _server.on("/api/device-name-config", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/device-name-config"), HTTP_GET, [](AsyncWebServerRequest* req) {
         SpoolhardAuth::handleDeviceNameGet(req, "SpoolHardConsole");
     });
-    _server.on("/api/device-name-config", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/device-name-config"), HTTP_POST,
         [](AsyncWebServerRequest*) {},
         nullptr,
         [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -512,29 +512,29 @@ void ConsoleWebServer::_setupRoutes() {
     // log file, not the in-RAM ring head.
     SpoolhardCommonRoutes::registerAll(_server);
 
-    _server.on("/api/wifi-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/wifi-status"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleWifiStatus(req);
     });
 
-    _server.on("/api/ota-config", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-config"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleOtaConfigGet(req);
     });
-    _server.on("/api/ota-config", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/ota-config"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handleOtaConfigPost(req, data, len);
         }
     );
-    _server.on("/api/ota-run", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-run"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (_onOtaRequested) _onOtaRequested();
         req->send(200, "application/json", "{\"ok\":true}");
     });
     // Periodic-check telemetry + manual triggers.
-    _server.on("/api/ota-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-status"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleOtaStatus(req);
     });
-    _server.on("/api/ota-check", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-check"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         g_ota_checker.kickNow();
         // Phase 5: also forward to the paired scale so a single "Check now"
@@ -546,7 +546,7 @@ void ConsoleWebServer::_setupRoutes() {
     // Phase-5 trigger: tell the paired scale to flash itself NOW using its
     // stored OtaConfig. Returns 503 if the link is down so the React UI can
     // surface a clear "scale offline, can't update" message.
-    _server.on("/api/ota-update-scale", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-update-scale"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (!_scale || !_scale->isConnected()) {
             req->send(503, "application/json",
@@ -575,7 +575,7 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleCrashDelete(req);
     });
-    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/crashes/");
+    spoolhard::addPathReject(_server, HTTP_ALL, "/api/crashes/");
     _server.on("/api/crashes", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCrashesList(req);
@@ -584,14 +584,14 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleCrashesDeleteAll(req);
     });
-    _server.on("/api/logs/current", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/logs/current"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCurrentLog(req);
     });
     // Rotated tail of the previous (or a very long current) session.
     // current.log is deleted on every clean boot, so after a non-crash
     // wedge + reset this is the only remotely reachable history.
-    _server.on("/api/logs/previous", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/logs/previous"), HTTP_GET, [](AsyncWebServerRequest* req) {
         if (!SpoolhardAuth::requireAuth(req)) return;
         if (!CrashLogger::isAvailable()) {
             req->send(503, "application/json",
@@ -608,23 +608,23 @@ void ConsoleWebServer::_setupRoutes() {
 
     // /api/restart is registered above by SpoolhardCommonRoutes::registerAll.
     // Legacy alias for older clients that POST to /api/reset-device.
-    _server.on("/api/reset-device", HTTP_POST, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/reset-device"), HTTP_POST, [](AsyncWebServerRequest* req) {
         if (!SpoolhardAuth::requireAuth(req)) return;
         req->send(200, "application/json", "{\"status\":\"resetting\"}");
         spoolhardDeferredReboot();
     });
 
-    _server.on("/api/test-key", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/test-key"), HTTP_GET, [](AsyncWebServerRequest* req) {
         SpoolhardAuth::handleTestKey(req);
     });
-    _server.on("/api/fixed-key-config", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/fixed-key-config"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!SpoolhardAuth::requireAuth(req)) return;
             SpoolhardAuth::handleFixedKeyConfigPost(req, data, len);
         }
     );
 
-    _server.on("/api/firmware-info", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/firmware-info"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleFirmwareInfo(req);
     });
 
@@ -634,11 +634,11 @@ void ConsoleWebServer::_setupRoutes() {
     // accepts the same shape and writes everything back. Both are
     // gated by _requireAuth: the backup contains every secret the
     // device knows.
-    _server.on("/api/backup", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/backup"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleBackupGet(req);
     });
-    _server.on("/api/restore", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/restore"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             // Final response handler — fires after every body chunk has
             // been delivered. Validation + apply runs here so we can
@@ -686,11 +686,11 @@ void ConsoleWebServer::_setupRoutes() {
     // Status + toggle for where the spool JSONL lives. Frequent rewrites
     // during prints are the only meaningful flash-wear contributor on the
     // userfs partition, so steering them to SD is worth the option.
-    _server.on("/api/storage/spools", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/storage/spools"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleStorageSpoolsStatus(req);
     });
-    _server.on("/api/storage/spools", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/storage/spools"), HTTP_POST,
         [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
@@ -701,7 +701,10 @@ void ConsoleWebServer::_setupRoutes() {
     spoolhard::addPathRoute(_server, HTTP_GET, "/api/spools/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handleSpoolGet(req);
     });
-    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/spools/");
+    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/spools/", "", true, false, [this](AsyncWebServerRequest* req) {
+        _handleSpoolDelete(req);
+    });
+    spoolhard::addPathReject(_server, HTTP_ALL, "/api/spools/");
     _server.on("/api/spools", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleSpoolsList(req);
     });
@@ -711,9 +714,6 @@ void ConsoleWebServer::_setupRoutes() {
             _handleSpoolPost(req, data, len);
         }
     );
-    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/spools/", "", true, false, [this](AsyncWebServerRequest* req) {
-        _handleSpoolDelete(req);
-    });
 
     // ── User filament CRUD + cloud sync ──────────────────────
     //
@@ -724,11 +724,11 @@ void ConsoleWebServer::_setupRoutes() {
     // empty lambda (the body parser does the work) so a request sent
     // here without a body would just sit until the connection drops.
     // Same mistake the comment on the printers section warns about.
-    _server.on("/api/user-filaments/cloud-sync", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/user-filaments/cloud-sync"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleUserFilamentsCloudSync(req);
     });
-    _server.on("/api/user-filaments/cloud-sync/status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/user-filaments/cloud-sync/status"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentsCloudSyncStatus(req);
     });
     spoolhard::addPathRoute(_server, HTTP_POST, "/api/user-filaments/", "/cloud-push", true, false, [this](AsyncWebServerRequest* req) {
@@ -739,27 +739,27 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleUserFilamentCloudDetail(req);
     });
-    _server.on("/api/bambu-cloud/filament-by-name", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/filament-by-name"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCloudFilamentByName(req);
     });
-    _server.on("/api/bambu-cloud/preset", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/preset"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCloudPresetById(req);
     });
-    _server.on("/api/bambu-cloud/public-cache", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/public-cache"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCloudPublicCacheGet(req);
     });
-    _server.on("/api/bambu-cloud/public-cache/refresh", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/public-cache/refresh"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCloudPublicCacheRefresh(req);
     });
-    _server.on("/api/bambu-cloud/public-cache", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/public-cache"), HTTP_DELETE, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCloudPublicCacheDelete(req);
     });
-    _server.on("/api/bambu-cloud/public-cache/upload", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/public-cache/upload"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             // Final response handler — `_cacheUploadFile` is closed in
             // the chunk handler when `final` lands. If the file's there,
@@ -782,16 +782,6 @@ void ConsoleWebServer::_setupRoutes() {
     spoolhard::addPathRoute(_server, HTTP_GET, "/api/user-filaments/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentGet(req);
     });
-    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/user-filaments/");
-    _server.on("/api/user-filaments", HTTP_GET, [this](AsyncWebServerRequest* req) {
-        _handleUserFilamentsList(req);
-    });
-    _server.on("/api/user-filaments", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
-        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
-            if (!_requireAuth(req)) return;
-            _handleUserFilamentPost(req, data, len);
-        }
-    );
     spoolhard::addPathRoute(_server, HTTP_PUT, "/api/user-filaments/", "", true, false, [](AsyncWebServerRequest*) {},
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
@@ -801,6 +791,16 @@ void ConsoleWebServer::_setupRoutes() {
     spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/user-filaments/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentDelete(req);
     });
+    spoolhard::addPathReject(_server, HTTP_ALL, "/api/user-filaments/");
+    _server.on("/api/user-filaments", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        _handleUserFilamentsList(req);
+    });
+    _server.on("/api/user-filaments", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!_requireAuth(req)) return;
+            _handleUserFilamentPost(req, data, len);
+        }
+    );
 
     // ── Printers CRUD ────────────────────────────────────────
     // Register specific sub-routes FIRST — the ESPAsyncWebServer router
@@ -868,14 +868,17 @@ void ConsoleWebServer::_setupRoutes() {
 
     // Registered before the `/api/printers/<serial>` GET PathRoute so the
     // exact path doesn't accidentally get swallowed as a serial.
-    _server.on("/api/printers/refresh", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/printers/refresh"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handlePrinterRefresh(req);
     });
     spoolhard::addPathRoute(_server, HTTP_GET, "/api/printers/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handlePrinterGet(req);
     });
-    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/printers/");
+    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/printers/", "", true, false, [this](AsyncWebServerRequest* req) {
+        _handlePrinterDelete(req);
+    });
+    spoolhard::addPathReject(_server, HTTP_ALL, "/api/printers/");
     _server.on("/api/printers", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handlePrintersList(req);
     });
@@ -885,23 +888,20 @@ void ConsoleWebServer::_setupRoutes() {
             _handlePrinterPost(req, data, len);
         }
     );
-    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/printers/", "", true, false, [this](AsyncWebServerRequest* req) {
-        _handlePrinterDelete(req);
-    });
-    _server.on("/api/discovery/printers", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/discovery/printers"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleDiscoveryPrinters(req);
     });
     // Core-weights DB (auto-learned empty-spool reference values).
-    _server.on("/api/core-weights", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/core-weights"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleCoreWeightsGet(req);
     });
-    _server.on("/api/core-weights", HTTP_PUT,
+    _server.on(AsyncURIMatcher::exact("/api/core-weights"), HTTP_PUT,
         [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handleCoreWeightsPut(req, data, len);
         });
-    _server.on("/api/core-weights", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/core-weights"), HTTP_DELETE, [this](AsyncWebServerRequest* req) {
         _handleCoreWeightsDelete(req);
     });
 
@@ -909,48 +909,48 @@ void ConsoleWebServer::_setupRoutes() {
     // Calibration weight presets (config for the LCD's scale-calibration
     // wizard). PUT replaces the whole list; the firmware normalises
     // (positive, sorted, deduped, capped) before persisting.
-    _server.on("/api/calibration-presets", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/calibration-presets"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleCalibrationPresetsGet(req);
     });
-    _server.on("/api/calibration-presets", HTTP_PUT,
+    _server.on(AsyncURIMatcher::exact("/api/calibration-presets"), HTTP_PUT,
         [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handleCalibrationPresetsPut(req, data, len);
         });
 
-    _server.on("/api/quick-weights", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/quick-weights"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleQuickWeightsGet(req);
     });
-    _server.on("/api/quick-weights", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/quick-weights"), HTTP_POST,
         [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handleQuickWeightsPost(req, data, len);
         });
-    _server.on("/api/display-config", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/display-config"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleDisplayConfigGet(req);
     });
-    _server.on("/api/display-config", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/display-config"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handleDisplayConfigPost(req, data, len);
         });
 
-    _server.on("/api/discovery/scales", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/discovery/scales"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleDiscoveryScales(req);
     });
 
     // ── Scale-link forwarding ────────────────────────────────
-    _server.on("/api/scale-link", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/scale-link"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleScaleLinkStatus(req);
     });
-    _server.on("/api/scale-link/tare", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/scale-link/tare"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (_scale) _scale->tare();
         req->send(200, "application/json", "{\"ok\":true}");
     });
-    _server.on("/api/scale-link/calibrate", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/scale-link/calibrate"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             JsonDocument doc;
@@ -967,50 +967,50 @@ void ConsoleWebServer::_setupRoutes() {
             req->send(200, "application/json", "{\"ok\":true}");
         }
     );
-    _server.on("/api/scale-link/read-tag", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/scale-link/read-tag"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (_scale) _scale->readTag();
         req->send(200, "application/json", "{\"ok\":true}");
     });
 
     // Shared secret between console and its paired scale (future HMAC use).
-    _server.on("/api/scale-secret", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/scale-secret"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleScaleSecretGet(req);
     });
-    _server.on("/api/scale-secret", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/scale-secret"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             _handleScaleSecretPost(req, data, len);
         }
     );
 
     // ── Bambu Lab cloud auth ────────────────────────────────
-    _server.on("/api/bambu-cloud", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleBambuCloudGet(req);
     });
-    _server.on("/api/bambu-cloud", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud"), HTTP_DELETE, [this](AsyncWebServerRequest* req) {
         _handleBambuCloudClear(req);
     });
-    _server.on("/api/bambu-cloud/login", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/login"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             _handleBambuCloudLogin(req, data, len);
         }
     );
-    _server.on("/api/bambu-cloud/login-code", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/login-code"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             _handleBambuCloudLoginCode(req, data, len);
         }
     );
-    _server.on("/api/bambu-cloud/login-tfa", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/login-tfa"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             _handleBambuCloudLoginTfa(req, data, len);
         }
     );
-    _server.on("/api/bambu-cloud/token", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/token"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             _handleBambuCloudSetToken(req, data, len);
         }
     );
-    _server.on("/api/bambu-cloud/verify", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/bambu-cloud/verify"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         _handleBambuCloudVerify(req);
     });
 
@@ -1278,7 +1278,7 @@ void ConsoleWebServer::_setupRoutes() {
     // registered first. Earlier ordering caused the info endpoint to stream
     // the actual .db file instead of JSON, which the frontend parsed as an
     // empty object → "No library uploaded yet" even after a clean upload.
-    _server.on("/api/filaments/info", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/filaments/info"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         JsonDocument doc;
         doc["present"]    = false;
@@ -1296,7 +1296,7 @@ void ConsoleWebServer::_setupRoutes() {
         req->send(200, "application/json", out);
     });
 
-    _server.on("/api/filaments", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/filaments"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (!g_sd.isMounted() || !SD.exists(FILAMENTS_RELPATH)) {
             req->send(404, "application/json", "{\"error\":\"no library uploaded\"}");
@@ -1312,7 +1312,7 @@ void ConsoleWebServer::_setupRoutes() {
     // to /ftp_dl.bin on the SD card. SD.open paths are bare `/foo` —
     // the wrong-prefix `/sd/...` form silently fails. Auth-gated; sent
     // as attachment so the browser saves rather than rendering bytes.
-    _server.on("/api/ftp-download", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ftp-download"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (!g_sd.isMounted() || !SD.exists("/ftp_dl.bin")) {
             req->send(404, "application/json", "{\"error\":\"no download available\"}");
@@ -1324,7 +1324,7 @@ void ConsoleWebServer::_setupRoutes() {
         req->send(resp);
     });
 
-    _server.on("/api/filaments", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/filaments"), HTTP_DELETE, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (!g_sd.isMounted()) {
             req->send(503, "application/json", "{\"error\":\"SD card not mounted\"}");
@@ -1343,14 +1343,14 @@ void ConsoleWebServer::_setupRoutes() {
     });
 
     // ── Debug toggles (session-only) ─────────────────────────
-    _server.on("/api/debug/config", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/debug/config"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         JsonDocument doc;
         doc["log_ams"] = _logAmsRaw;
         String out; serializeJson(doc, out);
         req->send(200, "application/json", out);
     });
-    _server.on("/api/debug/config", HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+    _server.on(AsyncURIMatcher::exact("/api/debug/config"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             JsonDocument body;

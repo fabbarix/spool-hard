@@ -187,13 +187,13 @@ void ScaleWebServer::_setupRoutes() {
     _server.addHandler(&_ws);
 
     // Auth + device-name + key routes — shared lib registrations.
-    _server.on("/api/auth-status", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/auth-status"), HTTP_GET, [](AsyncWebServerRequest* req) {
         SpoolhardAuth::handleAuthStatus(req, "SpoolHardScale", "scale");
     });
-    _server.on("/api/device-name-config", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/device-name-config"), HTTP_GET, [](AsyncWebServerRequest* req) {
         SpoolhardAuth::handleDeviceNameGet(req, "SpoolHardScale");
     });
-    _server.on("/api/device-name-config", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/device-name-config"), HTTP_POST,
         [](AsyncWebServerRequest*) {},
         nullptr,
         [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -201,10 +201,10 @@ void ScaleWebServer::_setupRoutes() {
             SpoolhardAuth::handleDeviceNamePost(req, data, len);
         }
     );
-    _server.on("/api/test-key", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/test-key"), HTTP_GET, [](AsyncWebServerRequest* req) {
         SpoolhardAuth::handleTestKey(req);
     });
-    _server.on("/api/fixed-key-config", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/fixed-key-config"), HTTP_POST,
         [](AsyncWebServerRequest*) {},
         nullptr,
         [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -218,21 +218,21 @@ void ScaleWebServer::_setupRoutes() {
 
     // ── Scale-specific API endpoints ────────────────────────────
 
-    _server.on("/api/nfc-module-config", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/nfc-module-config"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleNfcConfig(req);
     });
-    _server.on("/api/nfc-module-config", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/nfc-module-config"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         _handleNfcConfig(req);
     });
 
-    _server.on("/api/wifi-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/wifi-status"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleWifiStatus(req);
     });
 
-    _server.on("/api/ota-config", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-config"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleOtaConfigGet(req);
     });
-    _server.on("/api/ota-config", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/ota-config"), HTTP_POST,
         [](AsyncWebServerRequest*) {},
         nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -243,15 +243,15 @@ void ScaleWebServer::_setupRoutes() {
     // Periodic-check telemetry + manual triggers (Phase 4 parity with the
     // console UI). Same surface, single-product payload — the scale's UI
     // only ever flashes the scale itself.
-    _server.on("/api/ota-status", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-status"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleOtaStatus(req);
     });
-    _server.on("/api/ota-check", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-check"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         g_ota_checker.kickNow();
         req->send(200, "application/json", "{\"ok\":true}");
     });
-    _server.on("/api/ota-run", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/ota-run"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (_onOtaRequested) _onOtaRequested();
         req->send(200, "application/json", "{\"ok\":true}");
@@ -263,7 +263,7 @@ void ScaleWebServer::_setupRoutes() {
 
     // Legacy alias kept for backwards-compat with older console builds
     // that still POST to /api/reset-device. New clients use /api/restart.
-    _server.on("/api/reset-device", HTTP_POST, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/reset-device"), HTTP_POST, [](AsyncWebServerRequest* req) {
         if (!SpoolhardAuth::requireAuth(req)) return;
         req->send(200, "application/json", "{\"status\":\"resetting\"}");
         spoolhardDeferredReboot();
@@ -286,7 +286,7 @@ void ScaleWebServer::_setupRoutes() {
         if (SPIFFS.exists(path)) SPIFFS.remove(path);
         req->send(200, "application/json", "{\"ok\":true}");
     });
-    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/crashes/");
+    spoolhard::addPathReject(_server, HTTP_ALL, "/api/crashes/");
     _server.on("/api/crashes", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         JsonDocument doc(&g_psramJsonAlloc);
@@ -318,7 +318,7 @@ void ScaleWebServer::_setupRoutes() {
         req->send(200, "application/json", out);
     });
 
-    _server.on("/api/tags-in-store", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/tags-in-store"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (!SPIFFS.exists("/tags_in_store.txt")) {
             req->send(200, "application/json", "{\"tags\":\"\"}");
@@ -336,10 +336,10 @@ void ScaleWebServer::_setupRoutes() {
 
     // ── Scale config + actions ─────────────────────────────
 
-    _server.on("/api/scale-config", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/scale-config"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleScaleConfigGet(req);
     });
-    _server.on("/api/scale-config", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/scale-config"), HTTP_POST,
         [](AsyncWebServerRequest*) {},
         nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -347,7 +347,7 @@ void ScaleWebServer::_setupRoutes() {
             _handleScaleConfigPost(req, data, len);
         }
     );
-    _server.on("/api/scale-tare", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/scale-tare"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (_onTare) _onTare();
         // Return the fresh tare so the client can patch its cache without a
@@ -367,7 +367,7 @@ void ScaleWebServer::_setupRoutes() {
                  "{\"ok\":true,\"tare_raw\":%ld}", newTare);
         req->send(200, "application/json", body);
     });
-    _server.on("/api/scale-calibrate", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/scale-calibrate"), HTTP_POST,
         [](AsyncWebServerRequest*) {},
         nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -388,7 +388,7 @@ void ScaleWebServer::_setupRoutes() {
     );
 
     // Capture current raw ADC reading (averaged)
-    _server.on("/api/scale-raw", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/scale-raw"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         long raw = _onCaptureRaw ? _onCaptureRaw() : 0;
         JsonDocument doc(&g_psramJsonAlloc);
@@ -399,7 +399,7 @@ void ScaleWebServer::_setupRoutes() {
     });
 
     // Add a calibration point (captures raw at the moment of call)
-    _server.on("/api/scale-cal-point", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/scale-cal-point"), HTTP_POST,
         [](AsyncWebServerRequest*) {},
         nullptr,
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -420,7 +420,7 @@ void ScaleWebServer::_setupRoutes() {
     );
 
     // Clear all calibration points
-    _server.on("/api/scale-cal-clear", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/scale-cal-clear"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (_onClearCal) _onClearCal();
         req->send(200, "application/json", "{\"ok\":true}");
@@ -431,7 +431,7 @@ void ScaleWebServer::_setupRoutes() {
     // the trigger validation below. Each entry mirrors a `show*`/`ack*`
     // method in rgb_led.h, keyed by `id` — main.cpp's LED test override
     // maps the id back to the right call.
-    _server.on("/api/led-legend", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/led-legend"), HTTP_GET, [](AsyncWebServerRequest* req) {
         // No auth — purely informational. The trigger below IS auth-gated.
         AsyncResponseStream* s = req->beginResponseStream("application/json");
         s->print(R"json({"states":[)json"
@@ -474,7 +474,7 @@ void ScaleWebServer::_setupRoutes() {
         req->send(s);
     });
 
-    _server.on("/api/led-test", HTTP_POST, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/led-test"), HTTP_POST, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         if (!req->hasParam("state")) {
             req->send(400, "application/json",
@@ -493,18 +493,18 @@ void ScaleWebServer::_setupRoutes() {
 
     // ── Firmware info ────────────────────────────────────────
 
-    _server.on("/api/firmware-info", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/firmware-info"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleFirmwareInfo(req);
     });
 
     // ── Backup / restore ─────────────────────────────────────
     // Same wire format the console uses; see spoolhard_core/backup.h.
     // Auth-gated because the file contains every secret the scale knows.
-    _server.on("/api/backup", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/api/backup"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleBackupGet(req);
     });
-    _server.on("/api/restore", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/restore"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             SpoolhardBackup::RestoreReport rep;
             String why;
