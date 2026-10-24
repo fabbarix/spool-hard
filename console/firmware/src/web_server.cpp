@@ -1015,7 +1015,7 @@ void ConsoleWebServer::_setupRoutes() {
     });
 
     // ── Firmware upload (recovery path) ──────────────────────
-    _server.on("/api/upload/firmware", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/upload/firmware"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             if (!_uploadAccepted) {
                 const char* reason = _uploadRejectReason ? _uploadRejectReason : "unknown";
@@ -1105,7 +1105,7 @@ void ConsoleWebServer::_setupRoutes() {
     // ── Frontend upload (web UI served from SPIFFS) ──────────
     // Path stays /api/upload/spiffs so older uploaders still work; only the
     // release filename and user-visible labels are renamed.
-    _server.on("/api/upload/spiffs", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/upload/spiffs"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             if (!_uploadAccepted) {
                 const char* reason = _uploadRejectReason ? _uploadRejectReason : "unknown";
@@ -1205,7 +1205,7 @@ void ConsoleWebServer::_setupRoutes() {
     // "/sd/..." here would collide into "/sd/sd/..." and fail to open.
     static constexpr const char* FILAMENTS_RELPATH = "/filaments.jsonl";
 
-    _server.on("/api/upload/filaments", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/upload/filaments"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             if (!_filamentsUploadOk) {
                 char body[160];
@@ -1401,7 +1401,7 @@ void ConsoleWebServer::_setupRoutes() {
 
     // Log every incoming request that isn't handled by a registered route.
     // Helps diagnose 404s from the SPA or missing assets.
-    _server.on("/__debug/list", HTTP_GET, [](AsyncWebServerRequest* req) {
+    _server.on(AsyncURIMatcher::exact("/__debug/list"), HTTP_GET, [](AsyncWebServerRequest* req) {
         String out = "SPIFFS files:\n";
         File root = SPIFFS.open("/");
         File f = root.openNextFile();

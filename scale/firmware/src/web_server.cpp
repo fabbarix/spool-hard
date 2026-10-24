@@ -540,7 +540,7 @@ void ScaleWebServer::_setupRoutes() {
 
     // ── Direct binary upload: firmware ────────────────────────
 
-    _server.on("/api/upload/firmware", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/upload/firmware"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             if (!_requireAuth(req)) return;
             if (_uploadRejectedProduct) {
@@ -598,7 +598,7 @@ void ScaleWebServer::_setupRoutes() {
     // The API path stays /api/upload/spiffs so existing clients keep working;
     // only the release-bundle filename and user-visible labels are renamed.
 
-    _server.on("/api/upload/spiffs", HTTP_POST,
+    _server.on(AsyncURIMatcher::exact("/api/upload/spiffs"), HTTP_POST,
         [this](AsyncWebServerRequest* req) {
             if (!_requireAuth(req)) return;
             if (_uploadRejectedProduct) {

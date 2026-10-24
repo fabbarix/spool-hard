@@ -85,7 +85,9 @@ def patch_asyncwebserver():
 # exceeds SPOOLHARD_MAX_REQLINE (request line) / SPOOLHARD_MAX_HDRLINE
 # (header lines; cookies / Authorization fit comfortably). Checked only in
 # the "no newline in this chunk yet" branch, so overshoot is <= one TCP
-# segment. Body parsing is untouched.
+# segment. The check is per TCP segment, not per
+# byte: lines up to roughly limit + one segment (~1.4 KB) can still pass
+# (observed: ~2.9 KB request line OK, 4 KB reset). Good enough as a DoS bound. Body parsing is untouched.
 LINE_MARKER = "SPOOLHARD_MAX_REQLINE"
 LINE_DEFINE = """
 // ── SpoolHard patch: cap request/header line length ──
