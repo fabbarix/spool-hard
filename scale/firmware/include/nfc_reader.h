@@ -33,6 +33,8 @@ public:
 
     TagStatus getStatus() const     { return _status; }
     const SpoolTag& getLastTag() const { return _lastTag; }
+    // Bumped every time update() rewrites _lastTag (nfc_task owner only).
+    uint32_t tagGeneration() const  { return _tagGen; }
 
     bool writeTag(const uint8_t* uid, uint8_t uid_len, const String& ndef_message, const String& cookie);
     bool eraseTag(const uint8_t* uid, uint8_t uid_len);
@@ -52,6 +54,8 @@ private:
     void _setStatus(TagStatus s)    { _status = s; }
 
     bool _tagPresent = false;
+    uint32_t _tagGen = 0;
+    bool _uidMatchesPresent(const uint8_t* uid, uint8_t uid_len) const;
 
 public:
     NfcReader();

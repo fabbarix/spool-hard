@@ -196,7 +196,7 @@ so the coordinator loop never blocks on hardware I/O:
 |-----------------|-------|------|--------------------------------------------|
 | `loopTask`      | Arduino default | 1 | Coordinator: drains task event queues, dispatches WS broadcasts, runs the LED state machine, services WiFi state machine. |
 | `sensor_task`   | 4 KB  | 1    | `g_scale` (LoadCell). 100 Hz poll, drains command queue (tare/calibrate/addCalPoint/clear/reloadParams). Publishes a seqlock snapshot. |
-| `nfc_task`      | 4 KB  | 1    | `g_nfc` (NfcReader / PN532 SPI). 50 Hz poll, drains write/erase/emulate command queue. Publishes a seqlock snapshot. |
+| `nfc_task`      | 4 KB  | 1    | `g_nfc` (NfcReader / PN532 SPI). 50 Hz poll, drains write/erase/emulate command queue. Publishes status as an atomic; the SpoolTag (Strings) is copied under a mutex, and events queue heap pointers. |
 | `console_tx`    | 4 KB  | 1    | Single writer to the port-80 `/ws/console` AsyncWebSocket. Drains a 32-deep frame queue. |
 | `ota_run`       | 12 KB | 0    | Spawned on demand by `otaTaskSpawn`; self-deletes when done. Handles HTTPS manifest + binary fetch, sha256, `Update.write`. |
 | `AsyncTCP_task` | system | 0   | mathieucarbou's lib + lwIP + WiFi. |
