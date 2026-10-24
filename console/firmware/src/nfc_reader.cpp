@@ -173,18 +173,42 @@ bool NfcReader::_readNdefUrl(char* out, size_t outLen) {
     uint8_t raw[64];
     size_t have = 0;
     bool first = true;
+    // Root cause of "first READ failed": Adafruit_PN532::inDataExchange() uses
+    // its private _inListedTag as the InDataExchange target number, and that
+    // is only set by inListPassiveTarget() -- NOT by readPassiveTargetID().
+    // Left at 0 the PN532 rejects the command. ntag2xx_ReadPage() hardcodes
+    // target 1, which is why it works. Re-list once per new tag to set it.
+    bool listed = _pn->inListPassiveTarget();
     for (uint8_t page = 4; page < 20; page += 4) {
         uint8_t cmd[2] = {0x30 /*MIFARE READ*/, page};
         uint8_t resp[18];
         uint8_t rlen = sizeof(resp);
         _pageReads.fetch_add(1);
-        if (!_pn->inDataExchange(cmd, 2, resp, &rlen) || rlen < 16) break;
+        if (!_pn->inDataExchange(cmd, 2, resp, &rlen) || rlen < 16) {
+            if (first)
+                Serial.printf("[NFC] batch READ p%u failed (listed=%d rlen=%u)\n",
+                              (unsigned)page, (int)listed, (unsigned)rlen);
+            break;
+        }
         first = false;
         memcpy(raw + have, resp, 16);
         have += 16;
     }
-    Serial.printf("[NFC] read %u bytes first8=%02X %02X %02X %02X %02X %02X %02X %02X%s\n",
-                  (unsigned)have,
+    bool single = false;
+    if (first) {
+        // Fallback, issued as the very next command: old single-page reads.
+        for (uint8_t page = 4; page < 20; page++) {
+            uint8_t b[4];
+            _pageReads.fetch_add(1);
+            if (!_pn->ntag2xx_ReadPage(page, b)) break;
+            memcpy(raw + have, b, 4);
+            have += 4;
+            first = false;
+            single = true;
+        }
+    }
+    Serial.printf("[NFC] read %u bytes via %s first8=%02X %02X %02X %02X %02X %02X %02X %02X%s\n",
+                  (unsigned)have, single ? "single-page fallback" : "batch",
                   have > 0 ? raw[0] : 0, have > 1 ? raw[1] : 0, have > 2 ? raw[2] : 0,
                   have > 3 ? raw[3] : 0, have > 4 ? raw[4] : 0, have > 5 ? raw[5] : 0,
                   have > 6 ? raw[6] : 0, have > 7 ? raw[7] : 0,
