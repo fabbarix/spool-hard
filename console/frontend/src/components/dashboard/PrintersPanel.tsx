@@ -18,6 +18,13 @@ import { useFilamentsDb } from '../../hooks/useFilamentsDb';
 import { AmsSlotPicker } from './AmsSlotPicker';
 import { LinkFilamentDialog } from './LinkFilamentDialog';
 
+// A tray_info_idx the "Link to filament" hint could apply to: non-empty,
+// not the '0' placeholder, not a Bambu stock code (GF…).
+function isCustomPresetCode(t: AmsTray): boolean {
+  const id = t.tray_info_idx;
+  return !!id && id !== '0' && !id.startsWith('GF');
+}
+
 export function PrintersPanel() {
   const { data: printers } = usePrinters();
   // Fetch the full spool list once per panel render so each tray card can
@@ -34,7 +41,16 @@ export function PrintersPanel() {
   // slot reporting tray_info_idx that no filament-DB row claims yet.
   // The Link-to-filament affordance lets the user associate the slot's
   // preset code with an existing filament row in one click.
-  const { data: userFilaments } = useUserFilaments();
+  //
+  // Both libraries are big (the stock catalog is ~40 KB of JSONL), so
+  // they're fetched lazily: only when some tray reports a custom preset
+  // code that could need linking. Stock codes (`GF…`) never need it.
+  const needsLibraries = !!printers?.some((p) =>
+    p.state.link === 'connected' &&
+    [...(p.state.ams?.flatMap((u) => u.trays) ?? []), ...(p.state.vt_tray ? [p.state.vt_tray] : [])]
+      .some(isCustomPresetCode),
+  );
+  const { data: userFilaments } = useUserFilaments(undefined, { enabled: needsLibraries });
   const filamentByFilamentId = useMemo(() => {
     const m = new Map<string, UserFilament>();
     userFilaments?.rows?.forEach((f) => {
@@ -46,7 +62,7 @@ export function PrintersPanel() {
   // are already meaningful in the slicer — no need to ask the user to
   // associate them with anything. Used purely to suppress the "Link to
   // filament" prompt for known stock codes.
-  const { data: stockFilaments } = useFilamentsDb();
+  const { data: stockFilaments } = useFilamentsDb({ enabled: needsLibraries });
   const stockFilamentIds = useMemo(() => {
     const s = new Set<string>();
     stockFilaments?.entries?.forEach((e) => { if (e.filament_id) s.add(e.filament_id); });
@@ -58,7 +74,7 @@ export function PrintersPanel() {
   // ready to render but hasn't completed the filament-DB fetches yet, so
   // every populated slot briefly reads as "unmatched" before the
   // libraries arrive and the prompts hide.
-  const librariesReady = userFilaments !== undefined && stockFilaments !== undefined;
+  const librariesReady = needsLibraries && userFilaments !== undefined && stockFilaments !== undefined;
 
   if (!printers || printers.length === 0) {
     return (
@@ -161,7 +177,7 @@ function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds, libr
                 />
               ))}
               {s.vt_tray && (
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                <div className="grid grid-cols-1 gap-2">
                   <AmsSlotCard
                     t={s.vt_tray}
                     active={s.active_tray === s.vt_tray.id}
@@ -340,23 +356,21 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
   // populated slot before the libraries hide it again.
   const unmatchedPreset =
     librariesReady &&
-    !!t.tray_info_idx &&
-    t.tray_info_idx !== '0' &&
+    isCustomPresetCode(t) &&
     !filamentByFilamentId.has(t.tray_info_idx) &&
     !stockFilamentIds.has(t.tray_info_idx);
   // Colour source priority: AMS-reported tray_color wins when it's known
   // and non-zero — that's the ground truth of what's physically loaded
   // right now (RFID read, or what the user set on the printer's panel).
   // Fall back to the mapped SpoolRecord's color_code for the SpoolHard-
-  // tagged case before our auto-push lands. An all-zero color is treated
-  // as "unknown" rather than real black, since Bambu reports 000000FF for
-  // empty / unset trays.
+  // tagged case before our auto-push lands. Only an empty / malformed
+  // value is "unknown": 000000 is real black (a populated black spool).
+  // Truly empty trays are caught by isEmpty below (no material AND no
+  // usable colour — and the firmware reports empty trays with no material).
   const hex = (() => {
-    const fromAms = t.color && t.color.length >= 6 ? t.color.slice(0, 6) : '';
-    if (fromAms && fromAms !== '000000') return fromAms;
-    return spool?.color_code && spool.color_code.length >= 6
-      ? spool.color_code.slice(0, 6)
-      : '';
+    const fromAms = validHex6(t.color);
+    if (fromAms) return fromAms;
+    return validHex6(spool?.color_code);
   })();
   const bg  = hex ? `#${hex}` : 'transparent';
   const textOnSwatch = useMemo(() => pickReadableTextColor(hex), [hex]);
@@ -381,7 +395,15 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
     !t.k && spool?.ext?.k_values?.find((e) => e.printer === serial)?.k;
   const kVal = t.k && t.k > 0 ? t.k : (storedK || 0);
 
-  const isEmpty = !t.material && !hex;
+  // Bambu reports empty trays as 000000FF with no material; a populated
+  // black spool has material (or a mapped spool). So 000000 only counts
+  // as "empty" when nothing else says the slot is loaded.
+  const isEmpty = !t.material && (!hex || (hex === '000000' && !spool));
+  // remain_pct is only meaningful for RFID-read spools; third-party
+  // spools report 0 (or -1) for "don't know". Show 0% only with a real tag.
+  const hasRfid = !!t.tag_uid && !/^0+$/.test(t.tag_uid);
+  const remainKnown = !isEmpty && typeof t.remain_pct === 'number' &&
+    (t.remain_pct > 0 || (t.remain_pct === 0 && hasRfid));
   const subtitle = [
     spool ? (spool.brand ? `${spool.brand}` : null) : null,
     spool?.color_name ?? null,
@@ -399,7 +421,7 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
       <button
         type="button"
         onClick={() => setPicking(true)}
-        className={`group relative overflow-hidden rounded-md border text-left transition-all hover:border-brand-400/60 flex-1 flex flex-col ${active ? 'border-brand-500 ring-1 ring-brand-500/30' : 'border-surface-border'} ${isEmpty ? 'bg-surface-card/40' : 'bg-surface-card'}`}
+        className={`group relative overflow-hidden rounded-md border text-left transition-all hover:border-brand-400/60 flex-1 flex flex-col ${active ? 'border-brand-500 ring-2 ring-brand-500/60 shadow-[0_0_14px_rgba(240,180,41,0.25)]' : 'border-surface-border'} ${isEmpty ? 'bg-surface-card/40' : 'bg-surface-card'}`}
         title={title}
       >
         {/* Color swatch — dominates the card when populated, leaving a
@@ -414,6 +436,12 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
         >
           <div className={`absolute top-1 left-2 text-[10px] uppercase tracking-wider font-medium ${isEmpty ? 'text-text-muted' : ''}`} style={!isEmpty ? { color: textOnSwatch, opacity: 0.85 } : undefined}>
             {label}
+            {active && (
+              <span className="ml-1.5 inline-flex items-center gap-1 px-1 rounded-sm bg-brand-500 text-black font-semibold align-middle">
+                <span className="w-1.5 h-1.5 rounded-full bg-black animate-pulse" />
+                Active
+              </span>
+            )}
           </div>
           {external && !isEmpty && (
             <ExternalLink size={12} className="absolute top-1 right-2" style={{ color: textOnSwatch, opacity: 0.85 }} />
@@ -421,7 +449,7 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
           {t.spool_override && (
             <Pin size={12} className="absolute top-1 right-2" style={!isEmpty ? { color: textOnSwatch } : { color: 'var(--color-brand-400)' }} />
           )}
-          {t.remain_pct >= 0 && !isEmpty && (
+          {remainKnown && (
             <div className="absolute bottom-1 right-2 text-[10px] font-mono" style={{ color: textOnSwatch, opacity: 0.9 }}>
               {t.remain_pct}%
             </div>
@@ -445,7 +473,9 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
           </div>
           <div className="flex items-baseline gap-2 font-mono tabular-nums">
             <span className="text-brand-400">
-              {weightG != null ? `${weightG} g` : <span className="text-text-muted">— g</span>}
+              {weightG != null
+                ? `${weightG} g`
+                : isEmpty ? null : <span className="text-text-muted" title="no weight recorded">--</span>}
             </span>
             {kVal > 0 && (
               <span className="text-text-muted inline-flex items-center gap-0.5 ml-auto" title={`pressure advance K${storedK ? ' (saved)' : ''}`}>
@@ -509,6 +539,14 @@ function gcodeStatePillClass(state: string): string {
     case 'PREPARE':  return 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/25';
     default:         return 'bg-surface-card text-text-muted border border-surface-border';
   }
+}
+
+// First 6 hex digits of an "RRGGBB[AA]" string, uppercase, or '' when the
+// value is empty / malformed. Black (000000) is a valid colour.
+function validHex6(c: string | undefined): string {
+  if (!c || c.length < 6) return '';
+  const h = c.slice(0, 6);
+  return /^[0-9a-fA-F]{6}$/.test(h) ? h.toUpperCase() : '';
 }
 
 function pickReadableTextColor(hex: string): string {
@@ -632,7 +670,7 @@ function AnalysisResult({ a }: { a: GcodeAnalysis }) {
           {a.has_pct_table ? 'exact' : 'linear'}
         </span>
       </div>
-      <div className="grid grid-cols-[auto,1fr,auto,auto] gap-x-3 gap-y-1 font-mono">
+      <div className="grid grid-cols-[auto_1fr_auto_auto] gap-x-3 gap-y-1 font-mono">
         {a.tools.map((t) => {
           const bg = t.color ? `#${t.color.slice(0, 6)}` : 'transparent';
           const consumed = t.grams_consumed ?? 0;
@@ -646,7 +684,8 @@ function AnalysisResult({ a }: { a: GcodeAnalysis }) {
               <div className="min-w-0">
                 <div className="text-text-primary truncate">
                   {t.material || 'unknown'}
-                  {t.ams_unit >= 0 && <span className="text-text-muted"> · AMS {t.ams_unit + 1}/{t.slot_id + 1}</span>}
+                  {t.ams_unit >= 0 && t.ams_unit < 254 && <span className="text-text-muted"> · AMS {t.ams_unit + 1}/{t.slot_id + 1}</span>}
+                  {t.ams_unit >= 254 && <span className="text-text-muted"> · External</span>}
                 </div>
                 {active && (
                   <div className="mt-0.5 h-1 w-full rounded bg-surface-input overflow-hidden">

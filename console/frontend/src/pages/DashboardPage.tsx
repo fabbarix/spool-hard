@@ -1,3 +1,4 @@
+import { ChevronRight } from 'lucide-react';
 import { StatusDot } from '@spoolhard/ui/components/StatusDot';
 import { StatCard } from '@spoolhard/ui/components/StatCard';
 import { formatUptime } from '@spoolhard/ui/utils/formatUptime';
@@ -30,7 +31,9 @@ export function DashboardPage() {
   // 5 s when a fresh heartbeat lands.
   const { data: scale, dataUpdatedAt: scaleAt } = useScaleLink();
   const { data: fw,    dataUpdatedAt: fwAt    } = useFirmwareInfo();
-  const { data: spools } = useSpools(0, 1);
+  // Same (0, 200) key as PrintersPanel's fetch, so react-query dedupes
+  // them into ONE request instead of a second one just for the count.
+  const { data: spools } = useSpools(0, 200);
 
   const consoleUptime = useLiveUptime(fw?.uptime_s, fwAt);
   const scaleUptime   = useLiveUptime(scale?.telemetry?.uptime_s, scaleAt);
@@ -45,47 +48,14 @@ export function DashboardPage() {
 
   return (
     <div className="space-y-4">
-      {/* Metrics row */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-        <StatCard
-          label="Spools"
-          value={spools?.total ?? '--'}
-          style={{ animationDelay: '0ms' }}
-        />
-        <StatCard
-          label="Firmware"
-          value={fw?.fw_version ?? '--'}
-          dataColor={false}
-          style={{ animationDelay: '50ms' }}
-        />
-        <StatCard
-          label="Uptime"
-          value={formatUptime(consoleUptime)}
-          dataColor={false}
-          style={{ animationDelay: '75ms' }}
-        />
-        <StatCard
-          label="Heap"
-          value={fw ? `${(fw.free_heap / 1024).toFixed(0)} K` : '--'}
-          style={{ animationDelay: '100ms' }}
-        />
-        <StatCard
-          label="PSRAM"
-          value={fw ? `${(fw.psram_free / 1024).toFixed(0)} K` : '--'}
-          style={{ animationDelay: '150ms' }}
-        />
-      </div>
-
-      {/* Printers — the central thing the user is here to monitor */}
+      {/* Printers — the hero: first thing on the page, the thing the user
+          is here to monitor. */}
       <div className="animate-in" style={{ animationDelay: '200ms' }}>
         <PrintersPanel />
       </div>
 
-      {/* Bottom row — paired peripheral status: Scale on the left, microSD
-          on the right. Stacks on mobile; two equal columns from sm: up.
-          These are background-info (less actionable than printers) so they
-          land at the bottom of the page. */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      {/* Scale — live reading, stays visible under the printers. */}
+      <div>
         {/* Scale card */}
         <div
           className="animate-in bg-surface-card border border-surface-border rounded-card p-4 shadow-[0_0_30px_rgba(240,180,41,0.03)]"
@@ -129,6 +99,49 @@ export function DashboardPage() {
           )}
         </div>
 
+      </div>
+
+      {/* Device health — collapsed by default; the one-line summary keeps
+          the most useful bits (firmware, uptime, spool count) visible. */}
+      <details className="group animate-in bg-surface-card border border-surface-border rounded-card" style={{ animationDelay: '300ms' }}>
+        <summary className="flex items-center gap-2 px-4 py-3 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
+          <ChevronRight size={14} className="text-text-muted transition-transform group-open:rotate-90" />
+          <span className="text-[10px] uppercase tracking-widest text-text-muted font-medium">Device</span>
+          <span className="ml-2 text-xs font-mono text-text-muted truncate">
+            {fw?.fw_version ? `v${fw.fw_version}` : '--'} · up {formatUptime(consoleUptime)} · {spools?.total ?? '--'} spools
+          </span>
+        </summary>
+        <div className="p-4 pt-0 space-y-4">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+            <StatCard
+              label="Spools"
+              value={spools?.total ?? '--'}
+              style={{ animationDelay: '0ms' }}
+            />
+            <StatCard
+              label="Firmware"
+              value={fw?.fw_version ?? '--'}
+              dataColor={false}
+              style={{ animationDelay: '50ms' }}
+            />
+            <StatCard
+              label="Uptime"
+              value={formatUptime(consoleUptime)}
+              dataColor={false}
+              style={{ animationDelay: '75ms' }}
+            />
+            <StatCard
+              label="Heap"
+              value={fw ? `${(fw.free_heap / 1024).toFixed(0)} K` : '--'}
+              style={{ animationDelay: '100ms' }}
+            />
+            <StatCard
+              label="PSRAM"
+              value={fw ? `${(fw.psram_free / 1024).toFixed(0)} K` : '--'}
+              style={{ animationDelay: '150ms' }}
+            />
+          </div>
+          <div>
         {/* microSD card */}
         <div
           className="animate-in bg-surface-card border border-surface-border rounded-card p-4"
@@ -168,7 +181,9 @@ export function DashboardPage() {
             <div className="text-sm text-text-muted">Insert a microSD card to enable local spool backups.</div>
           )}
         </div>
-      </div>
+          </div>
+        </div>
+      </details>
     </div>
   );
 }

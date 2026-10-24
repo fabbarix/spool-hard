@@ -1,16 +1,19 @@
-import { useState, useEffect, useCallback } from 'react';
+import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
 import { QueryProvider } from '@spoolhard/ui/providers/QueryProvider';
 import { AuthProvider } from '@spoolhard/ui/providers/AuthProvider';
 import { WebSocketProvider } from '@spoolhard/ui/providers/WebSocketProvider';
 import { ReconnectProvider } from '@spoolhard/ui/providers/ReconnectProvider';
 import { ReconnectOverlay } from '@spoolhard/ui/components/ReconnectOverlay';
 import { Header } from './components/layout/Header';
-import { NavTabs } from './components/layout/NavTabs';
+import { NavTabs, BottomTabBar } from './components/layout/NavTabs';
 import { DashboardPage } from './pages/DashboardPage';
 import { SpoolsPage } from './pages/SpoolsPage';
-import { EmptyWeightsPage } from './pages/EmptyWeightsPage';
-import { FilamentsPage } from './pages/FilamentsPage';
-import { ConfigPage } from './pages/ConfigPage';
+
+// Heavy, rarely-opened pages split into their own chunks so the dashboard
+// (default landing page) loads less JS over the ESP32's slow link.
+const EmptyWeightsPage = lazy(() => import('./pages/EmptyWeightsPage').then((m) => ({ default: m.EmptyWeightsPage })));
+const FilamentsPage    = lazy(() => import('./pages/FilamentsPage').then((m) => ({ default: m.FilamentsPage })));
+const ConfigPage       = lazy(() => import('./pages/ConfigPage').then((m) => ({ default: m.ConfigPage })));
 
 export type Tab = 'dashboard' | 'spools' | 'empty-weights' | 'filaments' | 'config';
 
@@ -74,13 +77,16 @@ export default function App() {
               </div>
               <main className="flex-1 overflow-y-auto">
                 <div className="mx-auto max-w-[1100px] p-4">
-                  {tab === 'dashboard'     && <DashboardPage />}
-                  {tab === 'spools'        && <SpoolsPage />}
-                  {tab === 'empty-weights' && <EmptyWeightsPage />}
-                  {tab === 'filaments'     && <FilamentsPage />}
-                  {tab === 'config'        && <ConfigPage />}
+                  <Suspense fallback={<div className="text-sm text-text-muted p-4">Loading…</div>}>
+                    {tab === 'dashboard'     && <DashboardPage />}
+                    {tab === 'spools'        && <SpoolsPage />}
+                    {tab === 'empty-weights' && <EmptyWeightsPage />}
+                    {tab === 'filaments'     && <FilamentsPage />}
+                    {tab === 'config'        && <ConfigPage />}
+                  </Suspense>
                 </div>
               </main>
+              <BottomTabBar activeTab={tab} onTabChange={navigate} />
             </div>
             <ReconnectOverlay />
           </WebSocketProvider>
