@@ -9,10 +9,8 @@
 // untouched.
 //
 // Behaviour:
-//   - Bytes accumulate per-line; on '\n' the line gets pushed to the
-//     ring (CR is stripped). Over-long lines (>=240 chars without a
-//     newline) are flushed eagerly so the ring never holds an unbounded
-//     fragment.
+//   - Each write() is pushed to the ring as one entry (trailing CR/LF
+//     stripped, >159 chars truncated with "..."). No heap allocation.
 //   - Bytes are also forwarded to the real USB-CDC ::Serial when the
 //     host has space — same non-blocking guard dlog() already uses, so
 //     a headless console never wedges on TX-buffer saturation.
@@ -34,6 +32,10 @@ public:
     void   flush() override;
     operator bool() const { return true; }
     void   begin(unsigned long baud);
+    // Hide Print::printf (which mallocs for >63-char output): formats into
+    // a 192-byte stack buffer and truncates (ending "...\n") instead.
+    size_t printf(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+    size_t printf(const __FlashStringHelper* fmt, ...);
 };
 
 extern LineBufferingPrint g_serial;

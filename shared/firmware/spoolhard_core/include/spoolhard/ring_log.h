@@ -20,7 +20,17 @@ struct Entry {
 
 // Push one line. If the line ends in a newline it's stripped — the web
 // layer adds delimiters when serialising. Safe to call from any task.
+// No per-call heap allocation (fixed slot ring, lines > 159 chars are
+// truncated and end in "...").
+void push(const char* text, size_t len);
 void push(const String& line);
+
+// Allocation-free iteration over entries with seq > since (oldest first,
+// at most `limit`). `fn` runs under the ring mutex: keep it short, don't
+// call RingLog::* or block from it.
+void forEach(uint32_t since, size_t limit,
+             void (*fn)(void* ctx, uint32_t seq, uint32_t millis_at, const char* text),
+             void* ctx);
 
 // Snapshot up to `limit` entries with seq > `since`. Latest at the
 // back. Returns the highest seq seen so the caller can use it as the

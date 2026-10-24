@@ -2,6 +2,9 @@
 #define SERIAL_MIRROR_NO_OVERRIDE
 #include "spoolhard/serial_mirror.h"
 #include "spoolhard/ring_log.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 
 LineBufferingPrint g_serial;
 
@@ -11,7 +14,7 @@ LineBufferingPrint g_serial;
 // over its limit and bootlooped during gcode-body parse. Each
 // Serial.printf already buffers its formatted output and calls write()
 // once, so we just take that buffer as-is and hand it to RingLog::push
-// (which has its own mutex + bounded String storage). USB-CDC mirror is
+// (which has its own mutex + preallocated fixed slots, no per-call heap). USB-CDC mirror is
 // gated on availableForWrite to avoid blocking when no host is opened.
 
 static inline bool _serialHasRoom(size_t n) {
@@ -51,14 +54,40 @@ size_t LineBufferingPrint::write(const uint8_t* buffer, size_t size) {
     while (n > 0 && (buffer[n - 1] == '\n' || buffer[n - 1] == '\r')) --n;
     if (n == 0) return size;
 
-    // RingLog::push takes a String — one allocation per ring entry. That
-    // String lives inside RingLog's bounded deque; once 80 entries are
-    // in, the oldest is freed on each push. push() also throttles when
-    // free internal heap drops below ~24 KB so logging can never tip a
-    // marginal real allocation into OOM.
-    String line;
-    line.reserve(n);
-    for (size_t i = 0; i < n; ++i) line += (char)buffer[i];
-    RingLog::push(line);
+    // Fixed-slot ring: copies into a preallocated slot, no heap use.
+    RingLog::push((const char*)buffer, n);
     return size;
+}
+
+size_t LineBufferingPrint::printf(const char* fmt, ...) {
+    // Print::printf mallocs for output > 63 chars (internal-DRAM churn on
+    // every long log line). Format into a bounded stack buffer instead and
+    // truncate rather than allocate.
+    char buf[192];
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (len < 0) return 0;
+    if ((size_t)len >= sizeof(buf)) {
+        len = sizeof(buf) - 1;
+        memcpy(buf + len - 4, "...\n", 4);
+    }
+    write((const uint8_t*)buf, (size_t)len);
+    return (size_t)len;
+}
+
+size_t LineBufferingPrint::printf(const __FlashStringHelper* fmt, ...) {
+    char buf[192];
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(buf, sizeof(buf), (const char*)fmt, ap);
+    va_end(ap);
+    if (len < 0) return 0;
+    if ((size_t)len >= sizeof(buf)) {
+        len = sizeof(buf) - 1;
+        memcpy(buf + len - 4, "...\n", 4);
+    }
+    write((const uint8_t*)buf, (size_t)len);
+    return (size_t)len;
 }
