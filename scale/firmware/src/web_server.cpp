@@ -286,6 +286,7 @@ void ScaleWebServer::_setupRoutes() {
         if (SPIFFS.exists(path)) SPIFFS.remove(path);
         req->send(200, "application/json", "{\"ok\":true}");
     });
+    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/crashes/");
     _server.on("/api/crashes", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         JsonDocument doc(&g_psramJsonAlloc);

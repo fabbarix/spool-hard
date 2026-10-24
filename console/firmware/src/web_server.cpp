@@ -575,6 +575,7 @@ void ConsoleWebServer::_setupRoutes() {
         if (!_requireAuth(req)) return;
         _handleCrashDelete(req);
     });
+    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/crashes/");
     _server.on("/api/crashes", HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _handleCrashesList(req);
@@ -700,6 +701,7 @@ void ConsoleWebServer::_setupRoutes() {
     spoolhard::addPathRoute(_server, HTTP_GET, "/api/spools/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handleSpoolGet(req);
     });
+    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/spools/");
     _server.on("/api/spools", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleSpoolsList(req);
     });
@@ -780,6 +782,7 @@ void ConsoleWebServer::_setupRoutes() {
     spoolhard::addPathRoute(_server, HTTP_GET, "/api/user-filaments/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentGet(req);
     });
+    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/user-filaments/");
     _server.on("/api/user-filaments", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleUserFilamentsList(req);
     });
@@ -872,6 +875,7 @@ void ConsoleWebServer::_setupRoutes() {
     spoolhard::addPathRoute(_server, HTTP_GET, "/api/printers/", "", true, false, [this](AsyncWebServerRequest* req) {
         _handlePrinterGet(req);
     });
+    spoolhard::addPathReject(_server, HTTP_GET | HTTP_DELETE, "/api/printers/");
     _server.on("/api/printers", HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handlePrintersList(req);
     });

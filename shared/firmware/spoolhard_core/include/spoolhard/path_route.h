@@ -9,8 +9,11 @@
 //
 // canHandle() is a plain predicate, so non-matching URLs fall through to the
 // next registered handler exactly like the regex routes did (registration
-// order = priority; register specific before generic). Over-long or
-// malformed args don't match and end up in the not-found handler (404).
+// order = priority; register specific before generic). NOTE: "fall through"
+// is NOT "404": a malformed/over-long arg continues to later handlers, and a
+// literal `on("/api/x")` collection route prefix-matches `/api/x/...`, so it
+// would swallow it. Register addPathReject() for the family right before the
+// literal collection routes to turn those URLs into a hard 404.
 #pragma once
 #include <ESPAsyncWebServer.h>
 
@@ -82,6 +85,29 @@ inline void addPathRoute(AsyncWebServer& server, WebRequestMethodComposite metho
                          const char* prefix, const char* suffix, bool allowSlash, bool digitsOnly,
                          ArRequestHandlerFunction onRequest, ArBodyHandlerFunction onBody = nullptr) {
     server.addHandler(new PathRoute(method, prefix, suffix, allowSlash, digitsOnly, onRequest, onBody));
+}
+
+// Hard 404 for any `<prefix><non-empty>` URL not claimed by an earlier handler.
+// An empty remainder (e.g. trailing-slash `/api/x/`) is left alone.
+class PathReject : public AsyncWebHandler {
+public:
+    PathReject(WebRequestMethodComposite method, const char* prefix)
+        : _method(method), _prefix(prefix) {}
+    bool canHandle(AsyncWebServerRequest* req) const override {
+        if (!req->isHTTP() || !_method.matches(req->method())) return false;
+        size_t pl = strlen(_prefix);
+        return req->url().length() > pl && strncmp(req->url().c_str(), _prefix, pl) == 0;
+    }
+    void handleRequest(AsyncWebServerRequest* req) override {
+        req->send(404, "application/json", "{\"error\":\"not found\"}");
+    }
+private:
+    WebRequestMethodComposite _method;
+    const char* _prefix;
+};
+
+inline void addPathReject(AsyncWebServer& server, WebRequestMethodComposite method, const char* prefix) {
+    server.addHandler(new PathReject(method, prefix));
 }
 
 }  // namespace spoolhard
