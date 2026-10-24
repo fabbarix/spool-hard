@@ -15,6 +15,7 @@
 #include <WiFi.h>
 #include <SPIFFS.h>
 #include <Update.h>
+#include "spoolhard/path_route.h"
 #include "spoolhard/serial_mirror.h"
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -271,16 +272,16 @@ void ScaleWebServer::_setupRoutes() {
     // ── Crash log retrieval ────────────────────────────────────
     // PanicPersist promotes pending ring-log tails to /crash_<seq>.txt
     // when the previous boot ended in a panic. List + download here.
-    _server.on("^\\/api\\/crashes\\/([0-9]+)$", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_GET, "/api/crashes/", "", false, true, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
-        String seq = req->pathArg(0);
+        String seq = spoolhard::pathArg(req, "/api/crashes/", "", false);
         String path = "/crash_" + seq + ".txt";
         if (!SPIFFS.exists(path)) { req->send(404); return; }
         req->send(SPIFFS, path, "text/plain");
     });
-    _server.on("^\\/api\\/crashes\\/([0-9]+)$", HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+    spoolhard::addPathRoute(_server, HTTP_DELETE, "/api/crashes/", "", false, true, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
-        String seq = req->pathArg(0);
+        String seq = spoolhard::pathArg(req, "/api/crashes/", "", false);
         String path = "/crash_" + seq + ".txt";
         if (SPIFFS.exists(path)) SPIFFS.remove(path);
         req->send(200, "application/json", "{\"ok\":true}");
@@ -507,6 +508,7 @@ void ScaleWebServer::_setupRoutes() {
             SpoolhardBackup::RestoreReport rep;
             String why;
             int code = _restore.finish(rep, why);
+            SpoolhardAuth::invalidateKeyCache();  // restore may have rewritten wifi_cfg/fixed_key
             if (code >= 400 && code < 500) {
                 JsonDocument err(&g_psramJsonAlloc);
                 err["error"] = why;
@@ -657,15 +659,23 @@ void ScaleWebServer::_setupRoutes() {
         if (SPIFFS.exists("/index.html.gz")) {
             auto* resp = req->beginResponse(SPIFFS, "/index.html.gz", "text/html");
             resp->addHeader("Content-Encoding", "gzip");
+            resp->addHeader("Cache-Control", "no-cache");
             req->send(resp);
         } else {
             req->send(SPIFFS, "/index.html", "text/html");
         }
     });
 
+    // Cache policy: Vite emits content-hashed files under /assets/ (safe to cache
+    // forever); everything else (index.html and any other un-hashed entry)
+    // must revalidate on every load or a firmware/frontend update stays
+    // invisible for up to a day. Hashed dir first: the root handler would
+    // otherwise claim those URLs too.
+    _server.serveStatic("/assets/", SPIFFS, "/assets/")
+           .setCacheControl("public, max-age=31536000, immutable");
     _server.serveStatic("/", SPIFFS, "/")
            .setDefaultFile("index.html")
-           .setCacheControl("max-age=86400");
+           .setCacheControl("no-cache");
 
     // SPA fallback: non-API GET requests serve index.html for client-side routing
     // (history API paths like /configuration, /dashboard)
@@ -678,6 +688,7 @@ void ScaleWebServer::_setupRoutes() {
             if (SPIFFS.exists("/index.html.gz")) {
                 auto* resp = req->beginResponse(SPIFFS, "/index.html.gz", "text/html");
                 resp->addHeader("Content-Encoding", "gzip");
+                resp->addHeader("Cache-Control", "no-cache");
                 req->send(resp);
             } else if (SPIFFS.exists("/index.html")) {
                 req->send(SPIFFS, "/index.html", "text/html");

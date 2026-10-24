@@ -132,7 +132,9 @@ the headers are `#include`d).
   Eliminates internal-DRAM churn on broadcastDebug/broadcastState pushes.
 - `spoolhard/auth.h` / `src/auth.cpp` — `requireAuth`, `wsAuthHandshake`,
   `handleAuthStatus`, `handleTestKey`, `handleFixedKeyConfigPost`,
-  `handleDeviceName{Get,Post}`. Shared NVS schema: namespace `wifi_cfg`
+  `handleDeviceName{Get,Post}`. The fixed key is cached in RAM (constant-time
+  compare); anything writing `fixed_key` outside auth.cpp must call
+  `invalidateKeyCache()`. Shared NVS schema: namespace `wifi_cfg`
   with keys `ssid`, `pass`, `device_name`, `fixed_key`.
 - `spoolhard/common_routes.h` / `src/common_routes.cpp` — `registerAll(server)`
   installs `/api/restart` + `/api/logs` + `/api/heap` (heap_caps stats
@@ -144,6 +146,14 @@ the headers are `#include`d).
 - Lazy mutexes (ring_log, scale protocol.cpp) are created via a CAS
   helper (build candidate, compare-exchange into the slot, delete if
   lost) so concurrent first use is race-free and usable before setup().
+- `spoolhard/path_route.h` — `spoolhard::addPathRoute(server, method, prefix,
+  suffix, allowSlash, digitsOnly, onRequest[, onBody])` + `spoolhard::pathArg(req,
+  prefix, suffix, allowSlash)`: regex-free `<prefix><arg><suffix>` routes (arg
+  1..64 chars, else falls through to 404). Replaces `-DASYNCWEBSERVER_REGEX` /
+  `req->pathArg()`; do NOT re-enable the regex flag (std::regex was ~220 KB of
+  console flash). Registration order is priority: specific before generic, and
+  per-id routes BEFORE the literal collection routes (literal `on("/api/x")`
+  also prefix-matches `/api/x/...`).
 - `spoolhard/deferred_reboot.h` / `src/deferred_reboot.cpp` —
   `spoolhardDeferredReboot()`: reboot from a detached task so an
   AsyncWebServer handler's queued response actually flushes first.
