@@ -173,6 +173,17 @@ struct PrinterState {
     String  model_code;
     uint32_t last_report_ms = 0;
     String  error_message;          // last connection/parse error, for dashboards
+    // Ack of the last control command we published (print.command + result
+    // in the printer's report). The H2S refuses unsigned LAN control commands
+    // unless LAN Only + Developer Mode is on ("mqtt message verify failed",
+    // err_code 84033543) -- publish() returns ok regardless, so this is the
+    // only way to know a push actually landed.
+    String   last_cmd;
+    String   last_cmd_result;       // "success" | "failed" | ...
+    String   last_cmd_reason;
+    int32_t  last_cmd_err      = 0;
+    uint32_t last_cmd_ms       = 0; // millis() of the ack, 0 = none seen
+    bool     commands_rejected_auth = false;  // cleared by a later successful ack
 };
 
 // arduino-esp32 3.x: WiFiClientSecure is a typedef of NetworkClientSecure,
@@ -225,6 +236,11 @@ public:
     // the identical path the empty->populated auto-claim uses. Returns false
     // if a previous request is still queued.
     bool requestClaimPending(int ams_unit, int slot_id);
+
+    // Forget what we last pushed per slot so the next report re-runs the
+    // (edge-triggered) spool->printer sync. Thread-safe; applied in loop().
+    // Used by the "Retry sync" action after the user enabled Developer Mode.
+    void requestResync() { _resyncReq.store(true); }
 
     // Fetch `path` from the printer over FTPS, stream-extract the first .gcode
     // entry from the 3MF, and run it through GCodeAnalyzer. Blocks the caller.
@@ -334,6 +350,11 @@ private:
     bool   _vtSignatureSeen = false;
     // Packed (ams_unit << 8 | slot_id) explicit claim request, -1 = none.
     std::atomic<int> _claimReq{-1};
+    std::atomic<bool> _resyncReq{false};
+    // Monotonic MQTT sequence_id source (unique per published command).
+    std::atomic<uint32_t> _seq{100};
+    String _nextSeq() { return String((unsigned long)(_seq.fetch_add(1) + 1)); }
+    void _recordCommandAck(JsonObjectConst print);
 
     // Set once the printer has reported `device.extruder.info[].snow`
     // (H2-series). From then on that's the authoritative active-slot

@@ -827,6 +827,14 @@ void ConsoleWebServer::_setupRoutes() {
             if (!_requireAuth(req)) return;
             _handlePrinterClaimPending(req, data, len);
         });
+    spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/resync", false, false,
+        [this](AsyncWebServerRequest* req) {
+            if (!_requireAuth(req)) return;
+            BambuPrinter* p = g_bambu.find(spoolhard::pathArg(req, "/api/printers/", "/resync", false));
+            if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
+            p->requestResync();
+            req->send(202, "application/json", "{\"ok\":true,\"queued\":true}");
+        });
     spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/import-ams-spool", false, false,
         [](AsyncWebServerRequest*) {},
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
@@ -2959,6 +2967,15 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
     st["last_report_ms_ago"] =
         s.last_report_ms ? (int)(millis() - s.last_report_ms) : -1;
     if (s.error_message.length()) st["error"] = s.error_message;
+    st["commands_rejected_auth"] = s.commands_rejected_auth;
+    if (s.last_cmd_ms) {
+        JsonObject lc = st["last_command"].to<JsonObject>();
+        lc["command"] = s.last_cmd;
+        lc["result"]  = s.last_cmd_result;
+        lc["reason"]  = s.last_cmd_reason;
+        lc["err_code"] = s.last_cmd_err;
+        lc["ms_ago"]  = (uint32_t)(millis() - s.last_cmd_ms);
+    }
 
     auto writeTray = [](JsonObject j, const AmsTray& tr) {
         j["id"]             = tr.id;

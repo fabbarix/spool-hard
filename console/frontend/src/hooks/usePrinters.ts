@@ -42,6 +42,10 @@ export interface PrinterState {
   active_tray?: number;
   last_report_ms_ago?: number;
   error?: string;
+  // True when the printer refused our last control command with its
+  // authorization error (needs LAN Only + Developer Mode).
+  commands_rejected_auth?: boolean;
+  last_command?: { command: string; result: string; reason: string; err_code: number; ms_ago: number };
   ams?: AmsUnit[];
   // External spool holder (single-extruder printers). Bambu calls this
   // `vt_tray`; id is typically 254. Absent on printers that don't report one.
@@ -173,6 +177,20 @@ export function useSetAmsMapping() {
         body: JSON.stringify({ ams_unit, slot_id, spool_id }),
       }).then(async (r) => {
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? 'save failed');
+        return r.json();
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['printers'] }),
+  });
+}
+
+// Forget what was last pushed to the printer so the spool settings are
+// re-sent on the next report (after enabling Developer Mode on the printer).
+export function useResyncPrinter() {
+  const qc = useQueryClient();
+  return useMutation<unknown, Error, { serial: string }>({
+    mutationFn: ({ serial }) =>
+      fetch(`/api/printers/${encodeURIComponent(serial)}/resync`, { method: 'POST' }).then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? 'resync failed');
         return r.json();
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['printers'] }),

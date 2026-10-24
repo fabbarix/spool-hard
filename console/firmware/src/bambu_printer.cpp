@@ -406,13 +406,21 @@ void BambuPrinter::_ensureConnected() {
 void BambuPrinter::requestFullStatus() {
     if (!_mqtt || !_mqtt->connected()) return;
     String topic = "device/" + _cfg.serial + "/request";
-    const char* payload =
-        "{\"pushing\":{\"sequence_id\":\"1\",\"command\":\"pushall\",\"version\":1,\"push_target\":1}}";
+    char payload[112];
+    snprintf(payload, sizeof(payload),
+        "{\"pushing\":{\"sequence_id\":\"%s\",\"command\":\"pushall\",\"version\":1,\"push_target\":1}}",
+        _nextSeq().c_str());
     _mqtt->publish(topic.c_str(), payload);
 }
 
 void BambuPrinter::loop() {
     _ensureConnected();
+    if (_resyncReq.exchange(false)) {
+        for (auto& row : _lastSyncedSpoolId) for (auto& s : row) s = "";
+        _lastSyncedSpoolIdVt = "";
+        Serial.printf("[Bambu %s] resync requested -- next report re-pushes spool settings\n",
+                      _cfg.serial.c_str());
+    }
     // Explicit "assign scanned spool" request from the web (claim-pending).
     {
         int req = _claimReq.exchange(-1);
@@ -493,10 +501,36 @@ void BambuPrinter::_onMessage(const char* /*topic*/, uint8_t* payload, unsigned 
     g_web.pushPrintersList();
 }
 
+void BambuPrinter::_recordCommandAck(JsonObjectConst print) {
+    String cmd    = print["command"].as<String>();
+    String result = print["result"].as<String>();
+    String reason = print["reason"] | "";
+    int32_t err   = print["err_code"].as<long>();
+    // Only control commands we issue matter; ignore other result-bearing acks.
+    if (cmd != "ams_filament_setting" && cmd != "extrusion_cali_set" &&
+        cmd != "extrusion_cali_sel" && cmd != "pushall") return;
+    _state.last_cmd        = cmd;
+    _state.last_cmd_result = result;
+    _state.last_cmd_reason = reason;
+    _state.last_cmd_err    = err;
+    _state.last_cmd_ms     = millis() ? millis() : 1;
+    bool ok = result.equalsIgnoreCase("success");
+    bool auth = !ok && (err == 84033543 || reason.indexOf("verify failed") >= 0);
+    if (auth) _state.commands_rejected_auth = true;
+    else if (ok && cmd != "pushall") _state.commands_rejected_auth = false;
+    dlog("Bambu", "%s ack %s -> %s reason='%s' err=%ld seq=%s",
+         _cfg.serial.c_str(), cmd.c_str(), result.c_str(), reason.c_str(),
+         (long)err, print["sequence_id"] | "?");
+}
+
 void BambuPrinter::_parseReport(const JsonDocument& doc) {
     // Bambu publishes {"print": {...}} or {"info": {...}}; we only care about print.
     JsonObjectConst print = doc["print"];
     if (!print) return;
+    // Command acks carry print.command + print.result; telemetry doesn't.
+    if (print["result"].is<const char*>() && print["command"].is<const char*>()) {
+        _recordCommandAck(print);
+    }
 
     String prevGcode = _state.gcode_state;
     if (print["gcode_state"].is<const char*>())  _state.gcode_state  = print["gcode_state"].as<String>();
@@ -759,7 +793,7 @@ void BambuPrinter::_pushKRestore(int ams_id, int slot_id, const AmsTray& tr, flo
     JsonObject print = doc["print"].to<JsonObject>();
     print["command"]         = "extrusion_cali_set";
     print["nozzle_diameter"] = nozzleStr;
-    print["sequence_id"]     = "1";
+    print["sequence_id"]     = _nextSeq();
     JsonArray filaments = print["filaments"].to<JsonArray>();
     JsonObject f = filaments.add<JsonObject>();
     f["ams_id"]          = ams_id;
@@ -1233,7 +1267,7 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
     print["nozzle_temp_min"] = tmin;
     print["nozzle_temp_max"] = tmax;
     print["tray_type"]       = rec.material_type;
-    print["sequence_id"]     = "1";
+    print["sequence_id"]     = _nextSeq();
 
     String payload;
     serializeJson(doc, payload);

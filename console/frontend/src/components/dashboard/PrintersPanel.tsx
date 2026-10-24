@@ -12,6 +12,7 @@ import {
   type GcodeAnalysis,
   type Printer,
   useClaimPendingSpool,
+  useResyncPrinter,
 } from '../../hooks/usePrinters';
 import { useSpools, type SpoolRecord } from '../../hooks/useSpools';
 import { useUserFilaments, type UserFilament } from '../../hooks/useUserFilaments';
@@ -197,11 +198,32 @@ function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds, libr
               )}
             </div>
           )}
+          {s.commands_rejected_auth && <AuthRejectedNotice serial={p.serial} />}
           <AnalysisBlock serial={p.serial} gcodeState={gcode} />
         </>
       ) : (
         <div className="text-xs text-text-muted">{s.error ?? s.link}</div>
       )}
+    </div>
+  );
+}
+
+// Shown while the printer's last control command was refused with its
+// authorization error: unsigned LAN MQTT commands only work on printers in
+// LAN Only + Developer Mode. Clears itself on the next successful ack.
+function AuthRejectedNotice({ serial }: { serial: string }) {
+  const resync = useResyncPrinter();
+  return (
+    <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-300">
+      Printer refused SpoolHard's settings. Enable LAN Only + Developer Mode on the printer to let SpoolHard set filament / K values.
+      <button
+        type="button"
+        disabled={resync.isPending}
+        onClick={() => resync.mutate({ serial })}
+        className="ml-2 underline hover:text-amber-200 disabled:opacity-50"
+      >
+        Retry sync
+      </button>
     </div>
   );
 }

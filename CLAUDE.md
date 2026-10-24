@@ -317,3 +317,11 @@ enum lives at `*/firmware/src/protocol.h`").
   `/api/printers` rows carry `pending_spool_id` while a scanned spool is armed;
   the dashboard external card shows "Assign scanned spool ... to External".
   No LCD destination-choice step (ui.cpp has no small, safe place for it).
+- Command acks: every published Bambu command uses a unique `sequence_id`
+  (`BambuPrinter::_nextSeq`); `_recordCommandAck` parses `print.command/result/
+  reason/err_code` from reports, dlogs them and keeps `PrinterState::last_cmd*`.
+  `commands_rejected_auth` (reason "mqtt message verify failed" / err 84033543 =
+  printer not in LAN Only + Developer Mode) is exposed in `/api/printers`
+  state (`commands_rejected_auth`, `last_command`) and shown as a notice on the
+  dashboard card. No retry loop; `POST /api/printers/<serial>/resync` clears the
+  per-slot "last synced" cache so the next report re-pushes.
