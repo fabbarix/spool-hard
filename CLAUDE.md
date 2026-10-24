@@ -401,6 +401,14 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   254:0, other out-of-range -> 400). `PrinterConfig::migrateAmsOverrides()` runs
   on load and rewrites legacy `254:254`/`255:255` keys to `254:0`.
   Host test: `console/firmware/test/host/test_ams_slot.cpp` (g++ one-liner in header).
+- Bambu MQTT reports are deserialized through an ArduinoJson filter
+  (`console/firmware/include/bambu_report_filter.h`, used by
+  `BambuPrinter::_onMessage`): only the keys `_parseReport` / `_recordCommandAck` /
+  `_parseAms` / `_parseExternalTray` read survive (`ams`, `vt_tray`, `vir_slot`
+  kept whole), ~4x smaller doc than the 16 KB H2S report. **If you read a new
+  key from the report doc, add it to the filter.** Host test (full vs filtered
+  digest on synthetic + fixture reports, plus a drift scan of
+  `bambu_printer.cpp`): `g++ -std=c++17 -O2 -I console/firmware/include -I console/firmware/.pio/libdeps/esp32-s3/ArduinoJson/src console/firmware/test/host/test_report_filter.cpp -o /tmp/trf && /tmp/trf console/firmware/test/host/fixtures console/firmware/src/bambu_printer.cpp [captures_dir]`
 - PendingAms auto-claim only fires on an empty->populated tray transition, which
   never happens on the H2S external holder. `POST /api/printers/<serial>/claim-pending`
   `{ams_unit, slot_id}` queues an explicit claim (atomic in BambuPrinter,
