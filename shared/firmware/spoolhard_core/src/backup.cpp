@@ -1,10 +1,13 @@
 #include "spoolhard/backup.h"
+#include "spoolhard/psram_json_alloc.h"
+#include "spoolhard/ring_log.h"
 
 #include <Preferences.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <esp_partition.h>
 #include <ctime>
+#include <memory>
 
 namespace SpoolhardBackup {
 
@@ -80,14 +83,14 @@ const char* nvsTypeName(nvs_type_t t) {
     }
 }
 
-// Dump every key in `ns` into the supplied JSON array. The arduino-esp32
-// framework currently ships ESP-IDF 4.4.x, which uses the older
-// nvs_entry_find / nvs_entry_next API (returns iterator directly,
-// nullptr when exhausted). Newer IDF (>=5.0) takes an out-param —
-// don't migrate to that without bumping the framework.
+// Dump every key in `ns` into the supplied JSON array. ESP-IDF 5.x NVS
+// iterator API: nvs_entry_find / nvs_entry_next take the iterator as an
+// out-param and return ESP_ERR_NVS_NOT_FOUND (setting it to nullptr)
+// once exhausted.
 void dumpNamespace(const char* ns, JsonArray entries) {
-    nvs_iterator_t it = nvs_entry_find("nvs", ns, NVS_TYPE_ANY);
-    while (it != nullptr) {
+    nvs_iterator_t it = nullptr;
+    esp_err_t res = nvs_entry_find("nvs", ns, NVS_TYPE_ANY, &it);
+    while (res == ESP_OK && it != nullptr) {
         nvs_entry_info_t info{};
         nvs_entry_info(it, &info);
 
@@ -134,7 +137,7 @@ void dumpNamespace(const char* ns, JsonArray entries) {
             }
             nvs_close(h);
         }
-        it = nvs_entry_next(it);  // returns nullptr when exhausted
+        res = nvs_entry_next(&it);  // ESP_ERR_NVS_NOT_FOUND + it=nullptr when exhausted
     }
     // nvs_release_iterator on nullptr is a documented no-op.
     nvs_release_iterator(it);
@@ -171,6 +174,18 @@ bool applyNvsEntry(Preferences& prefs, JsonObjectConst e) {
 }
 
 // ── FS helpers ──────────────────────────────────────────────────
+constexpr const char* kRestoreSuffix = ".restore";
+
+bool isSkipped(const String& full, const FsMount& mount) {
+    for (const char* p : mount.skip_prefixes) {
+        if (full.startsWith(p)) return true;
+    }
+    for (const char* sfx : mount.skip_suffixes) {
+        if (full.endsWith(sfx)) return true;
+    }
+    return full.endsWith(kRestoreSuffix);
+}
+
 void walkDir(FS& fs, const String& path, const FsMount& mount, JsonArray files) {
     File dir = fs.open(path);
     if (!dir || !dir.isDirectory()) {
@@ -183,10 +198,7 @@ void walkDir(FS& fs, const String& path, const FsMount& mount, JsonArray files) 
         String full = String(f.path() ? f.path() : f.name());
         if (full.length() == 0) full = path + "/" + f.name();
 
-        bool skip = false;
-        for (const char* p : mount.skip_prefixes) {
-            if (full.startsWith(p)) { skip = true; break; }
-        }
+        bool skip = isSkipped(full, mount);
 
         if (f.isDirectory()) {
             if (!skip) walkDir(fs, full, mount, files);
@@ -211,7 +223,7 @@ void walkDir(FS& fs, const String& path, const FsMount& mount, JsonArray files) 
     dir.close();
 }
 
-bool writeFile(FS& fs, const String& path, const std::vector<uint8_t>& bytes) {
+void ensureParentDirs(FS& fs, const String& path) {
     // Make sure parent dirs exist. Skip "/", they should already.
     int slash = path.lastIndexOf('/');
     if (slash > 0) {
@@ -230,6 +242,10 @@ bool writeFile(FS& fs, const String& path, const std::vector<uint8_t>& bytes) {
             fs.mkdir(parent);
         }
     }
+}
+
+bool writeFile(FS& fs, const String& path, const std::vector<uint8_t>& bytes) {
+    ensureParentDirs(fs, path);
     File out = fs.open(path, FILE_WRITE);
     if (!out) return false;
     size_t n = bytes.empty() ? 0 : out.write(bytes.data(), bytes.size());
@@ -275,7 +291,7 @@ bool validate(const JsonDocument& doc,
               String&             reason) {
     reason = "";
     int schema = doc["spoolhard_backup"] | 0;
-    if (schema != 1) {
+    if (schema != 1 && schema != 2) {
         reason = "not a SpoolHard backup (or unsupported schema)";
         return false;
     }
@@ -358,6 +374,18 @@ bool applyRestore(const Source&       src,
                 if (out.first_error.isEmpty()) out.first_error = String("unknown encoding: ") + enc;
                 continue;
             }
+            // v1 backups built on a PSRAM-starved device carry
+            // "content": null for large files, which decodes to zero
+            // bytes. Writing that would truncate e.g. the spool DB —
+            // refuse anything that doesn't match its recorded size.
+            if (f["size"].is<uint32_t>() && bytes.size() != f["size"].as<uint32_t>()) {
+                out.errors++;
+                if (out.first_error.isEmpty()) {
+                    out.first_error = String("content/size mismatch for ") + path +
+                                      " (corrupt backup) — not written";
+                }
+                continue;
+            }
             if (writeFile(*target, path, bytes)) {
                 out.files_written++;
             } else {
@@ -368,6 +396,544 @@ bool applyRestore(const Source&       src,
     }
 
     return out.errors == 0;
+}
+
+// ── v2: streaming tar ──────────────────────────────────────────────
+namespace {
+
+constexpr size_t kBlk = 512;
+constexpr int    kSchemaTar = 2;
+
+size_t padTo512(size_t n) { return (kBlk - (n % kBlk)) % kBlk; }
+
+// Zero-padded octal into a NUL-terminated field of `width` bytes.
+void putOctal(uint8_t* dst, size_t width, uint64_t v) {
+    dst[width - 1] = 0;
+    for (int i = (int)width - 2; i >= 0; --i) {
+        dst[i] = (uint8_t)('0' + (v & 7));
+        v >>= 3;
+    }
+}
+
+uint64_t getOctal(const uint8_t* src, size_t width) {
+    uint64_t v = 0;
+    for (size_t i = 0; i < width; ++i) {
+        uint8_t c = src[i];
+        if (c == ' ' && v == 0) continue;
+        if (c < '0' || c > '7') break;
+        v = (v << 3) | (uint64_t)(c - '0');
+    }
+    return v;
+}
+
+unsigned headerChecksum(const uint8_t* h) {
+    unsigned sum = 0;
+    for (size_t i = 0; i < kBlk; ++i) {
+        sum += (i >= 148 && i < 156) ? (unsigned)' ' : h[i];
+    }
+    return sum;
+}
+
+// POSIX ustar header. Names over 100 chars are split into prefix/name
+// at a '/'; returns false if no split fits.
+bool makeHeader(uint8_t* h, const String& name, size_t size, uint32_t mtime) {
+    memset(h, 0, kBlk);
+    const char* n   = name.c_str();
+    const size_t len = name.length();
+    if (len <= 100) {
+        memcpy(h, n, len);
+    } else {
+        int cut = -1;
+        for (int i = (int)len - 1; i > 0; --i) {
+            if (n[i] == '/' && (len - i - 1) <= 100 && i <= 155) { cut = i; break; }
+        }
+        if (cut < 0) return false;
+        memcpy(h + 345, n, cut);
+        memcpy(h, n + cut + 1, len - cut - 1);
+    }
+    memcpy(h + 100, "0000644", 8);   // mode
+    memcpy(h + 108, "0000000", 8);   // uid
+    memcpy(h + 116, "0000000", 8);   // gid
+    putOctal(h + 124, 12, size);
+    putOctal(h + 136, 12, mtime);
+    h[156] = '0';                    // regular file
+    memcpy(h + 257, "ustar", 6);     // magic incl. NUL
+    memcpy(h + 263, "00", 2);        // version
+    memcpy(h + 265, "spoolhard", 9); // uname
+    memcpy(h + 297, "spoolhard", 9); // gname
+    putOctal(h + 148, 7, headerChecksum(h));  // 6 digits + NUL ...
+    h[155] = ' ';                             // ... + space
+    return true;
+}
+
+struct TarMember {
+    String   name;          // archive path
+    String   mem;           // in-memory payload (manifest/nvs)
+    FS*      fs = nullptr;  // file payload when non-null
+    String   path;
+    size_t   size  = 0;
+    uint32_t mtime = 0;
+};
+
+// Pull-model tar generator: the AsyncWebServer response filler calls
+// fill() as the socket drains. Only the open File + one 512-byte header
+// are live at any time.
+class TarStream {
+public:
+    std::vector<TarMember> members;
+
+    size_t totalBytes() const {
+        size_t t = 2 * kBlk;  // end-of-archive marker
+        for (const auto& m : members) t += kBlk + m.size + padTo512(m.size);
+        return t;
+    }
+
+    size_t fill(uint8_t* buf, size_t maxLen) {
+        if (_aborted) return 0;   // ends the response short → client sees an error
+        size_t w = 0;
+        while (w < maxLen) {
+            if (_cur >= members.size()) {
+                size_t n = std::min(maxLen - w, _trailerLeft);
+                if (!n) break;
+                memset(buf + w, 0, n);
+                w += n; _trailerLeft -= n;
+                continue;
+            }
+            TarMember& m = members[_cur];
+            if (_phase == Phase::Header) {
+                if (_off == 0 && !makeHeader(_hdr, m.name, m.size, m.mtime)) {
+                    return _abort(w, "name too long: " + m.name);
+                }
+                size_t n = std::min(kBlk - _off, maxLen - w);
+                memcpy(buf + w, _hdr + _off, n);
+                w += n; _off += n;
+                if (_off == kBlk) { _phase = Phase::Data; _off = 0; }
+            } else if (_phase == Phase::Data) {
+                if (_off >= m.size) {
+                    if (_file) _file.close();
+                    _phase = Phase::Pad; _off = 0;
+                    continue;
+                }
+                size_t n = std::min(m.size - _off, maxLen - w);
+                if (!m.fs) {
+                    memcpy(buf + w, m.mem.c_str() + _off, n);
+                } else {
+                    if (!_file) _file = m.fs->open(m.path, FILE_READ);
+                    size_t got = _file ? _file.read(buf + w, n) : 0;
+                    if (got == 0) {
+                        // File vanished or shrank since the listing —
+                        // never emit zero-filled content as if it were real.
+                        return _abort(w, "short read on " + m.path);
+                    }
+                    n = got;
+                }
+                w += n; _off += n;
+            } else {  // Pad
+                size_t pad = padTo512(m.size);
+                size_t n   = std::min(pad - _off, maxLen - w);
+                memset(buf + w, 0, n);
+                w += n; _off += n;
+                if (_off == pad) { ++_cur; _phase = Phase::Header; _off = 0; }
+            }
+        }
+        return w;
+    }
+
+    ~TarStream() { if (_file) _file.close(); }
+
+private:
+    enum class Phase { Header, Data, Pad };
+    size_t  _cur = 0;
+    Phase   _phase = Phase::Header;
+    size_t  _off = 0;
+    size_t  _trailerLeft = 2 * kBlk;
+    uint8_t _hdr[kBlk];
+    File    _file;
+    bool    _aborted = false;
+
+    size_t _abort(size_t w, const String& why) {
+        dlog("Backup", "tar stream aborted: %s", why.c_str());
+        if (_file) _file.close();
+        _aborted = true;
+        return w;   // flush what's buffered; next fill() returns 0
+    }
+};
+
+void collectFiles(FS& fs, const String& path, const FsMount& mount,
+                  std::vector<TarMember>& out) {
+    File dir = fs.open(path);
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        return;
+    }
+    File f = dir.openNextFile();
+    while (f) {
+        String full = String(f.path() ? f.path() : f.name());
+        if (full.length() == 0) full = path + "/" + f.name();
+        if (!isSkipped(full, mount)) {
+            if (f.isDirectory()) {
+                collectFiles(fs, full, mount, out);
+            } else if (mount.max_file_size == 0 || f.size() <= mount.max_file_size) {
+                TarMember m;
+                m.name  = String(mount.label) + (full.startsWith("/") ? "" : "/") + full;
+                m.fs    = &fs;
+                m.path  = full;
+                m.size  = f.size();
+                m.mtime = (uint32_t)f.getLastWrite();
+                out.push_back(std::move(m));
+            }
+        }
+        File next = dir.openNextFile();
+        f.close();
+        f = next;
+    }
+    dir.close();
+}
+
+}  // namespace
+
+void sendTarBackup(AsyncWebServerRequest* req,
+                   const Source&          src,
+                   const String&          product,
+                   const String&          device_name,
+                   const String&          fw_version,
+                   const String&          filename) {
+    auto st = std::make_shared<TarStream>();
+    const uint32_t now = (uint32_t)time(nullptr);
+
+    TarMember manifest;
+    manifest.name  = "manifest.json";
+    manifest.mtime = now;
+    {
+        JsonDocument d(&g_psramJsonAlloc);
+        d["spoolhard_backup"] = kSchemaTar;
+        d["format"]           = "tar";
+        d["product"]          = product;
+        d["device_name"]      = device_name;
+        d["fw_version"]       = fw_version;
+        d["created_at"]       = now;
+        serializeJson(d, manifest.mem);
+    }
+    manifest.size = manifest.mem.length();
+    st->members.push_back(std::move(manifest));
+
+    TarMember nvs;
+    nvs.name  = "nvs.json";
+    nvs.mtime = now;
+    {
+        JsonDocument d(&g_psramJsonAlloc);
+        JsonObject root = d.to<JsonObject>();
+        for (const char* ns : src.nvs_namespaces) {
+            dumpNamespace(ns, root[ns].to<JsonArray>());
+        }
+        serializeJson(d, nvs.mem);
+    }
+    nvs.size = nvs.mem.length();
+    st->members.push_back(std::move(nvs));
+
+    for (const auto& m : src.fs_mounts) {
+        if (m.fs) collectFiles(*m.fs, "/", m, st->members);
+    }
+
+    const size_t total = st->totalBytes();
+    dlog("Backup", "tar backup: %u members, %u bytes",
+         (unsigned)st->members.size(), (unsigned)total);
+
+    AsyncWebServerResponse* resp = req->beginResponse(
+        "application/x-tar", total,
+        [st](uint8_t* buf, size_t maxLen, size_t /*index*/) -> size_t {
+            return st->fill(buf, maxLen);
+        });
+    resp->addHeader("Content-Disposition",
+                    String("attachment; filename=\"") + filename + "\"");
+    req->send(resp);
+}
+
+// ── RestoreSession ─────────────────────────────────────────────────
+struct RestoreSession::Impl {
+    enum class Mode  { None, Legacy, Tar, Rejected };
+    enum class State { Header, Data, Pad, End };
+    enum class Sink  { Skip, Mem, File };
+    struct Pending { FS* fs; String path; String tmp; };
+
+    static constexpr size_t kLegacyCap   = 256 * 1024;
+    static constexpr size_t kManifestCap = 4 * 1024;
+    static constexpr size_t kNvsCap      = 64 * 1024;
+
+    const Source* src = nullptr;
+    String  product;
+    Mode    mode  = Mode::None;
+    String  error;
+    int     rejectStatus = 400;
+    String  legacy;
+
+    State   st = State::Header;
+    uint8_t hdr[kBlk];
+    size_t  hdrFill = 0;
+    size_t  remain = 0, padRemain = 0;
+    Sink    sink = Sink::Skip;
+    String* memDst = nullptr;
+    size_t  memCap = 0;
+    bool    memIsManifest = false;
+    File    out;
+    Pending cur{};
+    bool    sawMember   = false;
+    bool    manifestOk  = false;
+    String  manifest, nvs;
+    std::vector<Pending> pending;
+    int     filesSkipped = 0;
+
+    ~Impl() { discardTemps(); }
+
+    void fail(const String& why) {
+        if (error.isEmpty()) error = why;
+        mode = Mode::Rejected;
+        discardTemps();
+    }
+
+    void discardTemps() {
+        if (out) {
+            out.close();
+            if (cur.fs) cur.fs->remove(cur.tmp);
+        }
+        for (auto& p : pending) p.fs->remove(p.tmp);
+        pending.clear();
+    }
+
+    void onHeader() {
+        bool zero = true;
+        for (size_t i = 0; i < kBlk; ++i) if (hdr[i]) { zero = false; break; }
+        if (zero) { st = State::End; return; }   // end-of-archive marker
+
+        if (memcmp(hdr + 257, "ustar", 5) != 0 ||
+            headerChecksum(hdr) != (unsigned)getOctal(hdr + 148, 8)) {
+            fail("not a SpoolHard backup (bad tar header)");
+            return;
+        }
+        String name;
+        if (hdr[345]) {
+            name = String((const char*)hdr + 345).substring(0, 155) + "/";
+        }
+        char nm[101]; memcpy(nm, hdr, 100); nm[100] = 0;
+        name += nm;
+        const size_t size = (size_t)getOctal(hdr + 124, 12);
+        const char   type = (char)hdr[156];
+
+        remain    = (type == '0' || type == '\0') ? size : 0;
+        padRemain = (type == '0' || type == '\0') ? padTo512(size) : 0;
+        if (type != '0' && type != '\0' && type != '5') {
+            // Unknown member type: still skip over its data.
+            remain = size; padRemain = padTo512(size);
+        }
+        sink = Sink::Skip;
+
+        const bool first = !sawMember;
+        sawMember = true;
+        if (first && name != "manifest.json") {
+            fail("not a SpoolHard backup (manifest.json must come first)");
+            return;
+        }
+        if (name == "manifest.json") {
+            sink = Sink::Mem; memDst = &manifest; memCap = kManifestCap; memIsManifest = true;
+        } else if (!manifestOk) {
+            fail("manifest.json missing or invalid");
+            return;
+        } else if (name == "nvs.json") {
+            sink = Sink::Mem; memDst = &nvs; memCap = kNvsCap; memIsManifest = false;
+        } else if (type == '0' || type == '\0') {
+            routeFile(name);
+            if (mode == Mode::Rejected) return;
+        }
+        if (remain == 0) memberEnd();
+        st = remain ? State::Data : (padRemain ? State::Pad : State::Header);
+    }
+
+    void routeFile(const String& name) {
+        int slash = name.indexOf('/');
+        FS* target = nullptr;
+        if (slash > 0) {
+            String label = name.substring(0, slash);
+            for (const auto& m : src->fs_mounts) {
+                if (m.fs && label == m.label) { target = m.fs; break; }
+            }
+        }
+        String path = slash > 0 ? name.substring(slash) : String();
+        if (!target || path.length() < 2 || path.indexOf("/../") >= 0 ||
+            path.endsWith("/..")) {
+            filesSkipped++;
+            return;
+        }
+        cur = Pending{target, path, path + kRestoreSuffix};
+        ensureParentDirs(*target, cur.tmp);
+        out = target->open(cur.tmp, FILE_WRITE);
+        if (!out) { fail("cannot write " + cur.tmp); return; }
+        sink = Sink::File;
+    }
+
+    void write(const uint8_t* data, size_t n) {
+        if (sink == Sink::Mem) {
+            if (memDst->length() + n > memCap) { fail("archive member too large"); return; }
+            memDst->concat((const char*)data, n);
+        } else if (sink == Sink::File) {
+            if (out.write(data, n) != n) fail("write failed for " + cur.tmp);
+        }
+    }
+
+    void memberEnd() {
+        if (sink == Sink::Mem && memIsManifest) {
+            JsonDocument d(&g_psramJsonAlloc);
+            if (deserializeJson(d, manifest)) { fail("manifest.json is not valid JSON"); return; }
+            if ((d["spoolhard_backup"] | 0) != kSchemaTar) {
+                fail("not a SpoolHard backup (or unsupported schema)");
+                return;
+            }
+            String why;
+            if (!validate(d, product, why)) { fail(why); return; }
+            manifestOk = true;
+        } else if (sink == Sink::File) {
+            out.close();
+            pending.push_back(cur);
+            cur = Pending{};
+        }
+        sink = Sink::Skip;
+    }
+
+    void feedTar(const uint8_t* data, size_t len) {
+        while (len && mode == Mode::Tar) {
+            switch (st) {
+                case State::Header: {
+                    size_t n = std::min(kBlk - hdrFill, len);
+                    memcpy(hdr + hdrFill, data, n);
+                    hdrFill += n; data += n; len -= n;
+                    if (hdrFill == kBlk) { hdrFill = 0; onHeader(); }
+                    break;
+                }
+                case State::Data: {
+                    size_t n = std::min(remain, len);
+                    write(data, n);
+                    remain -= n; data += n; len -= n;
+                    if (!remain && mode == Mode::Tar) {
+                        memberEnd();
+                        st = padRemain ? State::Pad : State::Header;
+                    }
+                    break;
+                }
+                case State::Pad: {
+                    size_t n = std::min(padRemain, len);
+                    padRemain -= n; data += n; len -= n;
+                    if (!padRemain) st = State::Header;
+                    break;
+                }
+                case State::End:
+                    return;   // trailing zero blocks / padding
+            }
+        }
+    }
+};
+
+RestoreSession::~RestoreSession() { delete _impl; }
+
+void RestoreSession::begin(const Source* src, const String& expected_product) {
+    delete _impl;
+    _impl = new Impl();
+    _impl->src     = src;
+    _impl->product = expected_product;
+}
+
+void RestoreSession::reject(const String& reason, int http_status) {
+    if (!_impl) return;
+    _impl->fail(reason);
+    _impl->rejectStatus = http_status;
+}
+
+void RestoreSession::feed(const uint8_t* data, size_t len, size_t index, size_t total) {
+    Impl* s = _impl;
+    if (!s || s->mode == Impl::Mode::Rejected || len == 0) return;
+    if (s->mode == Impl::Mode::None) {
+        if (index != 0) { s->fail("upload started mid-stream"); return; }
+        if (data[0] == '{') {
+            if (total > Impl::kLegacyCap) {
+                s->fail("legacy JSON backup too large (>256 KB)");
+                return;
+            }
+            s->mode = Impl::Mode::Legacy;
+            if (total) s->legacy.reserve(total);
+        } else {
+            s->mode = Impl::Mode::Tar;
+        }
+    }
+    if (s->mode == Impl::Mode::Legacy) {
+        if (s->legacy.length() + len > Impl::kLegacyCap) {
+            s->fail("legacy JSON backup too large (>256 KB)");
+            return;
+        }
+        s->legacy.concat((const char*)data, len);
+    } else {
+        s->feedTar(data, len);
+    }
+}
+
+int RestoreSession::finish(RestoreReport& rep, String& error) {
+    rep = RestoreReport{};
+    error = "";
+    std::unique_ptr<Impl> s(_impl);
+    _impl = nullptr;
+    if (!s) { error = "no upload"; return 400; }
+
+    if (s->mode == Impl::Mode::Rejected) { error = s->error; return s->rejectStatus; }
+    if (s->mode == Impl::Mode::None)     { error = "empty upload"; return 400; }
+
+    if (s->mode == Impl::Mode::Legacy) {
+        JsonDocument doc(&g_psramJsonAlloc);
+        if (deserializeJson(doc, s->legacy)) { error = "backup is not valid JSON"; return 400; }
+        s->legacy = String();
+        if (!validate(doc, s->product, error)) return 400;
+        bool ok = applyRestore(*s->src, doc, rep);
+        return ok ? 200 : 500;
+    }
+
+    // Tar: only commit if the archive arrived whole.
+    if (s->st != Impl::State::End) {
+        s->fail("upload incomplete (truncated archive)");
+        error = s->error;
+        return 400;
+    }
+    if (!s->manifestOk) { error = "manifest.json missing or invalid"; return 400; }
+
+    JsonDocument nvsDoc(&g_psramJsonAlloc);
+    if (s->nvs.length()) {
+        JsonDocument parsed(&g_psramJsonAlloc);
+        if (deserializeJson(parsed, s->nvs)) {
+            s->fail("nvs.json is not valid JSON");
+            error = s->error;
+            return 400;
+        }
+        nvsDoc["nvs"] = parsed.as<JsonObjectConst>();
+    }
+
+    // Files first (rename temps over originals), then NVS.
+    for (auto& p : s->pending) {
+        if (p.fs->exists(p.path)) p.fs->remove(p.path);
+        if (p.fs->rename(p.tmp, p.path)) {
+            rep.files_written++;
+        } else {
+            rep.errors++;
+            if (rep.first_error.isEmpty()) rep.first_error = "rename failed for " + p.path;
+            p.fs->remove(p.tmp);
+        }
+    }
+    s->pending.clear();
+
+    RestoreReport nvsRep;
+    applyRestore(*s->src, nvsDoc, nvsRep);
+    rep.nvs_keys_set     = nvsRep.nvs_keys_set;
+    rep.nvs_keys_skipped = nvsRep.nvs_keys_skipped;
+    rep.errors          += nvsRep.errors;
+    if (rep.first_error.isEmpty()) rep.first_error = nvsRep.first_error;
+    rep.files_skipped    = s->filesSkipped;
+    dlog("Backup", "tar restore: %d files, %d nvs keys, %d skipped, %d errors",
+         rep.files_written, rep.nvs_keys_set, rep.files_skipped, rep.errors);
+    return rep.errors ? 500 : 200;
 }
 
 }  // namespace SpoolhardBackup

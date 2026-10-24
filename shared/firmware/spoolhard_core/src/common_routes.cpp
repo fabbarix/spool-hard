@@ -5,6 +5,10 @@
 #include "spoolhard/psram_json_alloc.h"
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
+#include <esp_idf_version.h>
+#if ESP_IDF_VERSION_MAJOR >= 5
+#include <esp_memory_utils.h>
+#endif
 
 namespace SpoolhardCommonRoutes {
 
@@ -82,6 +86,22 @@ void registerHeap(AsyncWebServer& server) {
                 // words → bytes; minimum stack headroom ever observed
                 t["stack_free_min"] = (uint32_t)st[i].usStackHighWaterMark
                                           * sizeof(StackType_t);
+#if ESP_IDF_VERSION_MAJOR >= 5
+                // Heap footprint of the stack, for DRAM attribution.
+                // Static stacks (IDLE, IPC, our PSRAM-slot tasks) aren't
+                // heap blocks — heap_caps_get_allocated_size would assert
+                // on them — so only query dynamically created tasks.
+                StackType_t*  sbuf = nullptr;
+                StaticTask_t* tbuf = nullptr;
+                if (!xTaskGetStaticBuffers(st[i].xHandle, &sbuf, &tbuf) &&
+                    st[i].pxStackBase) {
+                    t["stack_bytes"] = (uint32_t)heap_caps_get_allocated_size(
+                        (void*)st[i].pxStackBase);
+                    t["stack_internal"] = esp_ptr_internal(st[i].pxStackBase);
+                } else {
+                    t["stack_static"] = true;
+                }
+#endif
             }
             free(st);
         }

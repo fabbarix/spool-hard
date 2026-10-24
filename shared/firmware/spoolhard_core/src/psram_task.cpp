@@ -4,7 +4,7 @@
 bool spoolhardSpawnPsramTask(TaskFunction_t fn, void* arg, const char* name,
                              size_t stack_bytes, UBaseType_t priority,
                              BaseType_t core_id, SpoolhardPsramTaskSlot& slot) {
-#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+#if SPOOLHARD_PSRAM_STACKS_ENABLED
     // PSRAM first — the whole point is keeping internal DRAM free for
     // the allocations that have no choice (lwIP, DMA, task churn).
     if (!slot.busy) {
@@ -35,8 +35,8 @@ bool spoolhardSpawnPsramTask(TaskFunction_t fn, void* arg, const char* name,
     // stack unless the sdkconfig enables SPIRAM_ALLOW_STACK_EXTERNAL_-
     // MEMORY — and arduino-esp32's prebuilt qio_qspi config does not
     // (learned the hard way: console 0.12.10/11 panic-looped at the
-    // boot+60s OTA check, crashes #2359-2363). Until the framework is
-    // built with that option, every spawn takes the internal path.
+    // boot+60s OTA check, crashes #2359-2363). Also gated on the
+    // SPOOLHARD_PSRAM_TASK_STACKS opt-in — see psram_task.h.
     (void)slot;
 #endif
 

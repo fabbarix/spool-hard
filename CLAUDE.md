@@ -20,7 +20,8 @@ See **[FLASHING.md](./FLASHING.md)** for the exact commands. TL;DR:
 - Console (`spuletto.local` / 192.168.20.153): multipart POST to
   `/api/upload/firmware` + `/api/upload/spiffs` with `?key=$SPULETTO_KEY`,
   bins from `console/firmware/.pio/build/esp32-s3/`.
-- Scale (`scalinata.local` / 192.168.20.154): same endpoints with
+- Scale (`scalinata.local` / 192.168.20.151 — DHCP, was .154; prefer the
+  hostname): same endpoints with
   `?key=$SCALINATA_KEY`, bins from `scale/firmware/.pio/build/esp32-s3/`.
 - CAUTION: whatever enumerates as `/dev/ttyACM0` (CH343 UART adapter) is
   some OTHER ESP32-S3 board, NOT the console or scale. Don't flash it.
@@ -42,8 +43,22 @@ each `protocol.cpp`. Missing one side silently drops the frame.
 
 ## Building
 
-Both firmwares build with plain `pio run` from their `firmware/` dir. The
-release scripts under `*/scripts/release.sh` additionally build the
+Both firmwares build with plain `pio run` from their `firmware/` dir.
+The platform is pinned (`espressif32@8.0.0` = arduino-esp32 3.3.12 /
+ESP-IDF 5.x) in both `platformio.ini`s — an unpinned platform let a
+cold CI cache silently jump majors. That builder adds no `-O` level,
+so `-Os` is in `build_flags`; without it the console image is ~4 MB
+and overflows its 3 MB OTA slot. `lib_deps` are pinned exactly for the
+same reason.
+
+`shared/firmware/scripts/patch_asyncwebserver.py` (pre-build, both
+products) patches ESPAsyncWebServer so form-urlencoded / text/plain POST
+bodies over 8 KB skip the lib's char-by-char param parser — unpatched, a
+single unauthenticated ~300 KB form POST to any route wedges async_tcp
+until the task WDT panics. The script fails the build if a lib bump moves
+its anchors; re-verify rather than delete it.
+
+The release scripts under `*/scripts/release.sh` additionally build the
 frontend, gzip it, produce a SPIFFS image, and emit a `manifest.json` for
 distribution — only needed for actual releases.
 
@@ -55,7 +70,7 @@ devices. Source it or read keys directly:
 - `SPULETTO_KEY` — fixed-key for the **console** at `192.168.20.153`
   (hostname `spuletto.local`). Used as `Authorization: Bearer <KEY>` or
   `?key=<KEY>` against `/api/*` endpoints.
-- `SCALINATA_KEY` — fixed-key for the **scale** at `192.168.20.154`
+- `SCALINATA_KEY` — fixed-key for the **scale** at `192.168.20.151`
   (hostname `scalinata.local`). In typical setups this is the same key as
   the console.
 - `BAMBU_PRINTER_IP` / `BAMBU_PRINTER_SERIAL` / `BAMBU_PRINTER_ACCESS_CODE`
@@ -67,7 +82,7 @@ Typical use:
 
 ```bash
 export $(grep -v '^#' .env | xargs)
-curl -H "Authorization: Bearer $SCALINATA_KEY" http://192.168.20.154/api/logs
+curl -H "Authorization: Bearer $SCALINATA_KEY" http://scalinata.local/api/logs
 ```
 
 ## Shared firmware library: `spoolhard_core`
@@ -95,8 +110,15 @@ the headers are `#include`d).
 - `spoolhard/version_marker.h` / `src/version_marker.cpp` —
   `SPOOLHARD-VERSION=<v>\x01` byte marker + `VersionMarkerParser` that
   pulls the version out of an uploaded firmware image.
-- `spoolhard/backup.h` / `src/backup.cpp` — `/api/backup` + `/api/restore`
-  serializer covering NVS namespaces + on-disk files.
+- `spoolhard/backup.h` / `src/backup.cpp` — `/api/backup` + `/api/restore`.
+  Backups are a streamed POSIX tar (`manifest.json`, `nvs.json`,
+  `<fs-label>/<path>` members — `tar tf` to inspect); restore streams
+  members to `<path>.restore` and only commits (rename + NVS apply) once
+  the whole archive arrived. Never build backups in RAM: the console's
+  SD spool DB is ~500 KB and the old single-JSON format silently dropped
+  large files. Legacy JSON (<256 KB) is still accepted on restore. Each
+  product's `_backupSource()` is the single list of namespaces, mounts and
+  skip rules used by both directions.
 - `spoolhard/ring_log.h` / `src/ring_log.cpp` — bounded in-RAM log ring
   + `dlog(tag, fmt, ...)` printf-style helper. Backs `/api/logs`.
 - `spoolhard/serial_mirror.h` / `src/serial_mirror.cpp` — `Serial`
@@ -125,9 +147,12 @@ the headers are `#include`d).
   Never `delay()+ESP.restart()` inline in a handler.
 - `spoolhard/psram_task.h` / `src/psram_task.cpp` — one-shot task
   spawner that would prefer a PSRAM stack, but the PSRAM path is
-  compiled out: this framework's sdkconfig lacks
-  `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` and FreeRTOS PANICS on
-  external stack buffers without it. Read the header before touching.
+  compiled out unless `-DSPOOLHARD_PSRAM_TASK_STACKS=1` AND the sdkconfig
+  has `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` (FreeRTOS PANICS on
+  external stack buffers without it — arduino-esp32 2.x lacked it; 3.x
+  has it). The opt-in is off: the path has never run in the field and
+  external-stack tasks must not write flash. Read the header before
+  touching.
 - `spoolhard/panic_persist.h` / `src/panic_persist.cpp` — best-effort
   crash-log persistence without an esp_core_dump partition. On boot,
   if `esp_reset_reason()` indicates panic/WDT/brownout AND a pending

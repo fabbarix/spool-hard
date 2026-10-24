@@ -1,5 +1,6 @@
 #pragma once
 #include <ESPAsyncWebServer.h>
+#include "spoolhard/backup.h"
 #include <AsyncWebSocket.h>
 #include <ArduinoJson.h>
 #include <FS.h>
@@ -259,10 +260,11 @@ private:
     bool        _filamentsUploadOk    = false;
     const char* _filamentsUploadErr   = "no upload";
 
-    // Backup / restore. The download endpoint serializes a single JSON
-    // document with every NVS namespace + filesystem file the console
-    // owns; restore parses an upload of the same shape and writes
-    // everything back. See spoolhard_core/backup.h for the wire format.
+    // Backup / restore. The download streams a tar of every NVS
+    // namespace + filesystem file the console owns; restore streams an
+    // upload of the same shape back to disk and applies it once the
+    // archive is complete. See spoolhard_core/backup.h for the format.
+    static const SpoolhardBackup::Source& _backupSource();
     void _handleBackupGet(AsyncWebServerRequest* req);
     void _handleRestorePost(AsyncWebServerRequest* req,
                             uint8_t* data, size_t len, size_t index, size_t total);
@@ -278,12 +280,9 @@ private:
     // serves the in-memory ring. Useful when the ring has rolled past the
     // moment of interest but the SD copy still has it.
     void _handleCurrentLog(AsyncWebServerRequest* req);
-    // Restore is delivered in chunks (the file can be ~hundreds of KB);
-    // accumulate into PSRAM until the final chunk lands, then parse +
-    // apply in the response handler. Reset on every new upload.
-    String _restoreBuffer;
-    bool   _restoreReady = false;
-    String _restoreError;
+    // Restore arrives in body chunks; the session streams file members
+    // to temp files and commits in the final response handler.
+    SpoolhardBackup::RestoreSession _restore;
 
 public:
     // Debug toggles (session-only; default off on every boot). Exposed as

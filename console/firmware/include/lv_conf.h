@@ -46,6 +46,11 @@
  * Operating system
  *====================*/
 #define LV_USE_OS               LV_OS_FREERTOS
+// SW draw thread ("swdraw"): LVGL's 8 KB default stack, observed peak
+// use ~1.9 KB (no FreeType/ThorVG). 4 KB keeps 2x headroom and returns
+// ~4 KB of internal DRAM. Re-measure via /api/heap before enabling any
+// vector/font renderer.
+#define LV_DRAW_THREAD_STACK_SIZE (4 * 1024)
 
 /*=================
  * Feature flags

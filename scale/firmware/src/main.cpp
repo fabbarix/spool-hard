@@ -709,7 +709,15 @@ void setup() {
     // <1 s; SPIFFS GC worst-case is seconds) but converts a forever-hang
     // into a recovery. Note this re-init also stretches the timeout for
     // AsyncTCP's task, which adds itself to the same WDT.
-    esp_task_wdt_init(60, /*panic=*/true);
+    // IDF 5: the framework already inits the TWDT (CONFIG_ESP_TASK_WDT_INIT,
+    // 5 s, CPU0 idle watched), so stretch it via reconfigure rather than
+    // init. Keep the stock idle-task mask.
+    const esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms     = 60 * 1000,
+        .idle_core_mask = BIT(0),
+        .trigger_panic  = true,
+    };
+    esp_task_wdt_reconfigure(&wdt_cfg);
     esp_task_wdt_add(nullptr);   // nullptr = calling task (loopTask)
 
     Serial.println("[Main] Init complete");

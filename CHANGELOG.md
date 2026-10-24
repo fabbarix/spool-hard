@@ -8,6 +8,45 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.12.14] - 2026-10-24
+
+H2-series external spool support, a working backup/restore, and the
+move to arduino-esp32 3.x. (Includes 0.12.13, whose release build never
+completed.)
+
+**Upgrade note:** backups are now `.tar` files. Backups taken with
+0.12.12 or earlier on a console whose SD spool database had grown large
+are incomplete (large files were silently emptied) — take a fresh backup
+after updating. Old small `.json` backups can still be restored.
+
+- feat(bambu): detect and show the external spool on H2S/H2D. These
+  printers report it in `print.vir_slot[]` instead of `print.vt_tray`,
+  so the external holder never appeared. The active slot now comes from
+  `device.extruder.info[].snow` (`ams.tray_now` stays "0" with no AMS
+  attached, which billed print consumption to a nonexistent AMS slot).
+  Loading a freshly scanned spool on the external holder now
+  auto-assigns it like an AMS slot, and spool settings are pushed to
+  the external tray with Bambu Studio's addressing.
+- fix(backup): backup and restore now stream a tar archive instead of
+  building one JSON document in RAM. The old format ran PSRAM dry on a
+  console with a ~500 KB spool database and silently wrote large files
+  as empty — restoring such a backup would have truncated the spool DB
+  (legacy restore now refuses content/size mismatches). Restore only
+  commits once the whole archive has arrived; a truncated, foreign or
+  wrong-product upload changes nothing. Logs, crash dumps, caches and
+  temp files are no longer included.
+- fix(http): a single large form-encoded POST to any route (no auth
+  needed) could hang the web server task until the watchdog rebooted
+  the device. ESPAsyncWebServer is now patched at build time so large
+  form bodies bypass its byte-by-byte parameter parser.
+- build: move to espressif32 8.0.0 (arduino-esp32 3.3.12 / ESP-IDF 5.x),
+  with the platform and every library pinned exactly so CI releases what
+  was tested. The new platform drops the `-Os` flag (the console image
+  ballooned to 4 MB); it is now set explicitly.
+- perf: the new framework costs ~23 KB of internal RAM; trimmed the web
+  server and LVGL draw-task stacks to recover ~11 KB on the console and
+  ~9 KB on the scale. `/api/heap` now reports each task's stack size.
+
 ## [0.12.7] - 2026-05-30
 
 Console: stop mid-print OOM rollbacks; instrument the heap.

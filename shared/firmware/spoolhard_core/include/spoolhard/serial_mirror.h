@@ -39,5 +39,8 @@ public:
 extern LineBufferingPrint g_serial;
 
 #ifndef SERIAL_MIRROR_NO_OVERRIDE
+// The core already #defines Serial (HWCDCSerial with USB-CDC-on-boot);
+// replace it explicitly. The wrapper reaches the real port via ::Serial.
+#undef Serial
 #define Serial g_serial
 #endif

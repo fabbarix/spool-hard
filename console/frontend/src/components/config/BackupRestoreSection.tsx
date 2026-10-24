@@ -6,9 +6,10 @@ import { useReconnect } from '@spoolhard/ui/providers/ReconnectProvider';
 import { getStoredKey } from '@spoolhard/ui/utils/authStorage';
 
 // Download/upload UI for the firmware's /api/backup + /api/restore
-// endpoints. The backup is a single JSON document carrying every NVS
-// namespace + filesystem file the device owns; restore parses an
-// upload of the same shape and writes it back, then reboots.
+// endpoints. The backup is a tar archive (manifest.json + nvs.json +
+// one member per file the device owns), streamed by the firmware;
+// restore streams an upload of the same shape back and reboots. Older
+// single-JSON backups (<256 KB) are still accepted on restore.
 //
 // SECURITY: the file contains every secret the device knows — WiFi
 // password, fixed bearer key, Bambu Cloud token, scale-link shared
@@ -45,7 +46,7 @@ export function BackupRestoreSection() {
       const m  = cd.match(/filename="([^"]+)"/);
       const name = m
         ? m[1]
-        : `spoolhard-console-${new Date().toISOString().slice(0, 10)}-backup.json`;
+        : `spoolhard-console-${new Date().toISOString().slice(0, 10)}-backup.tar`;
       const url = URL.createObjectURL(blob);
       const a   = document.createElement('a');
       a.href = url; a.download = name;
@@ -70,11 +71,11 @@ export function BackupRestoreSection() {
     setRestoreError(null);
     setRestoreInfo(null);
     try {
-      // Raw POST body (not multipart). The firmware route accumulates
+      // Raw POST body (not multipart). The firmware route streams
       // chunks via the body-handler third arg of _server.on(...).
       const r = await fetch('/api/restore', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...headers() },
+        headers: { 'Content-Type': 'application/octet-stream', ...headers() },
         body: pendingFile,
       });
       // The device reboots ~1s after sending the response on success.
@@ -161,7 +162,7 @@ export function BackupRestoreSection() {
           <input
             ref={fileInput}
             type="file"
-            accept="application/json,.json"
+            accept=".tar,application/x-tar,.json,application/json"
             onChange={(e) => {
               const f = e.target.files?.[0];
               if (f) stageFile(f);

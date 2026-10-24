@@ -11,6 +11,7 @@
 #include "ui/ui.h"
 #include "spoolhard/ring_log.h"
 #include "spoolhard/psram_json_alloc.h"
+#include "spoolhard/psram_task.h"   // SPOOLHARD_PSRAM_STACKS_ENABLED
 #include <WiFiClientSecure.h>
 // Raw-deflate inflater bundled in ROM. Bambu's slicer started shipping
 // some 3MFs with the gcode entry deflate-compressed (method=8) instead
@@ -19,7 +20,7 @@
 // callback, which requires the entire compressed input to be in memory)
 // so we can pipe the FTP retrieveRange callback's chunks straight into
 // the inflater and keep peak memory bounded by the 32 KiB sliding dict.
-#include <rom/miniz.h>
+#include <miniz.h>   // esp_rom/include on IDF 5 (was rom/miniz.h on IDF 4.4)
 #include <PubSubClient.h>
 #include <IPAddress.h>
 #include <esp_heap_caps.h>   // PSRAM-capable allocator for the analyzer
@@ -114,8 +115,9 @@ bool spawnPSRAMFallbackTask(TaskFunction_t fn, void* arg, const char* name,
     BaseType_t rc = xTaskCreatePinnedToCore(fn, name, TASK_STACK_BYTES,
                                             arg, priority, nullptr, core_id);
     if (rc == pdPASS) return true;
-#if !CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
-    // PSRAM task stacks are NOT permitted by this framework build:
+#if !SPOOLHARD_PSRAM_STACKS_ENABLED
+    // PSRAM task stacks are off (opt-in, see spoolhard/psram_task.h);
+    // on arduino-esp32 2.x they were outright unsupported:
     // xTaskCreateStatic's portVALID_STACK_MEM assert panics on an
     // external-RAM stack buffer. This fallback was a latent panic that
     // had simply never been exercised (see spoolhard/psram_task.h).

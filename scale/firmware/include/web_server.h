@@ -1,5 +1,6 @@
 #pragma once
 #include <ESPAsyncWebServer.h>
+#include "spoolhard/backup.h"
 #include <AsyncWebSocket.h>
 #include <ArduinoJson.h>
 #include <functional>
@@ -90,13 +91,13 @@ private:
     void _handleScaleConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
 
     // Backup / restore — same wire format as the console; see
-    // spoolhard_core/backup.h. Restore parses the upload, applies it,
+    // spoolhard_core/backup.h. Restore applies the upload once complete,
     // then reboots so the new state takes effect cleanly.
+    static const SpoolhardBackup::Source& _backupSource();
     void _handleBackupGet(AsyncWebServerRequest* req);
     void _handleRestorePost(AsyncWebServerRequest* req,
                             uint8_t* data, size_t len, size_t index, size_t total);
-    String _restoreBuffer;
-    bool   _restoreReady = false;
+    SpoolhardBackup::RestoreSession _restore;
 
     // Per-upload state. Only one upload runs at a time (Arduino's Update lib
     // is a singleton), so a single matcher + rejection flag is sufficient.

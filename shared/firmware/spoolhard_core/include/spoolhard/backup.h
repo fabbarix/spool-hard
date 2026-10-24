@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ESPAsyncWebServer.h>
 #include <FS.h>
 #include <vector>
 
@@ -9,11 +10,29 @@
 // Each product (console / scale) drives this with its own list of NVS
 // namespaces and filesystem mounts; the shared logic enumerates the
 // requested NVS keys via ESP-IDF's nvs_entry_find, walks each FS root
-// recursively, and emits one JSON document that can be downloaded by
-// the user and re-uploaded on the same (or a sibling) device to
-// restore the entire configured state.
+// recursively, and emits an archive that can be downloaded by the user
+// and re-uploaded on the same (or a sibling) device to restore the
+// entire configured state.
 //
-// Wire format (a single JSON document):
+// Wire format (current, "v2"): a plain POSIX ustar archive, streamed in
+// both directions so memory use is bounded by one chunk regardless of
+// how big the spool database grows (`tar tf backup.tar` to inspect):
+//
+//   manifest.json            {"spoolhard_backup":2,"format":"tar",
+//                             "product","device_name","fw_version",
+//                             "created_at"}  — always the first member
+//   nvs.json                 {"<ns>":[{"k","t","v"},...],...}
+//   <fs label>/<path>        raw file bytes, e.g. sd/spoolease/spools.jsonl,
+//                            littlefs/spools.jsonl
+//
+// Restore streams each file member to `<path>.restore`, and only once
+// the whole archive has arrived intact are NVS keys applied and the
+// temp files renamed over the originals — a truncated upload changes
+// nothing.
+//
+// Legacy wire format ("v1", still accepted on restore for uploads up
+// to 256 KB; no longer produced — building it in RAM silently dropped
+// large files once the spool DB outgrew PSRAM). A single JSON document:
 //
 //   {
 //     "spoolhard_backup": 1,                  // schema version
@@ -67,6 +86,9 @@ struct FsMount {
     // is "starts with" — entries here cover both the file itself and
     // any directory whose name begins with the prefix.
     std::vector<const char*> skip_prefixes;
+    // Filename suffixes to skip on backup (e.g. ".tmp"). "*.restore"
+    // leftovers from an aborted restore are always skipped.
+    std::vector<const char*> skip_suffixes;
 };
 
 // Describes which NVS namespaces and which filesystems to include.
@@ -75,7 +97,19 @@ struct Source {
     std::vector<FsMount>     fs_mounts;
 };
 
-// Build a backup document. Returns false only on a hard internal
+// Stream a v2 (tar) backup as the response to `req`. Walks the mounts
+// and snapshots NVS up front (metadata + a few KB of NVS JSON); file
+// bytes are read from disk chunk-by-chunk as the client drains the
+// socket. `filename` becomes the Content-Disposition download name.
+void sendTarBackup(AsyncWebServerRequest* req,
+                   const Source&          src,
+                   const String&          product,
+                   const String&          device_name,
+                   const String&          fw_version,
+                   const String&          filename);
+
+// Build a v1 backup document (legacy; kept for tests/tools — the HTTP
+// handlers use sendTarBackup). Returns false only on a hard internal
 // failure (NVS partition unreadable, etc); per-mount/file errors are
 // noted in `errors_out` but don't fail the whole operation. The
 // document is shaped per the comment above and ready to be
@@ -117,5 +151,36 @@ bool applyRestore(const Source&         src,
 bool validate(const JsonDocument& doc,
               const String&       expected_product,
               String&             reason);
+
+// Streaming restore for /api/restore. Feed it the raw request body from
+// the AsyncWebServer body callback, then call finish() from the final
+// request handler. Detects the format from the first byte: '{' is a v1
+// JSON backup (buffered, 256 KB cap), anything else must be a v2 tar.
+//
+// One session per server; a new begin() discards any previous state
+// (and its temp files).
+class RestoreSession {
+public:
+    RestoreSession() = default;
+    ~RestoreSession();
+    RestoreSession(const RestoreSession&) = delete;
+    RestoreSession& operator=(const RestoreSession&) = delete;
+
+    // index == 0 of a new upload. `src` must outlive the session's use
+    // (products keep it as a member or static).
+    void begin(const Source* src, const String& expected_product);
+    // Mark the upload rejected (e.g. auth failed) — further feed()s are
+    // ignored and finish() returns `http_status` with `reason`.
+    void reject(const String& reason, int http_status = 400);
+    void feed(const uint8_t* data, size_t len, size_t index, size_t total);
+    // Validate + apply. Returns the HTTP status to send (200 ok, 4xx bad
+    // upload, 500 apply failure); `rep` is filled either way and `error`
+    // carries the reason on 4xx. Resets the session afterwards.
+    int  finish(RestoreReport& rep, String& error);
+
+private:
+    struct Impl;
+    Impl* _impl = nullptr;
+};
 
 }  // namespace SpoolhardBackup

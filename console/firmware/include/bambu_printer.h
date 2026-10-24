@@ -174,7 +174,10 @@ struct PrinterState {
     String  error_message;          // last connection/parse error, for dashboards
 };
 
-class WiFiClientSecure;
+// arduino-esp32 3.x: WiFiClientSecure is a typedef of NetworkClientSecure,
+// so forward-declare the real class and alias it.
+class NetworkClientSecure;
+using WiFiClientSecure = NetworkClientSecure;
 class PubSubClient;
 
 /**
