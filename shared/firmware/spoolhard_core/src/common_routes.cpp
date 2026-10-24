@@ -51,6 +51,9 @@ void registerLogs(AsyncWebServer& server) {
     });
 }
 
+static HeapExtraFn s_heapExtra = nullptr;
+void setHeapExtra(HeapExtraFn fn) { s_heapExtra = fn; }
+
 void registerHeap(AsyncWebServer& server) {
     server.on(AsyncURIMatcher::exact("/api/heap"), HTTP_GET, [](AsyncWebServerRequest* req) {
         if (!SpoolhardAuth::requireAuth(req)) return;
@@ -75,6 +78,8 @@ void registerHeap(AsyncWebServer& server) {
             doc["ws_pool_total"]      = (uint32_t)g_wsBufPool.totalSlots();
             doc["ws_pool_free"]       = (uint32_t)g_wsBufPool.freeSlots();
         }
+
+        if (s_heapExtra) s_heapExtra(doc);
 
 #if (configUSE_TRACE_FACILITY == 1)
         // Per-task stack high-water marks — the data that says which

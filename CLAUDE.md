@@ -488,3 +488,15 @@ new sizes needed so far — `console/scripts/build_fonts.sh` has them);
 children don't shift; set a label's width BEFORE `lv_obj_align` on
 right/mid alignments. Debug: `GET /api/debug/lcd.bmp`, `POST
 /api/debug/lcd/touch` (see lcd_debug toggle).
+
+## Console loop instrumentation (`[LoopStat]`)
+
+`console/firmware/src/loop_stat.{h,cpp}` times the WHOLE `loop()` (body +
+`delay(5)`) and every `LAT_STEP` in microseconds with static counters (no
+heap, no Strings). Every 10 s it emits four back-to-back `dlog("LoopStat")`
+lines (ring-log lines cap at 159 chars, hence the split): window summary
+(`it/s`, `busy%` = body time / wall, `loop_max`, avg body/whole), then
+`max_us` per step and `avg_us` per step. The finished window is also
+served under `loop_stat` in `GET /api/heap` (added via
+`SpoolhardCommonRoutes::setHeapExtra()`, add-only; scale doesn't set it).
+The old `[LoopLat]` >200 ms per-step / >500 ms first-half lines remain.

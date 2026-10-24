@@ -32,6 +32,7 @@
 #include <lvgl.h>   // LV_SYMBOL_* FontAwesome glyphs baked into Montserrat
 #include "scale_discovery.h"
 #include "ssdp_hub.h"
+#include "loop_stat.h"
 #include <atomic>
 #include <esp_heap_caps.h>
 #include "spoolhard/serial_mirror.h"
@@ -1384,25 +1385,27 @@ static void _onOtaBannerTap() {
 }
 
 // ── Loop ─────────────────────────────────────────────────────
-#define LAT_STEP(name, expr) do {                                        \
-    uint32_t __t0 = millis();                                            \
+#define LAT_STEP(id, name, expr) do {                                    \
+    uint32_t __t0 = micros();                                            \
     expr;                                                                \
-    uint32_t __dt = millis() - __t0;                                     \
+    uint32_t __dtu = micros() - __t0;                                    \
+    LoopStat::add(LoopStat::id, __dtu);                                  \
+    uint32_t __dt = __dtu / 1000;                                        \
     if (__dt > 200) Serial.printf("[LoopLat] %s=%lums\n", name,          \
                                  (unsigned long)__dt);                   \
 } while (0)
 void loop() {
-    uint32_t __loop_t0 = millis();
-    LAT_STEP("wifi",            g_wifi.update());
-    LAT_STEP("scale",           g_scale.update());
-    LAT_STEP("nfc",             g_nfc.update());
-    LAT_STEP("sd",              g_sd.update());
-    LAT_STEP("crash_log",       CrashLogger::update());
-    LAT_STEP("bambu",           g_bambu.update());
-    LAT_STEP("ssdp",            ssdp_hub_poll());
-    LAT_STEP("bambu_discovery", g_bambu_discovery.update());
-    LAT_STEP("scale_discovery", g_scale_discovery.update());
-    LAT_STEP("ota_check",       g_ota_checker.update());
+    uint32_t __loop_t0 = micros();
+    LAT_STEP(S_WIFI, "wifi",            g_wifi.update());
+    LAT_STEP(S_SCALE, "scale",           g_scale.update());
+    LAT_STEP(S_NFC, "nfc",             g_nfc.update());
+    LAT_STEP(S_SD, "sd",              g_sd.update());
+    LAT_STEP(S_CRASH_LOG, "crash_log",       CrashLogger::update());
+    LAT_STEP(S_BAMBU, "bambu",           g_bambu.update());
+    LAT_STEP(S_SSDP, "ssdp",            ssdp_hub_poll());
+    LAT_STEP(S_BAMBU_DISC, "bambu_discovery", g_bambu_discovery.update());
+    LAT_STEP(S_SCALE_DISC, "scale_discovery", g_scale_discovery.update());
+    LAT_STEP(S_OTA_CHECK, "ota_check",       g_ota_checker.update());
 
     // Once per second, rebuild the home-screen AMS tile strip from whichever
     // printer is currently connected. Cheap in absolute terms but not so
@@ -1411,13 +1414,14 @@ void loop() {
     static uint32_t _lastAmsRefresh = 0;
     if (millis() - _lastAmsRefresh > 1000) {
         _lastAmsRefresh = millis();
-        LAT_STEP("ams_panel", _refreshHomeAmsPanel());
-        LAT_STEP("home_foot", _refreshHomeFooter());
-        LAT_STEP("ota_banner", _refreshOtaBanner());
+        LAT_STEP(S_AMS_PANEL, "ams_panel", _refreshHomeAmsPanel());
+        LAT_STEP(S_HOME_FOOT, "home_foot", _refreshHomeFooter());
+        LAT_STEP(S_OTA_BANNER, "ota_banner", _refreshOtaBanner());
 
         // Device-config live push — only while the screen is up. Sources
         // every field from its owning module (OTA checker, scale link)
         // so ui.cpp stays presentation-only.
+        uint32_t __tdc = micros();
         if (ui_devcfg_visible()) {
             auto cp = g_ota_checker.pending();
             const auto& sp = g_scale.scaleOtaPending();
@@ -1438,6 +1442,8 @@ void loop() {
             live.check_age_s     = (ts == 0) ? -1 : (int)(time(nullptr) - ts);
             ui_set_devcfg_live(live);
         }
+        LoopStat::add(LoopStat::S_DEVCFG, micros() - __tdc);
+        uint32_t __tws = micros();
 
         // Push the slow-changing infra resources. Each push helper is
         // rate-gated inside broadcastState (5–30 s gates) so a 1 Hz
@@ -1470,10 +1476,12 @@ void loop() {
         // the same id reuses the slot. Calling once per second is the
         // canonical workaround documented in the library's README.
         g_web.cleanupWsClients();
+        LoopStat::add(LoopStat::S_WS_PUSH, micros() - __tws);
     }
-    uint32_t __loop_dt = millis() - __loop_t0;
+    uint32_t __loop_dt = (micros() - __loop_t0) / 1000;
     if (__loop_dt > 500) Serial.printf("[LoopLat] total=%lums\n",
                                        (unsigned long)__loop_dt);
+    uint32_t __tail_t0 = micros();
 
     // Keep the scale-weight cache fresh while the spool-detail screen is
     // open. The scale only pushes LoadChanged* on state transitions; if the
@@ -1677,5 +1685,8 @@ void loop() {
         }
     }
 
+    uint32_t __body_end = micros();
+    LoopStat::add(LoopStat::S_TAIL, __body_end - __tail_t0);
     delay(5);
+    LoopStat::endIteration(__body_end - __loop_t0, micros() - __body_end);
 }

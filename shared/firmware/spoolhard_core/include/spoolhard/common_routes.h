@@ -1,5 +1,6 @@
 #pragma once
 #include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
 
 // Identical HTTP routes that both the console and scale firmwares
 // expose. Lifted to the shared lib so any change (auth shape, body
@@ -27,6 +28,13 @@ void registerLogs(AsyncWebServer& server);
 // per-task stack high-water marks (when configUSE_TRACE_FACILITY is
 // on). The measurement source for DRAM-budget work.
 void registerHeap(AsyncWebServer& server);
+
+// Optional per-product hook that appends extra fields to the /api/heap
+// JSON (add-only; never remove/rename the shared fields). The console
+// uses it to expose the latest [LoopStat] window. Call before/after
+// registerAll; nullptr (default) = no extras.
+using HeapExtraFn = void (*)(JsonDocument& doc);
+void setHeapExtra(HeapExtraFn fn);
 
 // Convenience: register all of the above in one call.
 inline void registerAll(AsyncWebServer& server) {

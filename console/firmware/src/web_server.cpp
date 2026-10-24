@@ -1,4 +1,5 @@
 #include "web_server.h"
+#include "loop_stat.h"
 #include <map>
 #include <set>
 #include "config.h"
@@ -488,6 +489,7 @@ void ConsoleWebServer::_setupRoutes() {
     // /api/restart, /api/logs — shared lib registrations. /api/logs/current
     // stays a console-specific handler because it serves the SD-persisted
     // log file, not the in-RAM ring head.
+    SpoolhardCommonRoutes::setHeapExtra(LoopStat::toJson);
     SpoolhardCommonRoutes::registerAll(_server);
 
     _server.on(AsyncURIMatcher::exact("/api/wifi-status"), HTTP_GET, [this](AsyncWebServerRequest* req) {
