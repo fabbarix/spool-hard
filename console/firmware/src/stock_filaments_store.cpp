@@ -22,15 +22,31 @@ void* psramAlloc(size_t n) {
 }  // namespace
 
 void StockFilamentsStore::begin() {
+    lock();  // create the mutex before any reader/reload races
     reload();
 }
 
-void StockFilamentsStore::freeBuffers() {
-    free(_buf);
-    free(_idx);
-    _buf = nullptr;
-    _idx = nullptr;
-    _count = 0;
+SemaphoreHandle_t StockFilamentsStore::lock() const {
+    if (!_mtx) {
+        // Created from begin() on loopTask before any reader exists.
+        _mtx = xSemaphoreCreateMutex();
+    }
+    return _mtx;
+}
+
+// Swap in new buffers under the mutex; free the old ones after unlocking.
+void StockFilamentsStore::install(char* buf, RowIdx* idx, size_t n, bool loaded) {
+    SemaphoreHandle_t m = lock();
+    xSemaphoreTake(m, portMAX_DELAY);
+    char* oldBuf = _buf;
+    RowIdx* oldIdx = _idx;
+    _buf = buf;
+    _idx = idx;
+    _count = n;
+    _loaded = loaded;
+    xSemaphoreGive(m);
+    free(oldBuf);
+    free(oldIdx);
 }
 
 bool StockFilamentsStore::parseRow(const RowIdx& r, FilamentRecord& out) const {
@@ -40,28 +56,29 @@ bool StockFilamentsStore::parseRow(const RowIdx& r, FilamentRecord& out) const {
 }
 
 void StockFilamentsStore::reload() {
-    freeBuffers();
-    _loaded = false;
     if (!g_sd.isMounted()) {
         Serial.println("[StockFilaments] SD not mounted; stock library unavailable");
+        install(nullptr, nullptr, 0, false);
         return;
     }
     File f = SD.open(FILAMENTS_PATH, FILE_READ);
     if (!f) {
         Serial.printf("[StockFilaments] %s not found — upload via web UI\n",
                       FILAMENTS_PATH);
+        install(nullptr, nullptr, 0, false);
         return;
     }
     size_t sz = f.size();
     if (!sz) {  // empty file == loaded, zero rows
         f.close();
-        _loaded = true;
+        install(nullptr, nullptr, 0, true);
         return;
     }
     char* buf = (char*)psramAlloc(sz + 1);
     if (!buf) {
         f.close();
         Serial.println("[StockFilaments] OOM allocating stock buffer");
+        install(nullptr, nullptr, 0, false);
         return;
     }
     size_t got = f.read((uint8_t*)buf, sz);
@@ -75,6 +92,7 @@ void StockFilamentsStore::reload() {
     if (!idx) {
         free(buf);
         Serial.println("[StockFilaments] OOM allocating stock index");
+        install(nullptr, nullptr, 0, false);
         return;
     }
 
@@ -98,25 +116,27 @@ void StockFilamentsStore::reload() {
         }
         pos = end + 1;
     }
-    _buf = buf;
-    _idx = idx;
-    _count = n;
-    _loaded = true;
+    install(buf, idx, n, true);
     Serial.printf("[StockFilaments] Loaded %u stock filament rows (%u B text, PSRAM)\n",
                   (unsigned)n, (unsigned)got);
 }
 
 bool StockFilamentsStore::findById(const String& setting_id, FilamentRecord& out) const {
     uint32_t h = fnv1a(setting_id);
+    SemaphoreHandle_t m = lock();
+    xSemaphoreTake(m, portMAX_DELAY);
+    bool found = false;
     for (size_t i = 0; i < _count; i++) {
         if (_idx[i].id_hash != h) continue;
         FilamentRecord r;
         if (parseRow(_idx[i], r) && r.setting_id == setting_id) {
             out = std::move(r);
-            return true;
+            found = true;
+            break;
         }
     }
-    return false;
+    xSemaphoreGive(m);
+    return found;
 }
 
 std::vector<FilamentRecord> StockFilamentsStore::list(
@@ -125,6 +145,8 @@ std::vector<FilamentRecord> StockFilamentsStore::list(
     size_t skipped = 0, returned = 0;
     bool filter = material_filter.length() > 0;
     uint32_t fh = filter ? fnv1a(material_filter) : 0;
+    SemaphoreHandle_t m = lock();
+    xSemaphoreTake(m, portMAX_DELAY);
     for (size_t i = 0; i < _count; i++) {
         if (filter && _idx[i].type_hash != fh) continue;
         FilamentRecord r;
@@ -134,5 +156,6 @@ std::vector<FilamentRecord> StockFilamentsStore::list(
         out.push_back(std::move(r));
         if (++returned >= limit) break;
     }
+    xSemaphoreGive(m);
     return out;
 }
