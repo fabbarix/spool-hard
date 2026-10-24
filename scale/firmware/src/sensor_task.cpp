@@ -59,6 +59,12 @@ void _publishSnapshot() {
 void _drainCommands() {
     Cmd c;
     while (xQueueReceive(s_cmd_q, &c, 0) == pdTRUE) {
+        // Every command either rewrites g_scale's CalibrationData or
+        // (ReloadParams) reloads it, so run under s_cal_mtx: snapshotCal()
+        // readers (50 ms timeout) never see a half-written struct. Held
+        // across tare()/captureRaw() HX711 averaging; readers just time
+        // out and retry on their next call.
+        if (s_cal_mtx) xSemaphoreTake(s_cal_mtx, portMAX_DELAY);
         switch (c.kind) {
             case CmdKind::Tare:
                 Serial.println("[Sensor] tare");
@@ -87,6 +93,7 @@ void _drainCommands() {
                 g_scale.loadParams();
                 break;
         }
+        if (s_cal_mtx) xSemaphoreGive(s_cal_mtx);
     }
 }
 
@@ -153,7 +160,7 @@ int         getPrecision(){ return snapshot().precision; }
 CalibrationData snapshotCal() {
     if (!s_cal_mtx) return {};
     CalibrationData out;
-    if (xSemaphoreTake(s_cal_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(s_cal_mtx, pdMS_TO_TICKS(400)) == pdTRUE) {
         out = g_scale.cal();
         xSemaphoreGive(s_cal_mtx);
     }

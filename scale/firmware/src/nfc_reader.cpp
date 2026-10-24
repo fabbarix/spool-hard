@@ -56,9 +56,12 @@ void NfcReader::update() {
     }
 
     _tagPresent = true;
+    _tagGen++;
     _lastTag.uid_len = uid_len;
     memcpy(_lastTag.uid, uid, uid_len);
     _lastTag.is_bambulab = _isBambuLabTag(uid, uid_len);
+    _lastTag.ndef_url = "";       // don't carry the previous tag's payload
+    _lastTag.raw_message = "";
 
     _setStatus(TagStatus::FoundTagNowReading);
 
@@ -114,23 +117,56 @@ bool NfcReader::_readNdef(SpoolTag& tag) {
     return true;
 }
 
+bool NfcReader::_uidMatchesPresent(const uint8_t* uid, uint8_t uid_len) const {
+    // Empty guard = caller didn't supply check_uid; otherwise the tag on
+    // the antenna must be the one the caller meant to modify.
+    if (uid_len == 0) return true;
+    return _tagPresent && uid_len == _lastTag.uid_len &&
+           memcmp(uid, _lastTag.uid, uid_len) == 0;
+}
+
 bool NfcReader::writeTag(const uint8_t* uid, uint8_t uid_len, const String& ndef_message, const String& cookie) {
     _setStatus(TagStatus::FoundTagNowWriting);
 
-    // Build NDEF TLV: 0x03 <len> <ndef> 0xFE
-    uint8_t len = ndef_message.length();
-    String tlv;
-    tlv += (char)0x03;
-    tlv += (char)len;
-    tlv += ndef_message;
-    tlv += (char)0xFE;
+    if (!_uidMatchesPresent(uid, uid_len)) {
+        Serial.println("[NFC] write: tag on reader doesn't match check_uid");
+        _setStatus(TagStatus::Failure);
+        return false;
+    }
+
+    // Build NDEF TLV: 0x03 <len> <ndef> 0xFE. Single-byte length form
+    // only (<= 254 bytes), which also bounds the stack buffer.
+    size_t len = ndef_message.length();
+    if (len > 254) {
+        Serial.printf("[NFC] write: message too long (%u > 254)\n", (unsigned)len);
+        _setStatus(TagStatus::Failure);
+        return false;
+    }
+    // Tag capacity from the NTAG capability container (page 3, byte 2 * 8).
+    uint8_t cc[4];
+    if (!_pn532.ntag2xx_ReadPage(3, cc) || cc[0] != 0xE1 || cc[2] == 0) {
+        Serial.println("[NFC] write: can't read capability container");
+        _setStatus(TagStatus::Failure);
+        return false;
+    }
+    size_t capacity = (size_t)cc[2] * 8;
+    size_t tlv_len = len + 3;
+    if (tlv_len > capacity) {
+        Serial.printf("[NFC] write: %u bytes exceed tag capacity %u\n",
+                      (unsigned)tlv_len, (unsigned)capacity);
+        _setStatus(TagStatus::Failure);
+        return false;
+    }
+
+    uint8_t tlv[258 + 4] = {0};
+    tlv[0] = 0x03;
+    tlv[1] = (uint8_t)len;
+    memcpy(tlv + 2, ndef_message.c_str(), len);
+    tlv[2 + len] = 0xFE;
 
     uint8_t page = 4;
-    for (int i = 0; i < (int)tlv.length(); i += 4) {
-        uint8_t buf[4] = {0};
-        for (int j = 0; j < 4 && (i + j) < (int)tlv.length(); j++)
-            buf[j] = tlv[i + j];
-        if (!_pn532.ntag2xx_WritePage(page++, buf)) {
+    for (size_t i = 0; i < tlv_len; i += 4) {
+        if (!_pn532.ntag2xx_WritePage(page++, tlv + i)) {
             _setStatus(TagStatus::Failure);
             return false;
         }
@@ -142,6 +178,11 @@ bool NfcReader::writeTag(const uint8_t* uid, uint8_t uid_len, const String& ndef
 
 bool NfcReader::eraseTag(const uint8_t* uid, uint8_t uid_len) {
     _setStatus(TagStatus::FoundTagNowErasing);
+    if (!_uidMatchesPresent(uid, uid_len)) {
+        Serial.println("[NFC] erase: tag on reader doesn't match check_uid");
+        _setStatus(TagStatus::Failure);
+        return false;
+    }
     // Write empty NDEF TLV terminator
     uint8_t buf[4] = {0x03, 0x00, 0xFE, 0x00};
     if (!_pn532.ntag2xx_WritePage(4, buf)) {
