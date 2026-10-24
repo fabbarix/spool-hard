@@ -102,6 +102,7 @@ void NfcReader::_pollStep() {
         if (_present && ++_misses >= kRemovedMisses) {
             _present = false;
             _lastUid[0] = 0;
+            _unreadUid[0] = 0;   // logged removal: a re-tap must always raise a new event
             Serial.printf("[NFC] tag removed, re-armed (polls=%u pings=%u pageReads=%u events=%u)\n",
                           (unsigned)_polls.load(), (unsigned)_pings.load(),
                           (unsigned)_pageReads.load(), (unsigned)_events.load());
