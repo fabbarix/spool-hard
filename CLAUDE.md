@@ -300,6 +300,17 @@ so the coordinator loop never blocks on hardware I/O:
   inbound parser (`deliver`) runs on AsyncTCP; the dispatcher
   (`receive`) runs on `loopTask`.
 
+**NFC presence (scale)**: an NTAG left ACTIVE after a READ ignores the
+REQA of `readPassiveTargetID`, so polling alone flaps on a held tag. While
+a readable NTAG is held, `NfcReader::update()` pings with
+`ntag2xx_ReadPage(3)` each tick, falls back to `readPassiveTargetID`
+(same-UID hit = no event), and declares removal only after >=5 misses AND
+1.5 s wall time. Emulate clears the ping state. `GET /api/debug/nfc`
+(auth + session-only `POST /api/debug/config?nfc=1`, off at boot) returns
+the seqlock-cached last tag (uid/sak/atqa/pages 4..19/counters); the
+handler never touches the PN532. The wire `is_bambulab` bool is just
+`uid_len == 7`; logs call it `ntag-7byte-uid`.
+
 **Single web server**: as of 0.8.0 there's only one `AsyncWebServer`
 on port 80. `/ws` serves the browser dashboard, `/ws/console` serves
 the paired console link. The retired port-81 server lives on in
