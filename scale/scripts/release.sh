@@ -73,10 +73,11 @@ npm run build --silent
 echo "   Frontend built to $DATA_DIR"
 
 echo "── [2/5] Gzipping frontend assets..."
-find "$DATA_DIR" -type f ! -name '*.gz' | while read -r f; do
-  gzip -9 -f "$f"
-  echo "   $(basename "$f").gz"
-done
+# The product marker goes into each gzip header (FCOMMENT) so it sits at the
+# very start of whichever file mkspiffs packs first; see
+# shared/firmware/scripts/spiffs_marker.py.
+MARKER_PY="$PRODUCT_DIR/../shared/firmware/scripts/spiffs_marker.py"
+find "$DATA_DIR" -type f ! -name '*.gz' ! -name '.spoolhard-*' -print0 | xargs -0 -r python3 "$MARKER_PY" gzip "SPOOLHARD-PRODUCT=spoolscale"
 
 # Plant the product signature as a plain (non-gzipped) file. mkspiffs embeds
 # file bytes verbatim, so the signature appears literally in the packed image
@@ -93,6 +94,9 @@ echo "   Firmware: $(du -h "$BUILD_DIR/firmware.bin" | cut -f1)"
 echo "── [4/5] Building frontend image..."
 pio run -e esp32-s3 -t buildfs --silent 2>/dev/null || true
 echo "   Frontend: $(du -h "$BUILD_DIR/spiffs.bin" | cut -f1)"
+# Guard: the product marker must sit in the first 4 KB of the image (the
+# firmware stages that much to reject a wrong-product upload before erasing).
+python3 "$MARKER_PY" check "SPOOLHARD-PRODUCT=spoolscale" "$BUILD_DIR/spiffs.bin"
 
 echo "── [5/5] Assembling release..."
 mkdir -p "$OUTPUT_DIR"

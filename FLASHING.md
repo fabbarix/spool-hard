@@ -154,9 +154,14 @@ two curl calls above are enough.
 > (clean empty FS) and `error` says why. Rejections (wrong product, busy,
 > sha mismatch) return 400/409 with `{"ok":false,"error":..}`. Optional
 > integrity check: append `&sha256=<hex of spiffs.bin>` (or `-H "X-Sha256: <hex>"`).
-> Product check: the first 4 KB are staged in RAM; a `SPOOLHARD-PRODUCT=<other>`
-> marker there is rejected (400) with the old frontend untouched (mkspiffs puts
-> the marker at ~offset 500). The partition is erased only once the correct
+> Product check (best-effort): the first 4 KB are staged in RAM; a `SPOOLHARD-PRODUCT=<other>`
+> marker there is rejected (400) with the old frontend untouched (mkspiffs packs files in readdir order, which varies per filesystem, so
+> the build embeds the marker in EVERY file's first bytes: gzip FCOMMENT header
+> for `*.gz`, leading text for `.spoolhard-*`; the marker then lands at offset
+> ~520 whichever file is first. `shared/firmware/scripts/spiffs_marker.py check`
+> runs after every spiffs.bin build (PIO post-action + release.sh) and FAILS the
+> build if the marker is at offset >= 3500. Images built by other means may
+> miss the early check). The partition is erased only once the correct
 > marker is seen (or 4 KB pass without any marker; then the final check still
 > rejects and formats). Limitation: a wrong `sha256=`, a truncated/corrupt
 > image, or a marker-less wrong image can't be detected before erasing (no

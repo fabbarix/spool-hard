@@ -188,7 +188,7 @@ the headers are `#include`d).
   sha256 (`?sha256=` / `X-Sha256`), tail erase, flash-readback hash, remount
   + read every file, and on ANY failure formats SPIFFS. 20 s stall timer
   recovers abandoned uploads. HTTP contract: POST answers 202 `verifying`,
-  poll `GET /api/upload/spiffs/status`; device reboots after `ok`. First 4 KB are staged so a wrong-product marker is rejected before the partition is erased; uploads are identified by generation token, completion runs once (atomic claim), OOM on task spawn retries via timer (never inline). Any new
+  poll `GET /api/upload/spiffs/status`; device reboots after `ok`. First 4 KB are staged so a wrong-product marker is rejected before the partition is erased (best-effort: `shared/firmware/scripts/spiffs_marker.py` embeds the marker in every packed file's header because mkspiffs file order is readdir-dependent, and its `check` guard fails the spiffs.bin build if the marker offset >= 3500); uploads are identified by generation token, completion runs once (atomic claim), OOM on task spawn retries via timer (never inline). Any new
   code that writes SPIFFS from a task must wrap it in `tryLockFs()`.
 - `spoolhard/panic_persist.h` / `src/panic_persist.cpp` — best-effort
   crash-log persistence without an esp_core_dump partition. On boot,

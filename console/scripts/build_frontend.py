@@ -1,5 +1,11 @@
 Import("env")
-import subprocess, os, gzip, shutil
+import subprocess, os, sys
+
+# Shared marker helper: puts the product marker in every gzip header so the
+# firmware's early (first-4KB) wrong-product check works whatever order
+# mkspiffs packs files in. See shared/firmware/scripts/spiffs_marker.py.
+sys.path.insert(0, os.path.normpath(os.path.join(env.get("PROJECT_DIR"), "..", "..", "shared", "firmware", "scripts")))
+import spiffs_marker
 
 PROJECT_DIR = env.get("PROJECT_DIR")  # console/firmware/
 FRONTEND_DIR = os.path.normpath(os.path.join(PROJECT_DIR, "..", "frontend"))
@@ -44,9 +50,7 @@ def build_frontend(source, target, env):
                 continue
             path = os.path.join(root, f)
             gz_path = path + '.gz'
-            with open(path, 'rb') as fin:
-                with gzip.open(gz_path, 'wb', compresslevel=9) as fout:
-                    shutil.copyfileobj(fin, fout)
+            spiffs_marker.gzip_with_comment(path, gz_path, PRODUCT_SIGNATURE.encode())
             os.remove(path)
             print(f"  {os.path.relpath(gz_path, DATA_DIR)}")
 
@@ -61,6 +65,8 @@ def build_frontend(source, target, env):
 
     ver_path = os.path.join(DATA_DIR, VERSION_FILENAME)
     with open(ver_path, 'wb') as f:
+        # Product marker first (see spiffs_marker.py), then the version marker.
+        f.write(PRODUCT_SIGNATURE.encode() + b"\n")
         f.write(f"SPOOLHARD-VERSION={fe_version}".encode("utf-8") + b"\x01")
     print(f"[build_frontend] Wrote {VERSION_FILENAME}: SPOOLHARD-VERSION={fe_version}\\x01")
 
@@ -75,3 +81,13 @@ def build_frontend(source, target, env):
 # forward-compat — only one is active at a time (board_build.filesystem).
 for artifact in ("$BUILD_DIR/spiffs.bin", "$BUILD_DIR/littlefs.bin"):
     env.AddPreAction(artifact, build_frontend)
+
+def _check_marker(source, target, env):
+    img = str(target[0])
+    ok, msg = spiffs_marker.check_image(img, PRODUCT_SIGNATURE)
+    print("[build_frontend] " + msg)
+    if not ok:
+        raise SystemExit("[build_frontend] FAIL: " + msg)
+
+for artifact in ("$BUILD_DIR/spiffs.bin", "$BUILD_DIR/littlefs.bin"):
+    env.AddPostAction(artifact, _check_marker)
