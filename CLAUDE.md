@@ -488,3 +488,23 @@ new sizes needed so far — `console/scripts/build_fonts.sh` has them);
 children don't shift; set a label's width BEFORE `lv_obj_align` on
 right/mid alignments. Debug: `GET /api/debug/lcd.bmp`, `POST
 /api/debug/lcd/touch` (see lcd_debug toggle).
+
+## Gcode-analysis inflate placement measurement (console only)
+
+`analyseRemote()` times every run (`InflateStats` in `bambu_printer.h`:
+total/stream/inflate-only/feed ms, bytes in/out, placement, free internal
+DRAM start/min) and logs one `dlog("inflate", ...)` line per run. Session-only
+toggles via `POST /api/debug/config` (off/default at boot):
+
+- `inflate_psram` (default `true` = shipped): `false` puts the ~11 KB
+  `tinfl_decompressor` in internal DRAM (falls back to PSRAM if the alloc fails,
+  reported as `fallback`). The 32 KiB dict is always PSRAM. The 38 KB analysis
+  DRAM gate in `startAnalyseTask` adds `sizeof(tinfl_decompressor)` only when
+  `inflate_psram` is false.
+- `analysis_debug`: enables `GET /api/debug/analysis` (auth; 403 when off) which
+  returns per-printer `InflateStats`.
+
+Re-trigger without touching config/printer: `POST /api/printers/<serial>/analyze`
+(empty body; FTP read only, no printer commands; only while gcode_state is
+RUNNING/PAUSE, 409 if already running). A deflate 3MF is required for inflate
+numbers (`deflate:true`).

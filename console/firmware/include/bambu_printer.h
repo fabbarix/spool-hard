@@ -113,6 +113,33 @@ struct GcodeAnalysis {
     void reset();
 };
 
+// Timing/placement record of the last analysis run (inflate-placement
+// measurement). Plain counters; single writer (analyse task), read by
+// GET /api/debug/analysis. Always populated (a few clock reads per run).
+struct InflateStats {
+    bool     valid        = false;   // a run has completed (ok or failed)
+    bool     ok           = false;
+    bool     deflate      = false;   // false = stored/raw path (no inflate)
+    bool     psram        = false;   // decompressor placement actually used
+    bool     requested_psram = true; // flag value at run start
+    bool     fallback     = false;   // wanted internal, alloc failed -> PSRAM
+    uint32_t total_ms     = 0;       // whole analyseRemote wall time
+    uint32_t stream_ms    = 0;       // FTP retrieve + inflate + feed
+    uint32_t inflate_ms   = 0;       // time inside tinfl_decompress only
+    uint32_t feed_ms      = 0;       // time inside analyzer.feed (deflate path)
+    uint32_t bytes_in     = 0;       // compressed bytes consumed
+    uint32_t bytes_out    = 0;       // inflated bytes produced
+    uint32_t decomp_size  = 0;       // sizeof(tinfl_decompressor)
+    uint32_t free_int_start = 0;     // free internal DRAM at run start
+    uint32_t free_int_min   = 0;     // lowest free internal seen at chunk callbacks
+};
+
+// Session-only runtime switch (POST /api/debug/config {"inflate_psram":..}).
+// true (default, = shipped behaviour) -> tinfl_decompressor in PSRAM;
+// false -> internal DRAM (falls back to PSRAM if the alloc fails). The
+// 32 KiB dict is always PSRAM. Not persisted; resets at boot.
+extern std::atomic<bool> g_analysisInflatePsram;
+
 struct PrinterState {
     BambuLinkState link = BambuLinkState::Disconnected;
     String  gcode_state;            // IDLE|PREPARE|RUNNING|PAUSE|FINISH|FAILED
@@ -232,6 +259,7 @@ public:
     const PrinterConfig& config() const   { return _cfg; }
     const GcodeAnalysis& lastAnalysis() const { return _lastAnalysis; }
     bool  analysisInProgress() const      { return _analysisInProgress; }
+    const InflateStats& inflateStats() const { return _inflateStats; }
 
     void updateConfig(const PrinterConfig& cfg);
 
@@ -382,6 +410,7 @@ private:
     int    _activeExtWireId  = 255;
 
     GcodeAnalysis _lastAnalysis;
+    InflateStats  _inflateStats;
     volatile bool _analysisInProgress = false;
 
     // Previous gcode_state, retained so we can detect edge transitions:

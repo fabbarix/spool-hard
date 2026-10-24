@@ -1353,6 +1353,8 @@ void ConsoleWebServer::_setupRoutes() {
         doc["log_ams"] = _logAmsRaw;
         doc["lcd_debug"] = _lcdDebug;
         doc["nfc_debug"] = _nfcDebug;
+        doc["analysis_debug"] = _analysisDebug;
+        doc["inflate_psram"] = g_analysisInflatePsram.load();
         String out; serializeJson(doc, out);
         req->send(200, "application/json", out);
     });
@@ -1372,8 +1374,12 @@ void ConsoleWebServer::_setupRoutes() {
                 if (!_lcdDebug) ConsoleDisplay::snapshotRelease();
             }
             if (body["nfc_debug"].is<bool>()) _nfcDebug = body["nfc_debug"].as<bool>();
+            if (body["analysis_debug"].is<bool>()) _analysisDebug = body["analysis_debug"].as<bool>();
+            if (body["inflate_psram"].is<bool>()) g_analysisInflatePsram = body["inflate_psram"].as<bool>();
             JsonDocument resp; resp["log_ams"] = _logAmsRaw; resp["lcd_debug"] = _lcdDebug;
             resp["nfc_debug"] = _nfcDebug;
+            resp["analysis_debug"] = _analysisDebug;
+            resp["inflate_psram"] = g_analysisInflatePsram.load();
             String out; serializeJson(resp, out);
             req->send(200, "application/json", out);
         }
@@ -1441,6 +1447,35 @@ void ConsoleWebServer::_setupRoutes() {
             req->send(200, "application/json", "{\"ok\":true}");
         }
     );
+    // Inflate-placement timings of each printer's last analysis run. Needs
+    // the session-only analysis_debug toggle. Read-only.
+    _server.on(AsyncURIMatcher::exact("/api/debug/analysis"), HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        if (!_analysisDebug) {
+            req->send(403, "application/json", "{\"error\":\"analysis_debug is off\"}");
+            return;
+        }
+        JsonDocument doc;
+        doc["inflate_psram"] = g_analysisInflatePsram.load();
+        doc["free_internal"] = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        JsonArray arr = doc["printers"].to<JsonArray>();
+        for (const auto& up : g_bambu.printers()) {
+            const InflateStats& st = up->inflateStats();
+            JsonObject o = arr.add<JsonObject>();
+            o["serial"] = up->config().serial;
+            o["in_progress"] = up->analysisInProgress();
+            o["valid"] = st.valid; o["ok"] = st.ok; o["deflate"] = st.deflate;
+            o["psram"] = st.psram; o["requested_psram"] = st.requested_psram;
+            o["fallback"] = st.fallback;
+            o["total_ms"] = st.total_ms; o["stream_ms"] = st.stream_ms;
+            o["inflate_ms"] = st.inflate_ms; o["feed_ms"] = st.feed_ms;
+            o["bytes_in"] = st.bytes_in; o["bytes_out"] = st.bytes_out;
+            o["decomp_size"] = st.decomp_size;
+            o["free_int_start"] = st.free_int_start; o["free_int_min"] = st.free_int_min;
+        }
+        String out; serializeJson(doc, out);
+        req->send(200, "application/json", out);
+    });
     // Read-only dump of the last tag nfc_task detected (seqlock snapshot; the
     // handler never touches the PN532). Requires the session-only nfc_debug
     // toggle (POST /api/debug/config {"nfc_debug":true}).
