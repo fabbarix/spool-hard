@@ -52,6 +52,8 @@ public:
     size_t count() const { return _idIndex.size(); }
 
     // Rewrite the file skipping deleted/tombstoned records. Rebuilds indexes.
+    // Crash-safe (temp file, swap only once complete; begin() recovers).
+    // Also run automatically from begin() when tombstones dominate.
     bool pack();
 
     // Migrate the underlying file to a different backend + path. Atomic-ish:
@@ -91,4 +93,10 @@ private:
     bool _append(const SpoolRecord& rec, size_t& outOffset);
     bool _tombstone(size_t offset);
     void _rebuildIndexes();
+    void _recoverPack();
+
+    // Tombstoned lines seen by the last _rebuildIndexes().
+    size_t _deadLines = 0;
+    // Compact at boot when dead lines >= this AND >= live records.
+    static constexpr size_t PACK_MIN_DEAD = 16;
 };

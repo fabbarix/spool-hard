@@ -42,6 +42,8 @@ private:
     bool _append(const FilamentRecord& rec, size_t& outOffset);
     bool _tombstone(size_t offset);
     void _rebuildIndex();
+    void _recoverPack();
+    size_t _deadLines = 0;
 };
 
 extern UserFilamentsStore g_user_filaments;

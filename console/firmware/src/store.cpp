@@ -7,9 +7,35 @@ void SpoolStore::begin(fs::FS& fs, const String& path) {
     _path      = path;
     _status    = Status::Ready;
     _lastError = "";
+    _recoverPack();
     _rebuildIndexes();
-    Serial.printf("[Store] Loaded %u spool records from %s\n",
-                  (unsigned)_idIndex.size(), _path.c_str());
+    Serial.printf("[Store] Loaded %u spool records from %s (%u tombstoned lines)\n",
+                  (unsigned)_idIndex.size(), _path.c_str(), (unsigned)_deadLines);
+    // Every upsert tombstones the old line and appends a new one, so the
+    // file only ever grows (consumption commits every 5%). Compact at boot
+    // once dead lines dominate. Boot is before the web server / printer
+    // link are up, so a ~0.5 MB SD rewrite (about a second) blocks nothing.
+    if (_deadLines >= PACK_MIN_DEAD && _deadLines >= _idIndex.size()) {
+        Serial.printf("[Store] Compacting %s\n", _path.c_str());
+        pack();
+    }
+}
+
+// Crash recovery for pack(). pack() only removes the original after the
+// .tmp is fully written and closed, so: both files present => the original
+// is authoritative and the .tmp is a partial/redundant copy (drop it);
+// only the .tmp present => crashed between remove and rename, .tmp is the
+// complete compacted file (promote it).
+void SpoolStore::_recoverPack() {
+    if (!_fs) return;
+    String tmpPath = _path + ".tmp";
+    if (!_fs->exists(tmpPath.c_str())) return;
+    if (_fs->exists(_path.c_str())) {
+        Serial.printf("[Store] Discarding stale %s\n", tmpPath.c_str());
+        _fs->remove(tmpPath.c_str());
+    } else if (_fs->rename(tmpPath.c_str(), _path.c_str())) {
+        Serial.printf("[Store] Recovered %s from interrupted pack\n", _path.c_str());
+    }
 }
 
 void SpoolStore::beginUnavailable(const String& reason) {
@@ -25,6 +51,7 @@ void SpoolStore::beginUnavailable(const String& reason) {
 void SpoolStore::_rebuildIndexes() {
     _idIndex.clear();
     _tagIndex.clear();
+    _deadLines = 0;
     if (!_fs) return;
 
     File f = _fs->open(_path.c_str(), "r");
@@ -37,6 +64,7 @@ void SpoolStore::_rebuildIndexes() {
         if (line.length() == 0) break;
         if (line.startsWith("x ")) {
             offset = f.position();
+            _deadLines++;
             continue;  // tombstoned
         }
         SpoolRecord rec;
@@ -160,16 +188,41 @@ bool SpoolStore::pack() {
     File out = _fs->open(tmpPath.c_str(), "w");
     if (!out) { in.close(); return false; }
 
+    bool ok = true;
+    size_t expect = 0;
     while (in.available()) {
         String line = in.readStringUntil('\n');
+        if (line.endsWith("\r")) line.remove(line.length() - 1);
         if (line.startsWith("x ") || line.length() == 0) continue;
-        out.println(line);
+        line += '\n';
+        if (out.print(line) != line.length()) { ok = false; break; }
+        expect += line.length();
     }
     in.close();
     out.close();
 
+    // Only swap once the temp copy is complete. Original is removed strictly
+    // after this point, so a power cut anywhere leaves either the original
+    // intact (+ stale .tmp) or just the complete .tmp — see _recoverPack().
+    if (ok) {
+        File chk = _fs->open(tmpPath.c_str(), "r");
+        ok = chk && chk.size() == expect;
+        if (chk) chk.close();
+    }
+    if (!ok) {
+        _fs->remove(tmpPath.c_str());
+        _lastError = "pack failed (write error)";
+        Serial.println("[Store] Pack failed, original untouched");
+        return false;
+    }
+
     _fs->remove(_path.c_str());
-    _fs->rename(tmpPath.c_str(), _path.c_str());
+    if (!_fs->rename(tmpPath.c_str(), _path.c_str())) {
+        // .tmp is intact; next boot's _recoverPack() promotes it.
+        _lastError = "pack rename failed";
+        Serial.println("[Store] Pack rename failed");
+        return false;
+    }
     _rebuildIndexes();
     Serial.printf("[Store] Packed, %u records remain\n", (unsigned)_idIndex.size());
     if (_onChange) _onChange();

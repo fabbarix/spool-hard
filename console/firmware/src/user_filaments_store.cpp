@@ -43,6 +43,7 @@ void UserFilamentsStore::begin() {
         Serial.println("[UserFilaments] SD not mounted; user filaments unavailable");
         return;
     }
+    _recoverPack();
     _rebuildIndex();
 
     // Detect pre-variants records and migrate.
@@ -97,12 +98,32 @@ void UserFilamentsStore::begin() {
         pack();   // collapse the tombstones
     }
 
+    // Edits tombstone + append, so the file only grows. Compact at boot once
+    // dead lines dominate (migration above already packs when it ran).
+    if (_deadLines >= 16 && _deadLines >= _idIndex.size()) {
+        Serial.printf("[UserFilaments] Compacting (%u dead lines)\n", (unsigned)_deadLines);
+        pack();
+    }
+
     Serial.printf("[UserFilaments] Loaded %u user filament records\n",
                   (unsigned)_idIndex.size());
 }
 
+// See SpoolStore::_recoverPack — same protocol. Both files => original is
+// authoritative, drop .tmp; only .tmp => promote it.
+void UserFilamentsStore::_recoverPack() {
+    const char* tmpPath = USER_FILAMENTS_PATH ".tmp";
+    if (!SD.exists(tmpPath)) return;
+    if (SD.exists(USER_FILAMENTS_PATH)) {
+        SD.remove(tmpPath);
+    } else if (SD.rename(tmpPath, USER_FILAMENTS_PATH)) {
+        Serial.println("[UserFilaments] Recovered from interrupted pack");
+    }
+}
+
 void UserFilamentsStore::_rebuildIndex() {
     _idIndex.clear();
+    _deadLines = 0;
     if (!_mounted) return;
 
     File f = SD.open(USER_FILAMENTS_PATH, FILE_READ);
@@ -111,7 +132,7 @@ void UserFilamentsStore::_rebuildIndex() {
         size_t lineStart = f.position();
         String line = f.readStringUntil('\n');
         if (line.length() == 0) break;
-        if (line.startsWith("x ")) continue;  // tombstone
+        if (line.startsWith("x ")) { _deadLines++; continue; }  // tombstone
         FilamentRecord rec;
         if (rec.fromLine(line)) {
             _idIndex[rec.setting_id] = lineStart;
@@ -208,15 +229,35 @@ bool UserFilamentsStore::pack() {
     const char* tmpPath = USER_FILAMENTS_PATH ".tmp";
     File out = SD.open(tmpPath, FILE_WRITE);
     if (!out) { in.close(); return false; }
+    bool ok = true;
+    size_t expect = 0;
     while (in.available()) {
         String line = in.readStringUntil('\n');
+        if (line.endsWith("\r")) line.remove(line.length() - 1);
         if (line.startsWith("x ") || line.length() == 0) continue;
-        out.println(line);
+        line += '\n';
+        if (out.print(line) != line.length()) { ok = false; break; }
+        expect += line.length();
     }
     in.close();
     out.close();
+    if (ok) {
+        File chk = SD.open(tmpPath, FILE_READ);
+        ok = chk && chk.size() == expect;
+        if (chk) chk.close();
+    }
+    if (!ok) {
+        SD.remove(tmpPath);
+        Serial.println("[UserFilaments] Pack failed, original untouched");
+        return false;
+    }
+    // Original is removed only after .tmp is complete; _recoverPack()
+    // handles a crash between remove and rename.
     SD.remove(USER_FILAMENTS_PATH);
-    SD.rename(tmpPath, USER_FILAMENTS_PATH);
+    if (!SD.rename(tmpPath, USER_FILAMENTS_PATH)) {
+        Serial.println("[UserFilaments] Pack rename failed (recovered next boot)");
+        return false;
+    }
     _rebuildIndex();
     Serial.printf("[UserFilaments] Packed, %u records remain\n",
                   (unsigned)_idIndex.size());
