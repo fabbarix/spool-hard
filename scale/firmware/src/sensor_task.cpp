@@ -30,7 +30,12 @@ struct Cmd {
 QueueHandle_t s_cmd_q   = nullptr;     // 8 entries — bounded
 QueueHandle_t s_event_q = nullptr;     // 8 entries — drained by coord loop
 TaskHandle_t  s_task    = nullptr;
-SemaphoreHandle_t s_cal_mtx = nullptr; // protects CalibrationData snapshots
+// g_scale's CalibrationData is only mutated by this task. Readers get a
+// last-good copy (s_cal_cache) refreshed by the task after every command;
+// s_cal_mtx guards only that struct copy (microseconds), so readers never
+// block on slow HX711 operations and never see an empty/torn struct.
+SemaphoreHandle_t s_cal_mtx = nullptr;
+CalibrationData   s_cal_cache;
 
 // ── Snapshot publish (Linux-style seqlock) ───────────────────
 //
@@ -56,15 +61,16 @@ void _publishSnapshot() {
     s_snap_seq.fetch_add(1, std::memory_order_release);
 }
 
+void _publishCal() {
+    if (!s_cal_mtx) return;
+    xSemaphoreTake(s_cal_mtx, portMAX_DELAY);
+    s_cal_cache = g_scale.cal();
+    xSemaphoreGive(s_cal_mtx);
+}
+
 void _drainCommands() {
     Cmd c;
     while (xQueueReceive(s_cmd_q, &c, 0) == pdTRUE) {
-        // Every command either rewrites g_scale's CalibrationData or
-        // (ReloadParams) reloads it, so run under s_cal_mtx: snapshotCal()
-        // readers (50 ms timeout) never see a half-written struct. Held
-        // across tare()/captureRaw() HX711 averaging; readers just time
-        // out and retry on their next call.
-        if (s_cal_mtx) xSemaphoreTake(s_cal_mtx, portMAX_DELAY);
         switch (c.kind) {
             case CmdKind::Tare:
                 Serial.println("[Sensor] tare");
@@ -93,7 +99,7 @@ void _drainCommands() {
                 g_scale.loadParams();
                 break;
         }
-        if (s_cal_mtx) xSemaphoreGive(s_cal_mtx);
+        _publishCal();   // refresh last-good cal copy after every command
     }
 }
 
@@ -133,6 +139,7 @@ void begin() {
     s_cmd_q   = xQueueCreate(8, sizeof(Cmd));
     s_event_q = xQueueCreate(8, sizeof(WeightEvent));
     s_cal_mtx = xSemaphoreCreateMutex();
+    _publishCal();   // seed the cache before any reader can call snapshotCal()
     BaseType_t r = xTaskCreatePinnedToCore(_taskBody, "sensor_task",
                                            4 * 1024, nullptr, 4, &s_task, 1);
     if (r != pdPASS) {
@@ -158,12 +165,13 @@ long        getLastRaw()  { return snapshot().last_raw; }
 int         getPrecision(){ return snapshot().precision; }
 
 CalibrationData snapshotCal() {
-    if (!s_cal_mtx) return {};
     CalibrationData out;
-    if (xSemaphoreTake(s_cal_mtx, pdMS_TO_TICKS(400)) == pdTRUE) {
-        out = g_scale.cal();
-        xSemaphoreGive(s_cal_mtx);
-    }
+    if (!s_cal_mtx) return out;
+    // Short critical section (struct copy only); the writer never holds
+    // the lock across hardware I/O.
+    xSemaphoreTake(s_cal_mtx, portMAX_DELAY);
+    out = s_cal_cache;
+    xSemaphoreGive(s_cal_mtx);
     return out;
 }
 
