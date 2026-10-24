@@ -122,6 +122,9 @@ static lv_obj_t*           s_footer_hit     = nullptr;
 static ui_devcfg_open_cb_t s_devcfg_open_cb = nullptr;
 // Hostname line is split in two so the WiFi glyph can be coloured by link
 // state (green/yellow/orange/grey) while the name itself stays white.
+static lv_obj_t* s_lbl_devmode_icon = nullptr; // Developer-Mode warning triangle
+static lv_obj_t* s_devmode_panel    = nullptr; // tap explanation (hidden)
+static lv_obj_t* s_devmode_text     = nullptr;
 static lv_obj_t* s_lbl_wifi_icon  = nullptr;   // coloured WiFi symbol
 static lv_obj_t* s_lbl_hostname   = nullptr;   // e.g. "spoolhard-console.local"
 
@@ -452,6 +455,19 @@ static void build_home() {
         if (s_devcfg_open_cb) s_devcfg_open_cb();
     }, LV_EVENT_CLICKED, nullptr);
 
+    // Developer-Mode warning triangle (hidden until a printer reports it),
+    // left of the centred version text. Created after the footer hit-strip
+    // so its own tap wins; the OTA banner below still covers it.
+    s_lbl_devmode_icon = make_label(s_home, LV_SYMBOL_WARNING,
+                                    lv_color_hex(0xfacc15), &spoolhard_mont_16);
+    lv_obj_align(s_lbl_devmode_icon, LV_ALIGN_BOTTOM_MID, -110, -4);
+    lv_obj_add_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(s_lbl_devmode_icon, 14);
+    lv_obj_add_event_cb(s_lbl_devmode_icon, [](lv_event_t*) {
+        if (s_devmode_panel) lv_obj_clear_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
+    }, LV_EVENT_CLICKED, nullptr);
+
     // OTA banner — hidden until main.cpp asks us to show it. Sits across
     // the bottom of the screen, OVER the footer text (which becomes
     // less important the moment there's an update to apply). Brand-amber
@@ -472,6 +488,19 @@ static void build_home() {
 
     s_ota_banner_label = make_label(s_ota_banner, "", COL_BODY, &spoolhard_mont_16);
     lv_obj_center(s_ota_banner_label);
+
+    // Developer-Mode explanation: a card over the AMS area, tap anywhere on
+    // it to dismiss. Created last so it sits on top.
+    s_devmode_panel = make_card(s_home, 12, 150, 456, 96);
+    lv_obj_set_style_border_color(s_devmode_panel, lv_color_hex(0xfacc15), 0);
+    lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_devmode_panel, [](lv_event_t*) {
+        lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
+    }, LV_EVENT_CLICKED, nullptr);
+    s_devmode_text = make_label(s_devmode_panel, "", COL_TEXT, &spoolhard_mont_16);
+    lv_obj_set_width(s_devmode_text, 430);
+    lv_label_set_long_mode(s_devmode_text, LV_LABEL_LONG_WRAP);
 }
 
 static void on_spool_btn(lv_event_t* e) {
@@ -1883,6 +1912,22 @@ void ui_set_onboarding(const char* ap_ssid, const char* security_key, const char
     if (s_lbl_ssid       && ap_ssid)       lv_label_set_text(s_lbl_ssid,       ap_ssid);
     if (s_lbl_key        && security_key)  lv_label_set_text(s_lbl_key,        security_key);
     if (s_lbl_onboard_ip && ip_or_mdns)    lv_label_set_text(s_lbl_onboard_ip, ip_or_mdns);
+    lv_unlock();
+}
+
+void ui_set_dev_mode_warning(const char* names) {
+    if (!s_lbl_devmode_icon || !s_devmode_panel || !s_devmode_text) return;
+    lv_lock();
+    if (names && *names) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING " %s: Developer Mode (LAN only). "
+                 "SpoolHard can control it. Tap to close.", names);
+        lv_label_set_text(s_devmode_text, buf);
+        lv_obj_clear_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_unlock();
 }
 

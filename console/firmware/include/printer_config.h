@@ -18,6 +18,10 @@ struct PrinterConfig {
     // (e.g. "0:2"), value = spool id. Empty string means no overrides set.
     // Persisted alongside the rest of the printer config in NVS.
     String ams_overrides_json;
+    // Last known Developer Mode state (LAN control authorised): 0 unknown,
+    // 1 off, 2 on. Persisted so the "printer is in Developer Mode" reminder
+    // survives reboots until a later ack / report disproves it.
+    uint8_t dev_mode = 0;
 
     void toJson(JsonDocument& doc, bool include_secret) const;
     bool fromJson(const JsonDocument& doc);

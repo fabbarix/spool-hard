@@ -325,3 +325,15 @@ enum lives at `*/firmware/src/protocol.h`").
   state (`commands_rejected_auth`, `last_command`) and shown as a notice on the
   dashboard card. No retry loop; `POST /api/printers/<serial>/resync` clears the
   per-slot "last synced" cache so the next report re-pushes.
+- Developer Mode reminder: `PrinterState::dev_mode` (0 unknown / 1 off / 2 on)
+  is derived in `_recordCommandAck` (auth failure -> off; successful
+  ams_filament_setting / extrusion_cali_* ack -> on; pushall never counts),
+  persisted as `PrinterConfig::dev_mode` (JSON `developer_mode`) via
+  `_setDevMode`, and exposed as `state.developer_mode` in `/api/printers`.
+  Passive hook `kFunBitDevMode` (bambu_printer.cpp) is -1 = DISABLED: the bit
+  of `print.fun` is not yet known, do not guess. Web: `DevModeBanner` (App
+  level, non-dismissible) while any printer is "on"; the per-card
+  "refused commands" notice covers the off/rejected case. LCD: warning
+  triangle in the home footer (`ui_set_dev_mode_warning`, called from
+  `_refreshDevModeWarning` only when the name list changes); tap shows a
+  one-line explanation card, tap again to close.

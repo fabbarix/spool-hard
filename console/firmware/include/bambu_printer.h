@@ -184,6 +184,11 @@ struct PrinterState {
     int32_t  last_cmd_err      = 0;
     uint32_t last_cmd_ms       = 0; // millis() of the ack, 0 = none seen
     bool     commands_rejected_auth = false;  // cleared by a later successful ack
+    // Developer Mode (LAN control authorised): 0 unknown, 1 off, 2 on.
+    // Derived from command acks (see _recordCommandAck) and, once
+    // kFunBitDevMode is known, passively from print.fun. Seeded from the
+    // persisted PrinterConfig::dev_mode.
+    uint8_t  dev_mode = 0;
 };
 
 // arduino-esp32 3.x: WiFiClientSecure is a typedef of NetworkClientSecure,
@@ -355,6 +360,8 @@ private:
     std::atomic<uint32_t> _seq{100};
     String _nextSeq() { return String((unsigned long)(_seq.fetch_add(1) + 1)); }
     void _recordCommandAck(JsonObjectConst print);
+    // Update dev_mode; persists to PrinterConfig/NVS only when it changes.
+    void _setDevMode(uint8_t v, const char* why);
 
     // Set once the printer has reported `device.extruder.info[].snow`
     // (H2-series). From then on that's the authoritative active-slot

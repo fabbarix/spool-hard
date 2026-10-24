@@ -45,6 +45,9 @@ export interface PrinterState {
   // True when the printer refused our last control command with its
   // authorization error (needs LAN Only + Developer Mode).
   commands_rejected_auth?: boolean;
+  // Developer Mode (LAN control authorised): detected from command acks,
+  // persisted by the firmware across reboots. 'unknown' until first evidence.
+  developer_mode?: 'on' | 'off' | 'unknown';
   last_command?: { command: string; result: string; reason: string; err_code: number; ms_ago: number };
   ams?: AmsUnit[];
   // External spool holder (single-extruder printers). Bambu calls this

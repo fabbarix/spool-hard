@@ -10,6 +10,7 @@ void PrinterConfig::toJson(JsonDocument& doc, bool include_secret) const {
     doc["ip"]      = ip;
     doc["auto_restore_k"]      = auto_restore_k;
     doc["track_print_consume"] = track_print_consume;
+    doc["developer_mode"] = dev_mode == 2 ? "on" : dev_mode == 1 ? "off" : "unknown";
     // Serialize the manual-override table as a nested object so the API
     // consumer (frontend / NVS blob) can read and edit it directly.
     if (ams_overrides_json.length()) {
@@ -38,6 +39,10 @@ bool PrinterConfig::fromJson(const JsonDocument& doc) {
     }
     if (doc["auto_restore_k"].is<bool>())      auto_restore_k      = doc["auto_restore_k"];
     if (doc["track_print_consume"].is<bool>()) track_print_consume = doc["track_print_consume"];
+    if (doc["developer_mode"].is<const char*>()) {
+        String m = doc["developer_mode"].as<String>();
+        dev_mode = m == "on" ? 2 : m == "off" ? 1 : 0;
+    }
     if (doc["ams_overrides"].is<JsonObjectConst>()) {
         ams_overrides_json = "";
         serializeJson(doc["ams_overrides"], ams_overrides_json);

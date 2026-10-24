@@ -2946,6 +2946,7 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
     JsonObject st = out["state"].to<JsonObject>();
     if (!p) {
         st["link"] = "disconnected";
+        st["developer_mode"] = cfg.dev_mode == 2 ? "on" : cfg.dev_mode == 1 ? "off" : "unknown";
         return;
     }
     const PrinterState& s = p->state();
@@ -2968,6 +2969,7 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
         s.last_report_ms ? (int)(millis() - s.last_report_ms) : -1;
     if (s.error_message.length()) st["error"] = s.error_message;
     st["commands_rejected_auth"] = s.commands_rejected_auth;
+    st["developer_mode"] = s.dev_mode == 2 ? "on" : s.dev_mode == 1 ? "off" : "unknown";
     if (s.last_cmd_ms) {
         JsonObject lc = st["last_command"].to<JsonObject>();
         lc["command"] = s.last_cmd;

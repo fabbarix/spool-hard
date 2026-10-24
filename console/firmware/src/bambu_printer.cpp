@@ -234,6 +234,7 @@ String modelFromSerial(const String& serial) {
 
 BambuPrinter::BambuPrinter(const PrinterConfig& cfg) : _cfg(cfg) {
     _state.model_code = modelFromSerial(cfg.serial);
+    _state.dev_mode   = cfg.dev_mode;
     _wifi = new WiFiClientSecure();
     _wifi->setInsecure();   // Bambu printers use self-signed certs in LAN mode.
     _mqtt = new PubSubClient(*_wifi);
@@ -501,6 +502,28 @@ void BambuPrinter::_onMessage(const char* /*topic*/, uint8_t* payload, unsigned 
     g_web.pushPrintersList();
 }
 
+void BambuPrinter::_setDevMode(uint8_t v, const char* why) {
+    if (_state.dev_mode == v) return;
+    _state.dev_mode = v;
+    dlog("Bambu", "%s developer_mode -> %s (%s)", _cfg.serial.c_str(),
+         v == 2 ? "on" : v == 1 ? "off" : "unknown", why);
+    const PrinterConfig* cfg_ro = g_printers_cfg.find(_cfg.serial);
+    if (cfg_ro && cfg_ro->dev_mode != v) {
+        PrinterConfig cfg_copy = *cfg_ro;
+        cfg_copy.dev_mode = v;
+        g_printers_cfg.upsert(cfg_copy);
+        g_printers_cfg.save();
+        _cfg = cfg_copy;
+    }
+}
+
+// PASSIVE HOOK -- DISABLED. Developer Mode is probably one bit of the hex
+// string print.fun (observed "35FF1AFFF9CB3" with Dev Mode OFF). The exact
+// bit is NOT known yet; do not guess. Set to the bit index (0 = LSB) once
+// confirmed by comparing fun with Dev Mode on vs off, and the code in
+// _parseReport will derive developer_mode on every report.
+static constexpr int kFunBitDevMode = -1;   // -1 = unset (hook disabled)
+
 void BambuPrinter::_recordCommandAck(JsonObjectConst print) {
     String cmd    = print["command"].as<String>();
     String result = print["result"].as<String>();
@@ -518,6 +541,11 @@ void BambuPrinter::_recordCommandAck(JsonObjectConst print) {
     bool auth = !ok && (err == 84033543 || reason.indexOf("verify failed") >= 0);
     if (auth) _state.commands_rejected_auth = true;
     else if (ok && cmd != "pushall") _state.commands_rejected_auth = false;
+    // Ack-based Developer Mode detection (control commands only, never pushall).
+    if (cmd != "pushall") {
+        if (auth)    _setDevMode(1, "control command rejected (verify failed)");
+        else if (ok) _setDevMode(2, "control command accepted");
+    }
     dlog("Bambu", "%s ack %s -> %s reason='%s' err=%ld seq=%s",
          _cfg.serial.c_str(), cmd.c_str(), result.c_str(), reason.c_str(),
          (long)err, print["sequence_id"] | "?");
@@ -527,6 +555,10 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
     // Bambu publishes {"print": {...}} or {"info": {...}}; we only care about print.
     JsonObjectConst print = doc["print"];
     if (!print) return;
+    if (kFunBitDevMode >= 0 && kFunBitDevMode < 64 && print["fun"].is<const char*>()) {
+        unsigned long long fun = strtoull(print["fun"].as<const char*>(), nullptr, 16);
+        _setDevMode(((fun >> kFunBitDevMode) & 1ULL) ? 2 : 1, "print.fun bit");
+    }
     // Command acks carry print.command + print.result; telemetry doesn't.
     if (print["result"].is<const char*>() && print["command"].is<const char*>()) {
         _recordCommandAck(print);
