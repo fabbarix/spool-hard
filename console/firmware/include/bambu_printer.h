@@ -146,12 +146,20 @@ struct PrinterState {
     AmsUnit ams[4];                 // up to 4 AMS units on H2D; only ams[0] on X1/P1
     int     ams_count    = 0;
     // External / "virtual" tray for single-extruder printers that feed from a
-    // regular spool holder instead of an AMS. Bambu reports it at
-    // `print.vt_tray` at the top level, separate from `print.ams.ams[]`.
+    // regular spool holder instead of an AMS. Older firmware (X1/P1/A1)
+    // reports it at `print.vt_tray`; H2-series (H2S/H2D) reports a
+    // `print.vir_slot[]` array instead, with ids 254 (deputy) / 255 (main).
     // `has_vt_tray` = false means this printer didn't report one in the last
     // pushall — we skip rendering it rather than show an empty card.
+    //
+    // Internally the external tray is always keyed as ams_unit 254 / slot 0
+    // (overrides, active_tray, analysis tools) and `vt_tray.id` is 254.
+    // `vt_wire_id` keeps the id the printer actually uses (254 for legacy
+    // vt_tray, 254/255 for vir_slot) so outbound commands address it right.
     AmsTray vt_tray;
     bool    has_vt_tray  = false;
+    int     vt_wire_id   = 254;
+    bool    vt_is_vir_slot = false;
     // Nozzle inventory from print.device.nozzle.info. X1/P1 typically expose
     // one nozzle (0.4 by default); H2D exposes two. Needed to key K-values
     // correctly since Bambu's pressure-advance is per-nozzle-diameter.
@@ -314,6 +322,14 @@ private:
     String _lastVtSignature;
     bool   _vtSignatureSeen = false;
 
+    // Set once the printer has reported `device.extruder.info[].snow`
+    // (H2-series). From then on that's the authoritative active-slot
+    // source and `ams.tray_now` (stuck at "0" with no AMS) is ignored.
+    bool   _haveExtruderSnow = false;
+    // Wire id (254/255) of the external slot snow last said was feeding —
+    // picks the right vir_slot[] entry on a dual-external H2D.
+    int    _activeExtWireId  = 255;
+
     GcodeAnalysis _lastAnalysis;
     volatile bool _analysisInProgress = false;
 
@@ -351,6 +367,7 @@ private:
     void _onMessage(const char* topic, uint8_t* payload, unsigned int length);
     void _parseReport(const JsonDocument& doc);
     void _parseAms(const JsonObjectConst& amsObj, PrinterState& out);
+    void _parseExternalTray(const JsonObjectConst& vt, int wire_id, bool vir_slot);
     void _persistKValues();
     // Sync the AMS-reported tray_info_idx onto every mapped spool whose
     // current `slicer_filament` doesn't match. Bambu re-keys this when

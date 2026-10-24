@@ -524,13 +524,49 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
                 ++_state.nozzle_count;
             }
         }
+
+        // H2-series active slot: `device.extruder.info[].snow` packs the
+        // feeding (ams_id << 8 | slot) for each extruder; `extruder.state`
+        // bits 4..7 name the extruder currently printing. `ams.tray_now`
+        // on these printers stays "0" with no AMS attached even while the
+        // external spool feeds, so this has to win over it.
+        JsonObjectConst extruder = device["extruder"];
+        JsonArrayConst  extInfo  = extruder["info"];
+        if (extInfo && extInfo.size() > 0) {
+            int cur = ((extruder["state"] | 0) >> 4) & 0xF;
+            JsonVariantConst e = extInfo[0];
+            for (JsonVariantConst cand : extInfo) {
+                if ((cand["id"] | -1) == cur) { e = cand; break; }
+            }
+            if (e["snow"].is<int>()) {
+                int snow    = e["snow"].as<int>();
+                int ams_id  = (snow >> 8) & 0xFF;
+                int slot_id = snow & 0xFF;
+                if (ams_id == 254 || ams_id == 255) {
+                    // 0xFFFF = nothing loaded; 0xFE00 / 0xFF00 = external.
+                    _state.active_tray = (slot_id == 0xFF) ? -1 : 254;
+                    if (slot_id != 0xFF) _activeExtWireId = ams_id;
+                } else if (ams_id < 4 && slot_id < 4) {
+                    _state.active_tray = ams_id * 4 + slot_id;
+                } else {
+                    // AMS HT (ids 128+) — no flat index for it; leave
+                    // active_tray as last reported by tray_now.
+                    _state.active_tray = -1;
+                }
+                _haveExtruderSnow = true;
+            }
+        }
     }
 
     JsonObjectConst ams = print["ams"];
     if (ams) {
         // tray_now / tray_tar are stringified ints in Bambu's wire format.
-        if (ams["tray_now"].is<const char*>())
-            _state.active_tray = atoi(ams["tray_now"].as<const char*>());
+        // Legacy: "254" = external, "255" = nothing loaded. Ignored once the
+        // printer has shown us extruder.info[].snow (see device block above).
+        if (!_haveExtruderSnow && ams["tray_now"].is<const char*>()) {
+            int now = atoi(ams["tray_now"].as<const char*>());
+            _state.active_tray = (now == 255) ? -1 : now;
+        }
 
         _parseAms(ams, _state);
         _persistKValues();
@@ -547,70 +583,111 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
             if (print["vt_tray"].is<JsonObjectConst>()) {
                 payload["vt_tray"] = print["vt_tray"];
             }
+            if (print["vir_slot"].is<JsonArrayConst>()) {
+                payload["vir_slot"] = print["vir_slot"];
+            }
             g_web.broadcastDebug("ams_raw", payload);
         }
     }
 
-    // External tray (`vt_tray`) — single-extruder printers use this for a
-    // regular spool holder rather than an AMS slot. Same schema as an AMS
-    // tray, lives at the top-level `print.vt_tray`.
+    // External tray. Older firmware: `print.vt_tray`, a single object with
+    // the AMS-tray schema. H2-series: `print.vir_slot[]`, same per-entry
+    // schema with "id" = "254"/"255" (the H2S reports just one, id 255).
+    // We model a single external tray; on a dual-external H2D we follow
+    // the one currently feeding, else stick with the last one shown, else
+    // the first populated entry.
     JsonObjectConst vt = print["vt_tray"];
     if (vt) {
-        AmsTray& tr = _state.vt_tray;
-        tr.id               = 254;                    // yanshay's convention for external
-        tr.tray_type        = vt["tray_type"]        | "";
-        tr.tray_sub_brands  = vt["tray_sub_brands"]  | "";
-        tr.tray_color       = vt["tray_color"]       | "";
-        tr.tray_info_idx    = vt["tray_info_idx"]    | "";
-        tr.tag_uid          = _normalizeBambuTagUid(vt["tag_uid"] | "");
-        if (vt["nozzle_temp_min"].is<const char*>()) tr.nozzle_min_c = atoi(vt["nozzle_temp_min"].as<const char*>());
-        if (vt["nozzle_temp_max"].is<const char*>()) tr.nozzle_max_c = atoi(vt["nozzle_temp_max"].as<const char*>());
-        if (vt["remain"].is<int>())   tr.remain_pct = vt["remain"];
-        if (vt["k"].is<float>())      tr.k          = vt["k"];
-        if (vt["cali_idx"].is<int>()) tr.cali_idx   = vt["cali_idx"];
-
-        // Same populated→empty unload detection as AMS slots — drop the
-        // override before resolution so a removed spool doesn't keep the
-        // tray "pinned" to the old id.
-        String vt_sig = tr.tray_type + "|" + tr.tray_info_idx + "|" + tr.tray_color;
-        bool vt_now_populated = tr.tray_type.length() ||
-                                tr.tray_info_idx.length() ||
-                                tr.tray_color.length();
-        if (_vtSignatureSeen) {
-            bool was_empty = _lastVtSignature.isEmpty() || _lastVtSignature == "||";
-            if (!vt_now_populated && !was_empty) {
-                Serial.printf("[Bambu %s] external tray physically unloaded\n",
-                              _cfg.serial.c_str());
-                const PrinterConfig* cfg_ro = g_printers_cfg.find(_cfg.serial);
-                if (cfg_ro && cfg_ro->findAmsOverride(254, 0).length()) {
-                    PrinterConfig cfg_copy = *cfg_ro;
-                    cfg_copy.setAmsOverride(254, 0, "");
-                    g_printers_cfg.upsert(cfg_copy);
-                    g_printers_cfg.save();
-                    _cfg = cfg_copy;
-                }
+        _parseExternalTray(vt, 254, /*vir_slot*/ false);
+    } else {
+        JsonArrayConst vir = print["vir_slot"];
+        if (vir && vir.size() > 0) {
+            JsonObjectConst active, sticky, populated;
+            for (JsonObjectConst e : vir) {
+                int id = atoi(e["id"] | "-1");
+                if (!active && _state.active_tray == 254 && id == _activeExtWireId) active = e;
+                if (!sticky && _state.vt_is_vir_slot && id == _state.vt_wire_id) sticky = e;
+                if (!populated && (e["tray_type"] | "")[0] != '\0') populated = e;
             }
+            const bool sticky_loaded = sticky && (sticky["tray_type"] | "")[0] != '\0';
+            JsonObjectConst pick = active        ? active
+                                 : sticky_loaded ? sticky
+                                 : populated     ? populated
+                                 : sticky        ? sticky
+                                 : vir[0].as<JsonObjectConst>();
+            int id = atoi(pick["id"] | "255");
+            _parseExternalTray(pick, (id == 254 || id == 255) ? id : 255, /*vir_slot*/ true);
         }
-        _lastVtSignature = vt_sig;
-        _vtSignatureSeen = true;
-
-        tr.mapped_spool_id     = "";
-        tr.mapped_via_override = false;
-        String override_id = _cfg.findAmsOverride(/*ams_unit*/ 254, /*slot*/ 0);
-        if (override_id.length()) {
-            SpoolRecord rec;
-            if (g_store.findById(override_id, rec)) {
-                tr.mapped_spool_id     = override_id;
-                tr.mapped_via_override = true;
-            }
-        }
-        if (tr.mapped_spool_id.isEmpty() && tr.tag_uid.length()) {
-            SpoolRecord rec;
-            if (g_store.findByTagId(tr.tag_uid, rec)) tr.mapped_spool_id = rec.id;
-        }
-        _syncSpoolToPrinter(/*ams_unit*/ 254, /*slot*/ 0, tr);
-        _state.has_vt_tray = true;
     }
+}
+
+void BambuPrinter::_parseExternalTray(const JsonObjectConst& vt, int wire_id, bool vir_slot) {
+    _state.vt_wire_id     = wire_id;
+    _state.vt_is_vir_slot = vir_slot;
+    AmsTray& tr = _state.vt_tray;
+    tr.id               = 254;                    // internal external-tray key (see vt_wire_id)
+    tr.tray_type        = vt["tray_type"]        | "";
+    tr.tray_sub_brands  = vt["tray_sub_brands"]  | "";
+    tr.tray_color       = vt["tray_color"]       | "";
+    tr.tray_info_idx    = vt["tray_info_idx"]    | "";
+    tr.tag_uid          = _normalizeBambuTagUid(vt["tag_uid"] | "");
+    if (vt["nozzle_temp_min"].is<const char*>()) tr.nozzle_min_c = atoi(vt["nozzle_temp_min"].as<const char*>());
+    if (vt["nozzle_temp_max"].is<const char*>()) tr.nozzle_max_c = atoi(vt["nozzle_temp_max"].as<const char*>());
+    if (vt["remain"].is<int>())   tr.remain_pct = vt["remain"];
+    if (vt["k"].is<float>())      tr.k          = vt["k"];
+    if (vt["cali_idx"].is<int>()) tr.cali_idx   = vt["cali_idx"];
+
+    // Same populated→empty unload detection as AMS slots — drop the
+    // override before resolution so a removed spool doesn't keep the
+    // tray "pinned" to the old id.
+    String vt_sig = tr.tray_type + "|" + tr.tray_info_idx + "|" + tr.tray_color;
+    bool vt_now_populated = tr.tray_type.length() ||
+                            tr.tray_info_idx.length() ||
+                            tr.tray_color.length();
+    bool fire_pending = false;
+    if (_vtSignatureSeen) {
+        bool was_empty = _lastVtSignature.isEmpty() || _lastVtSignature == "||";
+        if (vt_now_populated && was_empty) {
+            // empty → populated: a spool just went on the external holder.
+            // Lets a console tag-scan → "load into printer" flow land on the
+            // external tray exactly like it does on an AMS slot.
+            fire_pending = true;
+        } else if (!vt_now_populated && !was_empty) {
+            Serial.printf("[Bambu %s] external tray physically unloaded\n",
+                          _cfg.serial.c_str());
+            const PrinterConfig* cfg_ro = g_printers_cfg.find(_cfg.serial);
+            if (cfg_ro && cfg_ro->findAmsOverride(254, 0).length()) {
+                PrinterConfig cfg_copy = *cfg_ro;
+                cfg_copy.setAmsOverride(254, 0, "");
+                g_printers_cfg.upsert(cfg_copy);
+                g_printers_cfg.save();
+                _cfg = cfg_copy;
+            }
+        }
+    }
+    _lastVtSignature = vt_sig;
+    _vtSignatureSeen = true;
+
+    tr.mapped_spool_id     = "";
+    tr.mapped_via_override = false;
+    String override_id = _cfg.findAmsOverride(/*ams_unit*/ 254, /*slot*/ 0);
+    if (override_id.length()) {
+        SpoolRecord rec;
+        if (g_store.findById(override_id, rec)) {
+            tr.mapped_spool_id     = override_id;
+            tr.mapped_via_override = true;
+        }
+    }
+    if (tr.mapped_spool_id.isEmpty() && tr.tag_uid.length()) {
+        SpoolRecord rec;
+        if (g_store.findByTagId(tr.tag_uid, rec)) tr.mapped_spool_id = rec.id;
+    }
+    _syncSpoolToPrinter(/*ams_unit*/ 254, /*slot*/ 0, tr);
+    _state.has_vt_tray = true;
+
+    // Last, so it can record the new mapping into _lastSyncedSpoolIdVt and
+    // avoid a double-push on the next report (mirrors _parseAms).
+    if (fire_pending) _maybeAssignPendingSpool(/*ams_unit*/ 254, /*slot*/ 0);
 }
 
 void BambuPrinter::_autoRestoreKValues() {
@@ -969,9 +1046,12 @@ void BambuPrinter::_maybeAssignPendingSpool(int ams_unit, int slot_id) {
     // Surface the result on the spool screen's AMS line so the user gets
     // confirmation. UI will clear the line on the next screen transition.
     char buf[64];
-    snprintf(buf, sizeof(buf),
-             LV_SYMBOL_OK "  AMS " LV_SYMBOL_RIGHT " %s slot %d",
-             _cfg.name.length() ? _cfg.name.c_str() : _cfg.serial.c_str(), slot_id);
+    const char* pname = _cfg.name.length() ? _cfg.name.c_str() : _cfg.serial.c_str();
+    if (ams_unit == 254) {
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK "  AMS " LV_SYMBOL_RIGHT " %s external", pname);
+    } else {
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK "  AMS " LV_SYMBOL_RIGHT " %s slot %d", pname, slot_id);
+    }
     ui_set_spool_ams_status(buf);
 
     // Notify main.cpp so the LCD's spool-detail screen can dismiss itself
@@ -1118,9 +1198,18 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
     JsonDocument doc;
     JsonObject print = doc["print"].to<JsonObject>();
     print["command"]         = "ams_filament_setting";
-    print["ams_id"]          = ams_unit;
-    print["tray_id"]         = slot_id;       // within-AMS slot (newer firmware variant)
-    print["slot_id"]         = slot_id;
+    if (ams_unit == 254) {
+        // External tray, Bambu Studio addressing: ams_id = virtual-tray id
+        // (255 main / 254 deputy on vir_slot printers; 255 for legacy
+        // vt_tray), tray_id = 254, slot_id = 0.
+        print["ams_id"]      = _state.vt_is_vir_slot ? _state.vt_wire_id : 255;
+        print["tray_id"]     = 254;
+        print["slot_id"]     = 0;
+    } else {
+        print["ams_id"]      = ams_unit;
+        print["tray_id"]     = slot_id;       // within-AMS slot (newer firmware variant)
+        print["slot_id"]     = slot_id;
+    }
     print["tray_info_idx"]   = trayInfoIdx;  // may be "" — printer keeps old idx
     print["tray_color"]      = color;
     print["nozzle_temp_min"] = tmin;
