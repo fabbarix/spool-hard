@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "loop_stat.h"
 #include <map>
+#include <memory>
 #include <set>
 #include "config.h"
 #include "display.h"
@@ -59,6 +60,57 @@ const char kSpoolHardVersionMarker[] = SPOOLHARD_VERSION_MARKER;
 extern UserFilamentsStore  g_user_filaments;
 extern StockFilamentsStore g_stock_filaments;
 extern ScaleLink           g_scale;
+
+// ── SD file streaming under the global SD lock ───────────────────
+// AsyncWebServer's own `req->send(SD, path, ...)` keeps a File and reads it
+// from AsyncTCP's send callback with no lock. This helper opens under the
+// SD lock and re-takes it for every chunk read (never across the network
+// send), so a concurrent CrashLogger flush / store write can't interleave
+// with the FAT driver. Returns false (nothing sent) if the file can't be
+// opened; the caller sends the error response.
+namespace {
+struct SdFileHandle {
+    File f;
+    ~SdFileHandle() {
+        SdLock l(200);
+        if (f) f.close();
+    }
+};
+}  // namespace
+
+static bool sendSdFile(AsyncWebServerRequest* req, const char* path,
+                       const char* mime, const char* attachName = nullptr) {
+    auto h = std::make_shared<SdFileHandle>();
+    size_t total = 0;
+    {
+        SdLock l;
+        if (!l) return false;
+        h->f = SD.open(path, FILE_READ);
+        if (!h->f) return false;
+        total = h->f.size();
+    }
+    auto* resp = req->beginResponse(mime, total,
+        [h](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
+            SdLock l(200);
+            if (!l) return RESPONSE_TRY_AGAIN;
+            if (!h->f) return 0;
+            if ((size_t)h->f.position() != index) h->f.seek(index);
+            return h->f.read(buf, maxLen);
+        });
+    if (attachName) {
+        String cd = String("attachment; filename=\"") + attachName + "\"";
+        resp->addHeader("Content-Disposition", cd);
+    }
+    req->send(resp);
+    return true;
+}
+
+// True if `path` exists on a mounted card (takes the SD lock briefly).
+static bool sdExistsLocked(const char* path) {
+    if (!g_sd.isMounted()) return false;
+    SdLock l;
+    return l && SD.exists(path);
+}
 
 // Forward declarations for the static resource-serializer helpers,
 // which are defined further down alongside their HTTP-handler peers.
@@ -381,13 +433,16 @@ void ConsoleWebServer::pushFilamentsInfo() {
     JsonDocument doc;
     doc["present"]    = false;
     doc["sd_mounted"] = g_sd.isMounted();
-    if (g_sd.isMounted() && SD.exists(FILAMENTS_PATH)) {
-        File f = SD.open(FILAMENTS_PATH, FILE_READ);
-        if (f) {
-            doc["present"] = true;
-            doc["size"]    = (uint32_t)f.size();
-            doc["mtime_s"] = (uint32_t)f.getLastWrite();
-            f.close();
+    if (g_sd.isMounted()) {
+        SdLock sdl;
+        if (sdl && SD.exists(FILAMENTS_PATH)) {
+            File f = SD.open(FILAMENTS_PATH, FILE_READ);
+            if (f) {
+                doc["present"] = true;
+                doc["size"]    = (uint32_t)f.size();
+                doc["mtime_s"] = (uint32_t)f.getLastWrite();
+                f.close();
+            }
         }
     }
     broadcastState("filaments_info", doc);
@@ -400,7 +455,9 @@ void ConsoleWebServer::pushCloudPublicCache() {
     // DRAM. broadcastState() does the same for its outer envelope.
     JsonDocument doc(&g_psramJsonAlloc);
     if (g_sd.isMounted()) {
-        File f = SD.open(CLOUD_PUBLIC_CACHE_PATH);
+        SdLock sdl;
+        File f;
+        if (sdl) f = SD.open(CLOUD_PUBLIC_CACHE_PATH);
         if (f) {
             doc["present"]  = true;
             doc["size"]     = (uint32_t)f.size();
@@ -579,11 +636,12 @@ void ConsoleWebServer::_setupRoutes() {
             return;
         }
         const char* path = CrashLogger::prevLogPath();
-        if (!SD.exists(path)) {
+        if (!sdExistsLocked(path)) {
             req->send(204, "text/plain", "");
             return;
         }
-        req->send(SD, path, "text/plain");
+        if (!sendSdFile(req, path, "text/plain"))
+            req->send(503, "application/json", "{\"error\":\"SD busy\"}");
     });
 
     // /api/restart is registered above by SpoolhardCommonRoutes::registerAll.
@@ -746,7 +804,7 @@ void ConsoleWebServer::_setupRoutes() {
             // this is a success. The frontend re-polls the cache-status
             // endpoint to get entry count + bytes (avoids depending on
             // helpers defined later in the TU).
-            if (g_sd.isMounted() && SD.exists(CLOUD_PUBLIC_CACHE_PATH)) {
+            if (sdExistsLocked(CLOUD_PUBLIC_CACHE_PATH)) {
                 req->send(200, "application/json", "{\"ok\":true}");
             } else {
                 req->send(400, "application/json",
@@ -1242,11 +1300,19 @@ void ConsoleWebServer::_setupRoutes() {
                 if (!_requireAuth(req)) { _filamentsUploadErr = "unauthorized"; return; }
                 if (!g_sd.isMounted()) { _filamentsUploadErr = "SD card not mounted"; return; }
                 Serial.printf("[Upload] filaments.db begin: %s\n", filename.c_str());
+                SdLock sdl;   // per-chunk lock; the File stays open between chunks
+                if (!sdl) { _filamentsUploadErr = "SD busy"; return; }
                 if (_filamentsUploadFile) _filamentsUploadFile.close();
                 _filamentsUploadFile = SD.open(FILAMENTS_RELPATH, FILE_WRITE);
                 if (!_filamentsUploadFile) { _filamentsUploadErr = "SD open for write failed"; return; }
             }
             if (_filamentsUploadFile) {
+                SdLock sdl;
+                if (!sdl) {
+                    _filamentsUploadErr = "SD busy";
+                    _filamentsUploadFile.close();
+                    return;
+                }
                 size_t w = _filamentsUploadFile.write(data, len);
                 if (w != len) {
                     _filamentsUploadErr = "SD write short -- card full?";
@@ -1258,6 +1324,7 @@ void ConsoleWebServer::_setupRoutes() {
             }
             if (final) {
                 if (_filamentsUploadFile) {
+                    SdLock sdl;
                     _filamentsUploadFile.flush();
                     _filamentsUploadFile.close();
                 }
@@ -1289,13 +1356,16 @@ void ConsoleWebServer::_setupRoutes() {
         JsonDocument doc;
         doc["present"]    = false;
         doc["sd_mounted"] = g_sd.isMounted();
-        if (g_sd.isMounted() && SD.exists(FILAMENTS_RELPATH)) {
-            File f = SD.open(FILAMENTS_RELPATH, FILE_READ);
-            if (f) {
-                doc["present"] = true;
-                doc["size"]    = (uint32_t)f.size();
-                doc["mtime_s"] = (uint32_t)f.getLastWrite();   // FAT mtime, seconds since epoch
-                f.close();
+        if (g_sd.isMounted()) {
+            SdLock sdl;
+            if (sdl && SD.exists(FILAMENTS_RELPATH)) {
+                File f = SD.open(FILAMENTS_RELPATH, FILE_READ);
+                if (f) {
+                    doc["present"] = true;
+                    doc["size"]    = (uint32_t)f.size();
+                    doc["mtime_s"] = (uint32_t)f.getLastWrite();   // FAT mtime, seconds since epoch
+                    f.close();
+                }
             }
         }
         String out; serializeJson(doc, out);
@@ -1304,14 +1374,15 @@ void ConsoleWebServer::_setupRoutes() {
 
     _server.on(AsyncURIMatcher::exact("/api/filaments"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
-        if (!g_sd.isMounted() || !SD.exists(FILAMENTS_RELPATH)) {
+        if (!sdExistsLocked(FILAMENTS_RELPATH)) {
             req->send(404, "application/json", "{\"error\":\"no library uploaded\"}");
             return;
         }
         // Content type: JSON Lines per RFC 8259 / IANA convention. Some
         // clients are happier with text/plain; we return JSONL's own
         // type so the React fetch() side can branch on it cleanly.
-        req->send(SD, FILAMENTS_RELPATH, "application/x-ndjson");
+        if (!sendSdFile(req, FILAMENTS_RELPATH, "application/x-ndjson"))
+            req->send(503, "application/json", "{\"error\":\"SD busy\"}");
     });
 
     // Downloads the blob the most recent FTP debug "download" op wrote
@@ -1320,14 +1391,10 @@ void ConsoleWebServer::_setupRoutes() {
     // as attachment so the browser saves rather than rendering bytes.
     _server.on(AsyncURIMatcher::exact("/api/ftp-download"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
-        if (!g_sd.isMounted() || !SD.exists("/ftp_dl.bin")) {
+        if (!sdExistsLocked("/ftp_dl.bin") ||
+            !sendSdFile(req, "/ftp_dl.bin", "application/octet-stream", "ftp_dl.bin")) {
             req->send(404, "application/json", "{\"error\":\"no download available\"}");
-            return;
         }
-        auto* resp = req->beginResponse(SD, "/ftp_dl.bin",
-                                        "application/octet-stream");
-        resp->addHeader("Content-Disposition", "attachment; filename=\"ftp_dl.bin\"");
-        req->send(resp);
     });
 
     _server.on(AsyncURIMatcher::exact("/api/filaments"), HTTP_DELETE, [this](AsyncWebServerRequest* req) {
@@ -1336,13 +1403,20 @@ void ConsoleWebServer::_setupRoutes() {
             req->send(503, "application/json", "{\"error\":\"SD card not mounted\"}");
             return;
         }
-        if (!SD.exists(FILAMENTS_RELPATH)) {
-            req->send(404, "application/json", "{\"error\":\"no library uploaded\"}");
-            return;
-        }
-        if (!SD.remove(FILAMENTS_RELPATH)) {
-            req->send(500, "application/json", "{\"error\":\"delete failed\"}");
-            return;
+        {
+            SdLock sdl;
+            if (!sdl) {
+                req->send(503, "application/json", "{\"error\":\"SD busy\"}");
+                return;
+            }
+            if (!SD.exists(FILAMENTS_RELPATH)) {
+                req->send(404, "application/json", "{\"error\":\"no library uploaded\"}");
+                return;
+            }
+            if (!SD.remove(FILAMENTS_RELPATH)) {
+                req->send(500, "application/json", "{\"error\":\"delete failed\"}");
+                return;
+            }
         }
         pushFilamentsInfo();
         req->send(200, "application/json", "{\"ok\":true}");
@@ -1856,6 +1930,8 @@ const SpoolhardBackup::Source& ConsoleWebServer::_backupSource() {
               "/spoolease/logs", "/spoolease/crashes",
               CLOUD_PUBLIC_CACHE_PATH, "/ftp_dl.bin" },
             { ".tmp" }};
+        sdm.lock   = &sdLock;     // global SD mutex (sdcard.h), per-chunk
+        sdm.unlock = &sdUnlock;
         s.fs_mounts = { lfs, sdm };
         return s;
     }();
@@ -1926,7 +2002,8 @@ void ConsoleWebServer::_handleCrashGet(AsyncWebServerRequest* req) {
     }
     // AsyncWebServer streams from the FS object — internal allocator
     // handles buffer reuse, no big String materialisation here.
-    req->send(SD, path, "text/plain");
+    if (!sendSdFile(req, path.c_str(), "text/plain"))
+        req->send(503, "application/json", "{\"error\":\"SD busy\"}");
 }
 
 void ConsoleWebServer::_handleCrashDelete(AsyncWebServerRequest* req) {
@@ -1969,11 +2046,12 @@ void ConsoleWebServer::_handleCurrentLog(AsyncWebServerRequest* req) {
     // entries on disk too — otherwise the file lags up to ~3 s behind.
     CrashLogger::flush();
     const char* path = CrashLogger::currentLogPath();
-    if (!SD.exists(path)) {
+    if (!sdExistsLocked(path)) {
         req->send(204, "text/plain", "");
         return;
     }
-    req->send(SD, path, "text/plain");
+    if (!sendSdFile(req, path, "text/plain"))
+        req->send(503, "application/json", "{\"error\":\"SD busy\"}");
 }
 
 // ── Spool CRUD ───────────────────────────────────────────────
@@ -2149,7 +2227,10 @@ void ConsoleWebServer::_handleStorageSpoolsSet(AsyncWebServerRequest* req,
             String dst_path;
             fs::FS* dst_fs = nullptr;
             if (want_sd) {
-                if (!SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                {
+                    SdLock sdl;
+                    if (sdl && !SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                }
                 dst_fs   = &SD;
                 dst_path = SPOOLS_PATH_SD;
             } else {
@@ -2171,7 +2252,10 @@ void ConsoleWebServer::_handleStorageSpoolsSet(AsyncWebServerRequest* req,
             }
             _store->markBackendIsSd(want_sd);
             // Drop the old copy now that the new one is live + indexed.
-            src_fs.remove(src_path.c_str());
+            {
+                SdLock sdl;
+                src_fs.remove(src_path.c_str());
+            }
             resp["migrated"] = true;
             resp["message"]  = "moved to " + target;
         }
@@ -2755,18 +2839,25 @@ struct PublicCacheStats {
 PublicCacheStats statCache() {
     PublicCacheStats s;
     if (!g_sd.isMounted()) return s;
-    File f = SD.open(CLOUD_PUBLIC_CACHE_PATH, FILE_READ);
-    if (!f) return s;
-    s.present = true;
-    s.bytes   = f.size();
-    s.mtime_s = f.getLastWrite();
+    File f;
+    {
+        SdLock l;
+        if (!l) return s;
+        f = SD.open(CLOUD_PUBLIC_CACHE_PATH, FILE_READ);
+        if (!f) return s;
+        s.present = true;
+        s.bytes   = f.size();
+        s.mtime_s = f.getLastWrite();
+    }
     int n = 0;
-    while (f.available()) {
+    for (;;) {
+        SdLock l(200);               // lock per line: bounded hold time
+        if (!l || !f.available()) break;
         String line = f.readStringUntil('\n');
         if (line.length() > 1) ++n;
     }
     s.entries = n;
-    f.close();
+    { SdLock l(200); f.close(); }
     return s;
 }
 
@@ -2774,11 +2865,21 @@ PublicCacheStats statCache() {
 // true and fills `settingIdOut` on first match.
 bool scanCacheForName(const String& name, String& settingIdOut) {
     if (!g_sd.isMounted()) return false;
-    File f = SD.open(CLOUD_PUBLIC_CACHE_PATH, FILE_READ);
-    if (!f) return false;
+    File f;
+    {
+        SdLock l;
+        if (!l) return false;
+        f = SD.open(CLOUD_PUBLIC_CACHE_PATH, FILE_READ);
+        if (!f) return false;
+    }
     bool found = false;
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
+    for (;;) {
+        String line;
+        {
+            SdLock l(200);           // lock per line: bounded hold time
+            if (!l || !f.available()) break;
+            line = f.readStringUntil('\n');
+        }
         if (line.length() < 5) continue;
         // Cheap pre-filter: only deserialise lines that contain the
         // exact name substring. Saves ~98% of the JSON parses on misses.
@@ -2792,7 +2893,7 @@ bool scanCacheForName(const String& name, String& settingIdOut) {
             break;
         }
     }
-    f.close();
+    { SdLock l(200); f.close(); }
     return found;
 }
 
@@ -2836,6 +2937,10 @@ RefreshResult refreshPublicCache(int& entriesOut, String& errMsgOut) {
     // Write to a temp file and rename, so a partial write doesn't corrupt
     // an existing cache.
     const char* tmpPath = CLOUD_PUBLIC_CACHE_PATH ".tmp";
+    // The network fetch is done; the rest is local JSON -> SD only, so
+    // holding the SD lock for the (bounded, ~100 KB) write is fine.
+    SdLock sdl(2000);
+    if (!sdl) { errMsgOut = "SD busy"; return RefreshResult::IoError; }
     File out = SD.open(tmpPath, FILE_WRITE);
     if (!out) { errMsgOut = "SD open .tmp failed"; return RefreshResult::IoError; }
     int n = 0;
@@ -3097,16 +3202,25 @@ void ConsoleWebServer::_handleCloudPublicCacheUpload(AsyncWebServerRequest* req,
         // wipe the existing cache. Same atomic-swap pattern as
         // refreshPublicCache().
         const char* tmpPath = CLOUD_PUBLIC_CACHE_PATH ".tmp";
+        SdLock sdl;
+        if (!sdl) return;
         SD.remove(tmpPath);
         _cacheUploadFile = SD.open(tmpPath, FILE_WRITE);
     }
-    if (_cacheUploadFile && len) _cacheUploadFile.write(data, len);
+    if (_cacheUploadFile && len) {
+        SdLock sdl;                    // per-chunk; File stays open between chunks
+        if (sdl) _cacheUploadFile.write(data, len);
+        else dlog("CloudFil", "public-cache upload: SD busy, chunk dropped");
+    }
     if (final) {
         if (_cacheUploadFile) {
-            _cacheUploadFile.close();
-            const char* tmpPath = CLOUD_PUBLIC_CACHE_PATH ".tmp";
-            SD.remove(CLOUD_PUBLIC_CACHE_PATH);
-            SD.rename(tmpPath, CLOUD_PUBLIC_CACHE_PATH);
+            {
+                SdLock sdl(2000);
+                _cacheUploadFile.close();
+                const char* tmpPath = CLOUD_PUBLIC_CACHE_PATH ".tmp";
+                SD.remove(CLOUD_PUBLIC_CACHE_PATH);
+                SD.rename(tmpPath, CLOUD_PUBLIC_CACHE_PATH);
+            }
             dlog("CloudFil", "public-cache upload: %s", CLOUD_PUBLIC_CACHE_PATH);
             pushCloudPublicCache();
         }
@@ -3115,8 +3229,10 @@ void ConsoleWebServer::_handleCloudPublicCacheUpload(AsyncWebServerRequest* req,
 
 void ConsoleWebServer::_handleCloudPublicCacheDelete(AsyncWebServerRequest* req) {
     bool removed = false;
-    if (g_sd.isMounted() && SD.exists(CLOUD_PUBLIC_CACHE_PATH)) {
-        removed = SD.remove(CLOUD_PUBLIC_CACHE_PATH);
+    if (g_sd.isMounted()) {
+        SdLock sdl;
+        if (sdl && SD.exists(CLOUD_PUBLIC_CACHE_PATH))
+            removed = SD.remove(CLOUD_PUBLIC_CACHE_PATH);
     }
     if (removed) pushCloudPublicCache();
     JsonDocument doc;

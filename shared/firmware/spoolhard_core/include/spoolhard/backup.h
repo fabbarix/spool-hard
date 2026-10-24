@@ -89,6 +89,13 @@ struct FsMount {
     // Filename suffixes to skip on backup (e.g. ".tmp"). "*.restore"
     // leftovers from an aborted restore are always skipped.
     std::vector<const char*> skip_suffixes;
+    // Optional per-mount I/O lock (the console's global SD mutex). When set,
+    // every FS call on this mount is bracketed by lock(timeout_ms)/unlock()
+    // for a short bounded operation (one chunk / one directory walk / one
+    // rename) — never held across the network. nullptr = no locking (scale,
+    // LittleFS).
+    bool (*lock)(uint32_t timeout_ms) = nullptr;
+    void (*unlock)()                  = nullptr;
 };
 
 // Describes which NVS namespaces and which filesystems to include.

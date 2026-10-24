@@ -284,6 +284,7 @@ void setup() {
             // first so the user keeps their data without manual action.
             want_sd = g_sd.isMounted();
             if (want_sd) {
+                SdLock sdl(5000);   // boot-time migration; scope = this block
                 bool have_internal_data = LittleFS.exists(SPOOLS_PATH_INTERNAL);
                 bool have_sd_data       = SD.exists(SPOOLS_PATH_SD);
                 if (have_internal_data && !have_sd_data) {
@@ -327,7 +328,10 @@ void setup() {
                     "Spool store is set to SD but no SD card is mounted. "
                     "Insert the card or override to internal flash.");
             } else {
-                if (!SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                {
+                    SdLock sdl(5000);
+                    if (!SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                }
                 g_store.begin(SD, SPOOLS_PATH_SD);
                 g_store.markBackendIsSd(true);
             }

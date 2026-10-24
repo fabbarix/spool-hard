@@ -38,6 +38,7 @@ static void _parseSuffixToVariant(const String& name, FilamentVariant& fv) {
 }
 
 void UserFilamentsStore::begin() {
+    SdLock sdl(5000);  // recursive; also serialises the whole store
     _mounted = g_sd.isMounted();
     if (!_mounted) {
         Serial.println("[UserFilaments] SD not mounted; user filaments unavailable");
@@ -113,6 +114,8 @@ void UserFilamentsStore::begin() {
 // authoritative, drop .tmp; only .tmp => promote it.
 void UserFilamentsStore::_recoverPack() {
     const char* tmpPath = USER_FILAMENTS_PATH ".tmp";
+    SdLock sdl(5000);
+    if (!sdl) return;
     if (!SD.exists(tmpPath)) return;
     if (SD.exists(USER_FILAMENTS_PATH)) {
         SD.remove(tmpPath);
@@ -126,6 +129,8 @@ void UserFilamentsStore::_rebuildIndex() {
     _deadLines = 0;
     if (!_mounted) return;
 
+    SdLock sdl(5000);
+    if (!sdl) return;
     File f = SD.open(USER_FILAMENTS_PATH, FILE_READ);
     if (!f) return;
     while (f.available()) {
@@ -143,6 +148,8 @@ void UserFilamentsStore::_rebuildIndex() {
 
 bool UserFilamentsStore::_readAt(size_t offset, FilamentRecord& out) const {
     if (!_mounted) return false;
+    SdLock sdl(1000);
+    if (!sdl) return false;
     File f = SD.open(USER_FILAMENTS_PATH, FILE_READ);
     if (!f) return false;
     if (!f.seek(offset)) { f.close(); return false; }
@@ -154,6 +161,8 @@ bool UserFilamentsStore::_readAt(size_t offset, FilamentRecord& out) const {
 
 bool UserFilamentsStore::_append(const FilamentRecord& rec, size_t& outOffset) {
     if (!_mounted) return false;
+    SdLock sdl(1000);
+    if (!sdl) return false;
     File f = SD.open(USER_FILAMENTS_PATH, FILE_APPEND);
     if (!f) {
         // First write — create the file.
@@ -173,6 +182,8 @@ bool UserFilamentsStore::_tombstone(size_t offset) {
     // SD.open with "r+" mode: in-place overwrite. Arduino's SD library
     // exposes this via FILE_WRITE on an already-existing file at a seekable
     // position. We just need to write 2 bytes ("x ") at the line start.
+    SdLock sdl(1000);
+    if (!sdl) return false;
     File f = SD.open(USER_FILAMENTS_PATH, "r+");
     if (!f) return false;
     if (!f.seek(offset)) { f.close(); return false; }
@@ -182,6 +193,8 @@ bool UserFilamentsStore::_tombstone(size_t offset) {
 }
 
 bool UserFilamentsStore::findById(const String& setting_id, FilamentRecord& out) {
+    SdLock sdl(1000);
+    if (!sdl) return false;
     auto it = _idIndex.find(setting_id);
     if (it == _idIndex.end()) return false;
     return _readAt(it->second, out);
@@ -189,6 +202,8 @@ bool UserFilamentsStore::findById(const String& setting_id, FilamentRecord& out)
 
 bool UserFilamentsStore::upsert(const FilamentRecord& rec) {
     if (!_mounted || rec.setting_id.isEmpty()) return false;
+    SdLock sdl(2000);   // makes tombstone+append (and the index) atomic
+    if (!sdl) return false;
 
     auto it = _idIndex.find(rec.setting_id);
     if (it != _idIndex.end()) _tombstone(it->second);
@@ -200,6 +215,8 @@ bool UserFilamentsStore::upsert(const FilamentRecord& rec) {
 }
 
 bool UserFilamentsStore::remove(const String& setting_id) {
+    SdLock sdl(2000);
+    if (!sdl) return false;
     auto it = _idIndex.find(setting_id);
     if (it == _idIndex.end()) return false;
     if (!_tombstone(it->second)) return false;
@@ -210,6 +227,8 @@ bool UserFilamentsStore::remove(const String& setting_id) {
 std::vector<FilamentRecord> UserFilamentsStore::list(
         size_t offset, size_t limit, const String& material_filter) {
     std::vector<FilamentRecord> out;
+    SdLock sdl(2000);   // recursive; _readAt re-locks per record
+    if (!sdl) return out;
     size_t skipped = 0, returned = 0;
     for (auto& kv : _idIndex) {
         FilamentRecord rec;
@@ -224,6 +243,8 @@ std::vector<FilamentRecord> UserFilamentsStore::list(
 
 bool UserFilamentsStore::pack() {
     if (!_mounted) return false;
+    SdLock sdl(10000);  // rare whole-file rewrite
+    if (!sdl) return false;
     File in = SD.open(USER_FILAMENTS_PATH, FILE_READ);
     if (!in) return true;  // nothing to pack
     const char* tmpPath = USER_FILAMENTS_PATH ".tmp";

@@ -2,13 +2,44 @@
 #include "config.h"
 #include <SPI.h>
 #include <SD.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "spoolhard/serial_mirror.h"
 
 SdCard g_sd;
 
+static SemaphoreHandle_t s_sdMtx = nullptr;
+static portMUX_TYPE s_sdMtxInit = portMUX_INITIALIZER_UNLOCKED;
+
+// Created from SdCard::begin() (single-threaded setup) and lazily here as a
+// safety net; the critical section makes lazy creation race-free.
+static void _sdMtxEnsure() {
+    if (s_sdMtx) return;
+    SemaphoreHandle_t m = xSemaphoreCreateRecursiveMutex();
+    portENTER_CRITICAL(&s_sdMtxInit);
+    if (!s_sdMtx) { s_sdMtx = m; m = nullptr; }
+    portEXIT_CRITICAL(&s_sdMtxInit);
+    if (m) vSemaphoreDelete(m);
+}
+
+bool sdLock(uint32_t timeout_ms) {
+    _sdMtxEnsure();
+    if (!s_sdMtx) return false;
+    if (xSemaphoreTakeRecursive(s_sdMtx, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) return true;
+    Serial.printf("[SD] lock timeout (%lu ms) from task %s\n",
+                  (unsigned long)timeout_ms, pcTaskGetName(nullptr));
+    return false;
+}
+
+void sdUnlock() {
+    if (s_sdMtx) xSemaphoreGiveRecursive(s_sdMtx);
+}
+
 static SPIClass* s_sdSpi = nullptr;
 
 void SdCard::begin() {
+    _sdMtxEnsure();
+    SdLock lk(2000);
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);  // deselect
 
@@ -22,6 +53,10 @@ void SdCard::update() {
     if (now - _lastCheck < 2000) return;
     _lastCheck = now;
 
+    // Mount/unmount (SD.begin/SD.end) must not race file I/O in other
+    // tasks. Short timeout: if someone is mid-I/O, retry in 2 s.
+    SdLock lk(20);
+    if (!lk) { _lastCheck = now - 1500; return; }
     if (!_mounted) {
         _tryMount();
     } else {

@@ -1,4 +1,5 @@
 #include "store.h"
+#include "sdcard.h"
 #include "config.h"
 #include "spoolhard/serial_mirror.h"
 
@@ -31,6 +32,8 @@ void SpoolStore::begin(fs::FS& fs, const String& path) {
 // complete compacted file (promote it).
 void SpoolStore::_recoverPack() {
     if (!_fs) return;
+    SdLock sdl(5000);
+    if (!sdl) return;
     String tmpPath = _path + ".tmp";
     if (!_fs->exists(tmpPath.c_str())) return;
     if (_fs->exists(_path.c_str())) {
@@ -60,6 +63,8 @@ void SpoolStore::_rebuildIndexes() {
     _deadLines = 0;
     if (!_fs) return;
 
+    SdLock sdl(5000);  // lock order: store mutex -> SdLock
+    if (!sdl) { Serial.println("[Store] index rebuild: SD busy"); return; }
     File f = _fs->open(_path.c_str(), "r");
     if (!f) return;   // empty store — first boot, fine
 
@@ -86,6 +91,8 @@ void SpoolStore::_rebuildIndexes() {
 
 bool SpoolStore::_readAt(size_t offset, SpoolRecord& out) const {
     if (!_fs) return false;
+    SdLock sdl(1000);  // lock order: store mutex -> SdLock
+    if (!sdl) return false;
     File f = _fs->open(_path.c_str(), "r");
     if (!f) return false;
     if (!f.seek(offset)) { f.close(); return false; }
@@ -101,6 +108,8 @@ bool SpoolStore::_append(const SpoolRecord& rec, size_t& outOffset) {
     // creates on first write. Try open("a") first, fall back to open("w") if
     // the file doesn't exist yet (creates it). Both backends agree on these
     // mode strings via the fs::FS base class.
+    SdLock sdl(1000);  // lock order: store mutex -> SdLock
+    if (!sdl) return false;
     File f = _fs->open(_path.c_str(), "a");
     if (!f) f = _fs->open(_path.c_str(), "w");
     if (!f) return false;
@@ -114,6 +123,8 @@ bool SpoolStore::_append(const SpoolRecord& rec, size_t& outOffset) {
 
 bool SpoolStore::_tombstone(size_t offset) {
     if (!_fs) return false;
+    SdLock sdl(1000);  // lock order: store mutex -> SdLock
+    if (!sdl) return false;
     File f = _fs->open(_path.c_str(), "r+");
     if (!f) return false;
     if (!f.seek(offset)) { f.close(); return false; }
@@ -206,21 +217,32 @@ std::vector<SpoolRecord> SpoolStore::list(size_t offset, size_t limit, const Str
     std::vector<SpoolRecord> out;
     Lock lk(_mtx);
     if (!ready()) return out;
-    // One open for the whole listing (was one open per record).
-    File f = _fs->open(_path.c_str(), "r");
+    // One open for the whole listing (was one open per record). The SD lock
+    // is taken per record (bounded hold) — the File persists between locks.
+    File f;
+    {
+        SdLock sdl(1000);  // lock order: store mutex -> SdLock
+        if (!sdl) return out;
+        f = _fs->open(_path.c_str(), "r");
+    }
     if (!f) return out;
     size_t skipped = 0, returned = 0;
     for (auto& kv : _idIndex) {
         SpoolRecord rec;
-        if (!f.seek(kv.second)) continue;
-        String line = f.readStringUntil('\n');
+        String line;
+        {
+            SdLock sdl(1000);
+            if (!sdl) break;
+            if (!f.seek(kv.second)) continue;
+            line = f.readStringUntil('\n');
+        }
         if (line.startsWith("x ") || !rec.fromLine(line)) continue;
         if (material_filter.length() && rec.material_type != material_filter) continue;
         if (skipped < offset) { skipped++; continue; }
         out.push_back(std::move(rec));
         if (++returned >= limit) break;
     }
-    f.close();
+    { SdLock sdl(1000); f.close(); }
     return out;
 }
 
@@ -236,6 +258,10 @@ bool SpoolStore::pack() {
 
 bool SpoolStore::_packLocked() {
     if (!ready()) return false;
+    // Whole-file rewrite: rare (boot / explicit pack / migrate), bounded by
+    // file size (~1 s for 0.5 MB), hence the long timeout.
+    SdLock sdl(10000);  // lock order: store mutex -> SdLock
+    if (!sdl) { _lastError = "pack: SD busy"; return false; }
     File in = _fs->open(_path.c_str(), "r");
     if (!in) return true;  // nothing to pack
     String tmpPath = _path + ".tmp";
@@ -290,6 +316,8 @@ bool SpoolStore::migrateTo(fs::FS& dst_fs, const String& dst_path) {
     }
     // Pack first so we don't carry tombstones across — keeps the migrated
     // file tight and the index trivial to rebuild on the destination.
+    SdLock sdl(10000);  // lock order: store mutex -> SdLock (recursive)
+    if (!sdl) { _lastError = "migrate: SD busy"; return false; }
     _packLocked();   // (no onChange here: migrate rebinds + rebuilds below)
 
     String dst_tmp = dst_path + ".tmp";

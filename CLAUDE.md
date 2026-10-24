@@ -519,6 +519,29 @@ least every 5 s (`kLcdSafetyMs`) and on the first tick after screen wake
 (the hash is invalidated while asleep). `pushScaleLink()` from the 1 Hz
 block is a keep-alive only every 5 s (or immediately on a connect flip);
 `ScaleLink` still pushes on every event/handshake transition itself.
+## Console global SD mutex (`SdLock`)
+
+`console/firmware/include/sdcard.h` + `src/sdcard.cpp`: a recursive FreeRTOS
+mutex (created in `SdCard::begin`, lazy-safe fallback) guards ALL SD file I/O —
+the Arduino SD/FAT stack is not thread-safe and loopTask, AsyncTCP handlers,
+scale_link, FTP/analyse tasks all touch the card. Use `SdLock l(timeout_ms);
+if (!l) { /* log+skip */ }` (default 500 ms, `[SD] lock timeout` logged on
+failure; never block forever). `SdCard::update()` (mount/unmount) takes it too.
+
+**Lock order** (outermost first): `CrashLogger::s_mtx` -> store mutexes
+(`SpoolStore::_mtx`) -> `SdLock` -> leaf (RingLog mutex / Serial). Never take the
+LVGL lock, a queue/other mutex, or do a network send / FTP read while holding
+`SdLock`. Hold it only for short bounded ops; chunked streams re-take it per
+chunk (`sendSdFile()` in web_server.cpp for downloads — replaces
+`req->send(SD, ...)`, which read the File unlocked from AsyncTCP; the
+backup tar stream/restore via `FsMount::lock/unlock` hooks in
+`spoolhard/backup.h`, add-only, null on scale). `CrashLogger::flush()` (loopTask)
+uses a 50 ms timeout and retries next tick. Covered: crash logger, spool store,
+user/stock filament stores, cloud public cache, filaments upload/info/delete,
+ftp_dl.bin write + download, /api/logs/{current,previous}, crash downloads,
+backup/restore, storage migration, boot-time first-boot migration.
+New SD code must take the lock.
+
 ## Gcode-analysis inflate placement measurement (console only)
 
 `analyseRemote()` times every run (`InflateStats` in `bambu_printer.h`:
