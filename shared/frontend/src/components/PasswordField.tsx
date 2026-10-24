@@ -20,7 +20,8 @@ export function PasswordField({ label, className = '', ...props }: PasswordField
           type="button"
           className="absolute right-2 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary"
           onClick={() => setShow(!show)}
-          tabIndex={-1}
+          aria-label={show ? 'Hide password' : 'Show password'}
+          aria-pressed={show}
         >
           {show ? <EyeOff size={16} /> : <Eye size={16} />}
         </button>

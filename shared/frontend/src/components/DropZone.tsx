@@ -186,6 +186,7 @@ export function DropZone({ label, accept = '.bin', icon, onUpload, validate, dis
               <button
                 onClick={(e) => { e.stopPropagation(); clearStaged(); }}
                 className="text-text-muted hover:text-status-error transition-colors p-0.5"
+                aria-label="Remove selected file"
               >
                 <X size={14} />
               </button>

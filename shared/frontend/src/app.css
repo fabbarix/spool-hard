@@ -26,19 +26,19 @@
   --color-status-info: #64748b;
 
   --color-text-primary: #e2e8f0;
-  --color-text-secondary: #64748b;
-  --color-text-muted: #475569;
+  --color-text-secondary: #94a3b8; /* 6.6:1 on card */
+  --color-text-muted: #8391a7; /* 5.3:1 on card */
   --color-text-data: #f0b429;
 
   --color-log-event: #2dd4bf;
   --color-log-in: #38bdf8;
   --color-log-out: #f0b429;
-  --color-log-sys: #475569;
+  --color-log-sys: #8391a7;
   --color-log-err: #f87171;
 
-  --font-sans: 'DM Sans', system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
-  --font-data: 'JetBrains Mono', ui-monospace, monospace;
+  --font-sans: 'DM Sans', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-data: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   --radius-card: 10px;
   --radius-badge: 6px;
@@ -66,3 +66,16 @@
 .log-scroll::-webkit-scrollbar { width: 4px; }
 .log-scroll::-webkit-scrollbar-track { background: transparent; }
 .log-scroll::-webkit-scrollbar-thumb { background: #252830; border-radius: 2px; }
+
+/* Keyboard focus ring (mouse clicks don't trigger it). */
+:focus-visible {
+  outline: 2px solid var(--color-brand-400);
+  outline-offset: 2px;
+}
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline-offset: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-in, .animate-pulse-glow { animation: none; }
+}
