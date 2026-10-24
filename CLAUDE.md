@@ -500,3 +500,12 @@ lines (ring-log lines cap at 159 chars, hence the split): window summary
 served under `loop_stat` in `GET /api/heap` (added via
 `SpoolhardCommonRoutes::setHeapExtra()`, add-only; scale doesn't set it).
 The old `[LoopLat]` >200 ms per-step / >500 ms first-half lines remain.
+
+**OTA checker config cache**: `OtaChecker::update()` runs every loop tick
+(~200 Hz on the console). It used to `OtaConfig::load()` (NVS open + 9
+reads) each tick; it now caches only `check_enabled` + `check_interval_h`
+and re-reads when `OtaConfig::save()` bumps a static generation counter
+(config POSTs take effect on the next tick) or when the cache is >10 s old
+(safety net for writers that bypass `save()`, e.g. `/api/restore`). A real
+check start does one fresh full `load()` for url/ssl flags. `kickNow()`,
+the 5-min force floor and the interval/boot gates are unchanged.

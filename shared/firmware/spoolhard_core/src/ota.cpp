@@ -1,3 +1,4 @@
+#include <atomic>
 #include "spoolhard/ota.h"
 #include <Preferences.h>
 #include <ArduinoJson.h>
@@ -50,7 +51,14 @@ void OtaConfig::load() {
     if (check_interval_h > kOtaCheckIntervalMax) check_interval_h = kOtaCheckIntervalMax;
 }
 
+// Bumped on every OtaConfig::save() so OtaChecker::update()'s scheduling
+// cache notices a config change on its very next tick. Writers that
+// bypass save() (the /api/restore NVS import) are caught by the cache's
+// max-age safety net instead.
+static std::atomic<uint32_t> s_cfgGeneration{1};
+
 void OtaConfig::save() const {
+    s_cfgGeneration.fetch_add(1, std::memory_order_acq_rel);
     Preferences prefs;
     prefs.begin(kNvsNs, false);
     prefs.putString(kKeyUrl,        url);
@@ -228,15 +236,29 @@ void OtaChecker::update() {
 
     if (WiFi.status() != WL_CONNECTED) return;
 
-    OtaConfig cfg; cfg.load();
-    if (!cfg.check_enabled && !_forceNext) return;
-
+    // Scheduling reads only check_enabled + check_interval_h. Re-reading
+    // all of ota_cfg from NVS on every loop tick (~200 Hz) was pure
+    // overhead, so cache those two and refresh when save() bumps the
+    // generation or the entry is >10 s old (covers restore/other writers).
+    constexpr uint32_t kCfgCacheMaxAgeMs = 10UL * 1000UL;
     uint32_t now = millis();
+    uint32_t gen = s_cfgGeneration.load(std::memory_order_acquire);
+    if (!_cfgCacheValid || gen != _cfgCacheGen ||
+        (now - _cfgCacheMs) > kCfgCacheMaxAgeMs) {
+        OtaConfig c; c.load();
+        _cfgCheckEnabled   = c.check_enabled;
+        _cfgCheckIntervalH = c.check_interval_h;
+        _cfgCacheGen       = gen;
+        _cfgCacheMs        = now;
+        _cfgCacheValid     = true;
+    }
+    if (!_cfgCheckEnabled && !_forceNext) return;
+
     bool firstAfterBoot = (_lastCheckSessionMs == 0) &&
                           (now - _bootMs > 60UL * 1000UL);
     bool dueByInterval  = _lastCheckSessionMs > 0 &&
                           (now - _lastCheckSessionMs >
-                           cfg.check_interval_h * 60UL * 60UL * 1000UL);
+                           _cfgCheckIntervalH * 60UL * 60UL * 1000UL);
     // Hard floor on _forceNext to break feedback loops. The console
     // used to send CheckOtaUpdates on every reconnect, and a flapping
     // link could fire several reconnects per minute. Each forced
@@ -271,6 +293,10 @@ void OtaChecker::update() {
                       (unsigned)freeInternal, (unsigned)kCheckMinFreeInternal);
         return;
     }
+
+    // A check is really starting (rare): take a fresh full snapshot —
+    // the task needs url/ssl flags, and they must not be up to 10 s stale.
+    OtaConfig cfg; cfg.load();
 
     _forceNext = false;
     _lastCheckSessionMs = now;

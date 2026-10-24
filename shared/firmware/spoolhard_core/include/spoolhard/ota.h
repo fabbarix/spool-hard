@@ -122,6 +122,12 @@ private:
     // on a PSRAM stack (see spoolhard/psram_task.h).
     volatile bool _persistPending     = false;
     uint32_t      _bootMs             = 0;
+    // update()'s scheduling cache of ota_cfg (see ota.cpp). Loop-task only.
+    bool          _cfgCacheValid      = false;
+    bool          _cfgCheckEnabled    = true;
+    uint32_t      _cfgCheckIntervalH  = 24;
+    uint32_t      _cfgCacheGen        = 0;
+    uint32_t      _cfgCacheMs         = 0;
     uint32_t      _dramGateRetryMs    = 0;   // next millis() a gated check may retry
 
     static void _runCheckTask(void* arg);
