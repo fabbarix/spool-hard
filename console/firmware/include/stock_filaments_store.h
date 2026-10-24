@@ -1,6 +1,8 @@
 #pragma once
 #include <Arduino.h>
 #include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "filament_record.h"
 
 // Read-only stock-filament library from the BambuStudio-derived
@@ -29,7 +31,7 @@ public:
     std::vector<FilamentRecord> list(size_t offset, size_t limit,
                                      const String& material_filter = "") const;
 
-    size_t count() const { return _count; }
+    size_t count() const { return _count; }  // racy-but-benign snapshot read
     bool   loaded() const { return _loaded; }
 
 private:
@@ -44,11 +46,13 @@ private:
         uint32_t id_hash;
         uint32_t type_hash;
     };
-    void freeBuffers();
+    void install(char* buf, RowIdx* idx, size_t n, bool loaded);
+    SemaphoreHandle_t lock() const;
     bool parseRow(const RowIdx& r, FilamentRecord& out) const;
 
     char*   _buf   = nullptr;
     RowIdx* _idx   = nullptr;
     size_t  _count = 0;
     bool _loaded = false;
+    mutable SemaphoreHandle_t _mtx = nullptr;  // guards _buf/_idx/_count swap vs readers
 };
