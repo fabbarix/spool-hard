@@ -1199,7 +1199,7 @@ static void build_slot_detail() {
     // Left column: large color swatch + weight hero below.
     s_slot_swatch_big = lv_obj_create(s_slot);
     lv_obj_set_pos(s_slot_swatch_big, 12, 68);
-    lv_obj_set_size(s_slot_swatch_big, 140, 100);
+    lv_obj_set_size(s_slot_swatch_big, 120, 100);
     lv_obj_set_style_bg_color(s_slot_swatch_big, COL_INPUT, 0);
     lv_obj_set_style_bg_opa(s_slot_swatch_big, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(s_slot_swatch_big, COL_BORDER, 0);
@@ -1213,18 +1213,18 @@ static void build_slot_detail() {
     s_slot_weight_sub = make_label(s_slot, "",
                                    COL_TEXT_MUTED, &spoolhard_mont_16);
     lv_obj_align(s_slot_weight_sub, LV_ALIGN_TOP_LEFT, 12, 224);
-    lv_obj_set_width(s_slot_weight_sub, 140);
+    lv_obj_set_width(s_slot_weight_sub, 120);
     lv_label_set_long_mode(s_slot_weight_sub, LV_LABEL_LONG_WRAP);
 
     // Right column: a scrollable block holding the detail lines. Populated
     // fresh each time the screen opens — we clear + rebuild rather than
     // trying to keep a fixed set of labels in sync.
     s_slot_grid = lv_obj_create(s_slot);
-    lv_obj_set_pos(s_slot_grid, 164, 68);
+    lv_obj_set_pos(s_slot_grid, 144, 68);
     // Height shaved from 210 → 170 to make room for the import-button row
     // (button on the left, notice text on the right) under both columns
     // before the bottom note label.
-    lv_obj_set_size(s_slot_grid, 304, 170);
+    lv_obj_set_size(s_slot_grid, 324, 170);
     lv_obj_set_style_bg_color(s_slot_grid, COL_CARD, 0);
     lv_obj_set_style_bg_opa(s_slot_grid, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(s_slot_grid, COL_BORDER, 0);
@@ -1240,7 +1240,7 @@ static void build_slot_detail() {
     // the LCD. Hidden by ui_show_slot_detail when no spool is mapped to
     // the slot (firmware import helper would 409 anyway).
     s_slot_import_btn = lv_btn_create(s_slot);
-    lv_obj_set_pos(s_slot_import_btn, 164, 244);
+    lv_obj_set_pos(s_slot_import_btn, 144, 244);
     lv_obj_set_size(s_slot_import_btn, 140, 46);
     lv_obj_set_style_radius(s_slot_import_btn, 8, 0);
     lv_obj_set_style_bg_color(s_slot_import_btn, COL_INPUT, 0);
@@ -1250,7 +1250,7 @@ static void build_slot_detail() {
         if (s_slot_import_cb) s_slot_import_cb();
     }, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* importLbl = lv_label_create(s_slot_import_btn);
-    lv_label_set_text(importLbl, LV_SYMBOL_DOWNLOAD "  Import");
+    lv_label_set_text(importLbl, LV_SYMBOL_DOWN "  Import");
     lv_obj_set_style_text_color(importLbl, COL_TEXT, 0);
     lv_obj_set_style_text_font(importLbl, &spoolhard_mont_16, 0);
     lv_obj_center(importLbl);
@@ -1259,8 +1259,8 @@ static void build_slot_detail() {
     // ui_slot_detail_set_import_notice from main.cpp after the helper
     // runs. Two-line wrap so "Imported 4 fields: …" can spell out which.
     s_slot_import_notice = make_label(s_slot, "", COL_TEXT_MUTED, &spoolhard_mont_16);
-    lv_obj_align(s_slot_import_notice, LV_ALIGN_TOP_LEFT, 312, 246);
-    lv_obj_set_size(s_slot_import_notice, 156, 40);
+    lv_obj_align(s_slot_import_notice, LV_ALIGN_TOP_LEFT, 292, 246);
+    lv_obj_set_size(s_slot_import_notice, 176, 40);
     lv_label_set_long_mode(s_slot_import_notice, LV_LABEL_LONG_WRAP);
 
     // Note line at the very bottom, spans full width.
@@ -2463,7 +2463,7 @@ static void _slot_row(const char* key, const char* value) {
     lv_label_set_text(k, key);
     lv_obj_set_style_text_color(k, COL_TEXT_MUTED, 0);
     lv_obj_set_style_text_font(k, &spoolhard_mont_16, 0);
-    lv_obj_set_width(k, 118);
+    lv_obj_set_width(k, 104);
 
     lv_obj_t* v = lv_label_create(row);
     lv_label_set_text(v, value && *value ? value : "—");
@@ -2595,7 +2595,7 @@ void ui_show_slot_detail(const UiSlotDetail* d) {
             _slot_row("Weights", buf);
         }
         if (d->density > 0.f) {
-            snprintf(buf, sizeof(buf), "%.2f g/cm\xc2\xb3", (double)d->density);
+            snprintf(buf, sizeof(buf), "%.2f g/cm3", (double)d->density);
             _slot_row("Density", buf);
         }
         if (d->color_name[0]) _slot_row("Colour",  d->color_name);
