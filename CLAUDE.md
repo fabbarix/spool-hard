@@ -317,7 +317,7 @@ The console's own PN532 (`console/firmware/src/nfc_reader.cpp`) runs in a
 dedicated `nfc_task` (4 KB internal stack, core 1, prio 2, 200 ms poll). The
 task is the sole PN532/SPI user (the console never writes/erases tags),
 debounces by UID BEFORE any page reads (a held tag yields exactly one event;
-removal for ~600 ms re-arms), reads NTAG pages 4..19 as 4 x 16-byte READs, and
+removal (8 empty polls, ~2 s; held NTAGs are presence-pinged with a page-3 READ because an ACTIVE tag ignores REQA) re-arms), reads NTAG pages 4..19 as 4 x 16-byte READs, and
 posts POD events (char buffers, no Strings) to a 4-deep queue. `NfcReader::update()`
 on loopTask drains the queue and fires the callback (LVGL/store access stays
 on loopTask). `[NFC]` log lines carry polls/pageReads/events counters.
