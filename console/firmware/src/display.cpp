@@ -247,6 +247,7 @@ enum : uint8_t { SN_IDLE, SN_CAPTURING, SN_READY, SN_STREAMING, SN_FAILED };
 static std::atomic<uint8_t> s_snap_state{SN_IDLE};
 static lv_draw_buf_t*       s_snap_buf = nullptr;
 static volatile uint32_t    s_snap_ts  = 0;
+static std::atomic<uint32_t> s_snap_gen{0};   // bumped per claimed stream
 static constexpr uint32_t   SNAP_STALE_MS = 30000;
 
 static void snap_free() {
@@ -272,6 +273,7 @@ ConsoleDisplay::SnapStatus ConsoleDisplay::snapshotRequest() {
     case SN_READY:
         if (millis() - s_snap_ts < SNAP_STALE_MS) {
             s_snap_ts = millis();
+            s_snap_gen.fetch_add(1);
             s_snap_state.store(SN_STREAMING);
             return SNAP_READY;
         }
@@ -291,8 +293,20 @@ ConsoleDisplay::SnapStatus ConsoleDisplay::snapshotRequest() {
     return SNAP_PENDING;
 }
 
-void ConsoleDisplay::snapshotAbort() {
-    if (s_snap_state.load() == SN_STREAMING) snap_free();
+void ConsoleDisplay::snapshotAbort(uint32_t gen) {
+    if (gen == s_snap_gen.load() && s_snap_state.load() == SN_STREAMING) snap_free();
+}
+
+uint32_t ConsoleDisplay::snapshotGeneration() { return s_snap_gen.load(); }
+
+void ConsoleDisplay::snapshotRelease() {
+    uint8_t st = s_snap_state.load();
+    if (st == SN_READY || st == SN_STREAMING) snap_free();
+}
+
+void ConsoleDisplay::snapshotSweep() {
+    uint8_t st = s_snap_state.load();
+    if ((st == SN_READY || st == SN_STREAMING) && millis() - s_snap_ts >= SNAP_STALE_MS) snap_free();
 }
 
 size_t ConsoleDisplay::snapshotFill(uint8_t* out, size_t maxLen, size_t index) {
@@ -331,6 +345,7 @@ static uint32_t tick_cb() { return millis(); }
 
 static void lvgl_task(void*) {
     for (;;) {
+        ConsoleDisplay::snapshotSweep();
         lv_lock();
         uint32_t t = lv_timer_handler();
         lv_unlock();

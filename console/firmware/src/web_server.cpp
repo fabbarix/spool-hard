@@ -1365,7 +1365,10 @@ void ConsoleWebServer::_setupRoutes() {
             // Only patch keys that are present — leaves other flags alone if
             // we add more later.
             if (body["log_ams"].is<bool>()) _logAmsRaw = body["log_ams"].as<bool>();
-            if (body["lcd_debug"].is<bool>()) _lcdDebug = body["lcd_debug"].as<bool>();
+            if (body["lcd_debug"].is<bool>()) {
+                _lcdDebug = body["lcd_debug"].as<bool>();
+                if (!_lcdDebug) ConsoleDisplay::snapshotRelease();
+            }
             JsonDocument resp; resp["log_ams"] = _logAmsRaw; resp["lcd_debug"] = _lcdDebug;
             String out; serializeJson(resp, out);
             req->send(200, "application/json", out);
@@ -1395,7 +1398,8 @@ void ConsoleWebServer::_setupRoutes() {
                 return ConsoleDisplay::snapshotFill(buf, maxLen, index);
             });
         resp->addHeader("Cache-Control", "no-store");
-        req->onDisconnect([]() { ConsoleDisplay::snapshotAbort(); });
+        const uint32_t gen = ConsoleDisplay::snapshotGeneration();
+        req->onDisconnect([gen]() { ConsoleDisplay::snapshotAbort(gen); });
         req->send(resp);
     });
     _server.on(AsyncURIMatcher::exact("/api/debug/lcd/touch"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
