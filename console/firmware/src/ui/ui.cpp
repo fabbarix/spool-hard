@@ -1089,7 +1089,7 @@ static void build_devcfg() {
     const int chipW = 72, chipGap = 4;
     for (int i = 0; i < 6; i++) {
         lv_obj_t* chip = lv_btn_create(s_devcfg_set_cont);
-        lv_obj_set_size(chip, chipW, 40);
+        lv_obj_set_size(chip, chipW, 44);
         lv_obj_set_pos(chip, i * (chipW + chipGap), 22);
         lv_obj_set_style_radius(chip, 8, 0);
         lv_obj_set_style_bg_color(chip, COL_CARD, 0);
@@ -1230,9 +1230,9 @@ static void build_slot_detail() {
     lv_obj_set_style_border_color(s_slot_grid, COL_BORDER, 0);
     lv_obj_set_style_border_width(s_slot_grid, 1, 0);
     lv_obj_set_style_radius(s_slot_grid, 8, 0);
-    lv_obj_set_style_pad_all(s_slot_grid, 10, 0);
+    lv_obj_set_style_pad_all(s_slot_grid, 6, 0);
     lv_obj_set_flex_flow(s_slot_grid, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(s_slot_grid, 4, 0);
+    lv_obj_set_style_pad_row(s_slot_grid, 2, 0);
 
     // "Import from printer" button — sits in the strip under the right
     // grid (which was shortened above). Mirrors the web AmsSlotPicker's
@@ -2524,7 +2524,9 @@ void ui_show_slot_detail(const UiSlotDetail* d) {
     char wsub[64];
     if (d->has_spool && d->weight_current_g >= 0) {
         snprintf(wbuf, sizeof(wbuf), "%d g", (int)d->weight_current_g);
-    } else if (d->remain_pct >= 0) {
+    } else if (!d->has_spool && !d->material[0] && d->color_rgb == 0) {
+        snprintf(wbuf, sizeof(wbuf), "Empty");
+    } else if (d->remain_pct > 0) {
         snprintf(wbuf, sizeof(wbuf), "~%d%%", (int)d->remain_pct);
     } else {
         snprintf(wbuf, sizeof(wbuf), "—");
@@ -2586,12 +2588,16 @@ void ui_show_slot_detail(const UiSlotDetail* d) {
     // SpoolRecord-side — only when a record is mapped.
     if (d->has_spool) {
         if (d->weight_core_g > 0 || d->weight_advertised_g > 0 || d->weight_new_g > 0) {
-            char aw[16] = "—", cw[16] = "—", nw[16] = "—";
-            if (d->weight_advertised_g > 0) snprintf(aw, sizeof(aw), "%dg", (int)d->weight_advertised_g);
-            if (d->weight_core_g       > 0) snprintf(cw, sizeof(cw), "%dg", (int)d->weight_core_g);
-            if (d->weight_new_g        > 0) snprintf(nw, sizeof(nw), "%dg", (int)d->weight_new_g);
-            snprintf(buf, sizeof(buf), "adv %s %s core %s %s new %s",
-                     aw, LV_SYMBOL_BULLET, cw, LV_SYMBOL_BULLET, nw);
+            // Only known parts, comma separated: "adv 1000g, core 210g".
+            buf[0] = 0;
+            auto add = [&](const char* lbl, int v) {
+                if (v <= 0) return;
+                size_t n = strlen(buf);
+                snprintf(buf + n, sizeof(buf) - n, "%s%s %dg", n ? ", " : "", lbl, v);
+            };
+            add("adv", (int)d->weight_advertised_g);
+            add("core", (int)d->weight_core_g);
+            add("new", (int)d->weight_new_g);
             _slot_row("Weights", buf);
         }
         if (d->density > 0.f) {
@@ -2603,7 +2609,8 @@ void ui_show_slot_detail(const UiSlotDetail* d) {
         else if (d->ams_tray_info_idx[0]) _slot_row("Filament ID", d->ams_tray_info_idx);
         if (d->spool_tag_id[0]) _slot_row("Tag", d->spool_tag_id);
         else if (d->tag_uid[0]) _slot_row("Tag UID", d->tag_uid);
-        if (d->spool_id[0])     _slot_row("Spool ID", d->spool_id);
+        if (d->spool_id[0] && strcmp(d->spool_id, d->spool_tag_id) != 0)
+            _slot_row("Spool ID", d->spool_id);   // skip when identical to Tag
     } else {
         // No record: surface the raw AMS metadata so the user knows what
         // the printer itself thinks is in the slot.
