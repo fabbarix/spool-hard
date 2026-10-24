@@ -11,6 +11,7 @@ import {
   type AmsUnit,
   type GcodeAnalysis,
   type Printer,
+  useClaimPendingSpool,
 } from '../../hooks/usePrinters';
 import { useSpools, type SpoolRecord } from '../../hooks/useSpools';
 import { useUserFilaments, type UserFilament } from '../../hooks/useUserFilaments';
@@ -189,6 +190,8 @@ function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds, libr
                     librariesReady={librariesReady}
                     label="External"
                     external
+                    pendingSpool={p.pending_spool_id ? spoolById.get(p.pending_spool_id) : undefined}
+                    pendingSpoolId={p.pending_spool_id}
                   />
                 </div>
               )}
@@ -327,7 +330,7 @@ function DryingChip({ d }: { d: NonNullable<AmsUnit['drying']> }) {
   );
 }
 
-function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, stockFilamentIds, librariesReady, label, external }: {
+function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, stockFilamentIds, librariesReady, label, external, pendingSpool, pendingSpoolId }: {
   t: AmsTray;
   active: boolean;
   serial: string;
@@ -338,7 +341,11 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
   librariesReady: boolean;
   label: string;
   external?: boolean;
+  // Scanned spool waiting for a destination (external card only).
+  pendingSpool?: SpoolRecord | undefined;
+  pendingSpoolId?: string | undefined;
 }) {
+  const claim = useClaimPendingSpool();
   const [picking, setPicking] = useState(false);
   const [linking, setLinking] = useState(false);
   // "Unmatched preset" = the AMS reports a non-empty tray_info_idx that
@@ -501,11 +508,28 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
           Link <span className="text-text-primary">{t.tray_info_idx}</span> to a filament…
         </button>
       )}
+      {external && pendingSpoolId && (
+        <div className="mt-1">
+          <button
+            type="button"
+            disabled={claim.isPending}
+            onClick={() => claim.mutate({ serial, ams_unit: 254, slot_id: 0 })}
+            className="text-[11px] text-brand-400 hover:text-brand-300 inline-flex items-center gap-1 truncate disabled:opacity-50"
+            title="A spool was scanned on the console. Assign it to the external holder (sets the mapping and pushes its filament settings to the printer)."
+          >
+            <Pin size={10} />
+            Assign scanned spool{pendingSpool ? ` (${[pendingSpool.brand, pendingSpool.material_type, pendingSpool.color_name].filter(Boolean).join(' ')})` : ''} to External
+          </button>
+          {claim.isError && <div className="text-[10px] text-red-400">{claim.error.message}</div>}
+        </div>
+      )}
       {picking && (
         <AmsSlotPicker
           serial={serial}
           amsUnit={amsUnit}
-          slotId={t.id}
+          // The external holder is always slot 0 (its tray id, 254, is NOT a
+          // slot) -- the firmware keys the override as "254:0".
+          slotId={external ? 0 : t.id}
           currentSpoolId={t.spool_id}
           isOverride={t.spool_override}
           onClose={() => setPicking(false)}

@@ -413,6 +413,16 @@ void BambuPrinter::requestFullStatus() {
 
 void BambuPrinter::loop() {
     _ensureConnected();
+    // Explicit "assign scanned spool" request from the web (claim-pending).
+    {
+        int req = _claimReq.exchange(-1);
+        if (req >= 0) {
+            bool ok = _maybeAssignPendingSpool(req >> 8, req & 0xFF);
+            Serial.printf("[Bambu %s] explicit claim-pending AMS %d slot %d -> %s\n",
+                          _cfg.serial.c_str(), req >> 8, req & 0xFF,
+                          ok ? "assigned" : "nothing pending");
+        }
+    }
     // Skip _mqtt->loop() while the connect task owns _mqtt; PubSubClient
     // and WiFiClientSecure are not safe to read from the main loop while
     // mbedtls is in the middle of a handshake on the task.
@@ -1011,15 +1021,20 @@ void BambuPrinter::_parseAms(const JsonObjectConst& amsObj, PrinterState& out) {
     for (; u < 4; ++u) out.ams[u] = AmsUnit{};
 }
 
-void BambuPrinter::_maybeAssignPendingSpool(int ams_unit, int slot_id) {
+bool BambuPrinter::requestClaimPending(int ams_unit, int slot_id) {
+    int expected = -1;
+    return _claimReq.compare_exchange_strong(expected, (ams_unit << 8) | (slot_id & 0xFF));
+}
+
+bool BambuPrinter::_maybeAssignPendingSpool(int ams_unit, int slot_id) {
     String spool_id;
-    if (!PendingAms::claim(spool_id)) return;   // nothing armed, or already claimed by another printer
+    if (!PendingAms::claim(spool_id)) return false;   // nothing armed, or already claimed by another printer
 
     SpoolRecord rec;
     if (!g_store.findById(spool_id, rec)) {
         Serial.printf("[Bambu %s] pending spool %s vanished -- skip push\n",
                       _cfg.serial.c_str(), spool_id.c_str());
-        return;
+        return false;
     }
 
     Serial.printf("[Bambu %s] pending spool %s -> AMS %d slot %d\n",
@@ -1064,6 +1079,7 @@ void BambuPrinter::_maybeAssignPendingSpool(int ams_unit, int slot_id) {
                           _cfg.name.length() ? _cfg.name : _cfg.serial,
                           ams_unit, slot_id);
     }
+    return true;
 }
 
 void BambuPrinter::_syncSpoolToPrinter(int ams_unit, int slot_id, const AmsTray& tr) {

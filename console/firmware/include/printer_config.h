@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <vector>
 #include "config.h"
+#include "ams_slot.h"
 
 // One Bambu Lab printer the console is paired with.
 struct PrinterConfig {
@@ -27,6 +28,10 @@ struct PrinterConfig {
     // Set or clear (when spool_id is empty) an override for a slot. Mutates
     // `ams_overrides_json` in place; caller must save() to persist.
     void   setAmsOverride(int ams_unit, int slot_id, const String& spool_id);
+    // Rewrite legacy external-tray keys ("254:254", "255:255", "255:0" ...)
+    // to the canonical "254:0". An existing "254:0" wins (the stray key is
+    // dropped). Returns true if the table changed (caller must save()).
+    bool   migrateAmsOverrides();
 };
 
 // List of configured printers (hard cap BAMBU_MAX_PRINTERS = 5).

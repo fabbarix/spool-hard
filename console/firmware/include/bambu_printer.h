@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
@@ -218,6 +219,13 @@ public:
 
     void updateConfig(const PrinterConfig& cfg);
 
+    // Queue an explicit PendingAms claim for (ams_unit, slot_id) -- used by the
+    // web "assign scanned spool" action. Thread-safe (called from AsyncTCP);
+    // loop() consumes it on loopTask and runs _maybeAssignPendingSpool, i.e.
+    // the identical path the empty->populated auto-claim uses. Returns false
+    // if a previous request is still queued.
+    bool requestClaimPending(int ams_unit, int slot_id);
+
     // Fetch `path` from the printer over FTPS, stream-extract the first .gcode
     // entry from the 3MF, and run it through GCodeAnalyzer. Blocks the caller.
     // Default path targets the current print job. Returns false on transport
@@ -324,6 +332,8 @@ private:
     // holder before resolution so the sticky override can be dropped.
     String _lastVtSignature;
     bool   _vtSignatureSeen = false;
+    // Packed (ams_unit << 8 | slot_id) explicit claim request, -1 = none.
+    std::atomic<int> _claimReq{-1};
 
     // Set once the printer has reported `device.extruder.info[].snow`
     // (H2-series). From then on that's the authoritative active-slot
@@ -384,7 +394,7 @@ private:
     // empty/populated transition on the slot signature. Also sets a manual
     // AMS override so subsequent print-consumption accounting maps the slot
     // to the right spool without needing a second NFC/RFID read.
-    void _maybeAssignPendingSpool(int ams_unit, int slot_id);
+    bool _maybeAssignPendingSpool(int ams_unit, int slot_id);
     void _pushAmsFilamentSetting(int ams_unit, int slot_id, const class SpoolRecord& rec);
     // If the resolved spool mapping for this slot changed to a new non-empty
     // id since the last tick, push the spool's definition (color / material /

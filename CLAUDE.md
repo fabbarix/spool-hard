@@ -300,3 +300,20 @@ enum lives at `*/firmware/src/protocol.h`").
 - Console manual OTA (`g_pendingOta`) now uses `otaTaskSpawn` like the scale.
   The progress callback only writes atomics; `loop()` renders LVGL and
   detects failure (task exit). Same 50 KB internal-DRAM gate as the checker.
+
+## Console AMS override keys + scanned-spool claim
+
+- `PrinterConfig::ams_overrides_json` keys are `"<ams_unit>:<slot_id>"`. The
+  external holder is ALWAYS `"254:0"` (its tray id 254 is NOT a slot). Real AMS
+  is `0..3:0..3`. `ams_slot.h::normalizeAmsSlot` enforces this in the
+  `ams-mapping`, `import-ams-spool` and `claim-pending` endpoints (254/255 ->
+  254:0, other out-of-range -> 400). `PrinterConfig::migrateAmsOverrides()` runs
+  on load and rewrites legacy `254:254`/`255:255` keys to `254:0`.
+  Host test: `console/firmware/test/host/test_ams_slot.cpp` (g++ one-liner in header).
+- PendingAms auto-claim only fires on an empty->populated tray transition, which
+  never happens on the H2S external holder. `POST /api/printers/<serial>/claim-pending`
+  `{ams_unit, slot_id}` queues an explicit claim (atomic in BambuPrinter,
+  consumed in `loop()` on loopTask -> same `_maybeAssignPendingSpool` path).
+  `/api/printers` rows carry `pending_spool_id` while a scanned spool is armed;
+  the dashboard external card shows "Assign scanned spool ... to External".
+  No LCD destination-choice step (ui.cpp has no small, safe place for it).

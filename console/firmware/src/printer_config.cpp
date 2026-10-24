@@ -73,6 +73,30 @@ void PrinterConfig::setAmsOverride(int ams_unit, int slot_id, const String& spoo
     serializeJson(d, ams_overrides_json);
 }
 
+bool PrinterConfig::migrateAmsOverrides() {
+    if (ams_overrides_json.isEmpty()) return false;
+    JsonDocument d;
+    if (deserializeJson(d, ams_overrides_json)) return false;
+    JsonObject o = d.as<JsonObject>();
+    if (o.isNull()) return false;
+    // Collect first, mutate after -- don't modify the object while iterating.
+    std::vector<String> stray;
+    for (JsonPair kv : o) {
+        int u = -1, s = -1;
+        if (sscanf(kv.key().c_str(), "%d:%d", &u, &s) != 2) continue;
+        if ((u == 254 || u == 255) && !(u == 254 && s == 0)) stray.push_back(kv.key().c_str());
+    }
+    if (stray.empty()) return false;
+    for (const String& k : stray) {
+        String v = o[k.c_str()].as<String>();
+        o.remove(k.c_str());
+        if (!o["254:0"].is<const char*>() && v.length()) o["254:0"] = v;
+    }
+    ams_overrides_json = "";
+    if (o.size()) serializeJson(d, ams_overrides_json);
+    return true;
+}
+
 void PrintersConfig::load() {
     _list.clear();
     Preferences prefs;
@@ -86,12 +110,20 @@ void PrintersConfig::load() {
         Serial.println("[Printers] NVS blob invalid, starting empty");
         return;
     }
+    bool migrated = false;
     for (JsonVariant v : doc.as<JsonArray>()) {
         PrinterConfig p;
         JsonDocument d;
         d.set(v);
-        if (p.fromJson(d)) _list.push_back(std::move(p));
+        if (!p.fromJson(d)) continue;
+        if (p.migrateAmsOverrides()) {
+            Serial.printf("[Printers] %s: migrated legacy external ams-override key to 254:0\n",
+                          p.serial.c_str());
+            migrated = true;
+        }
+        _list.push_back(std::move(p));
     }
+    if (migrated) save();
     Serial.printf("[Printers] Loaded %u printer(s) from NVS\n", (unsigned)_list.size());
 }
 

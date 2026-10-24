@@ -23,6 +23,7 @@
 #include "quick_weights.h"
 #include "sdcard.h"
 #include "printer_config.h"
+#include "pending_ams.h"
 #include "bambu_manager.h"
 #include "bambu_cloud.h"
 #include "bambu_discovery.h"
@@ -819,6 +820,12 @@ void ConsoleWebServer::_setupRoutes() {
         [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
             if (!_requireAuth(req)) return;
             _handlePrinterAmsMappingPost(req, data, len);
+        });
+    spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/claim-pending", false, false,
+        [](AsyncWebServerRequest*) {},
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+            if (!_requireAuth(req)) return;
+            _handlePrinterClaimPending(req, data, len);
         });
     spoolhard::addPathRoute(_server, HTTP_POST, "/api/printers/", "/import-ams-spool", false, false,
         [](AsyncWebServerRequest*) {},
@@ -2995,6 +3002,13 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
         // External spool holder — sibling of `ams`, not an extra AMS unit.
         writeTray(st["vt_tray"].to<JsonObject>(), s.vt_tray);
     }
+    // A scanned spool is armed and waiting for a destination (see
+    // POST /api/printers/<serial>/claim-pending). Only meaningful while the
+    // printer link is up -- the claim publishes over MQTT.
+    if (s.link == BambuLinkState::Connected) {
+        String pend = PendingAms::peek();
+        if (pend.length()) out["pending_spool_id"] = pend;
+    }
 }
 
 void ConsoleWebServer::_handlePrintersList(AsyncWebServerRequest* req) {
@@ -3183,6 +3197,13 @@ void ConsoleWebServer::_handlePrinterAmsMappingPost(AsyncWebServerRequest* req,
     }
     int ams_unit = doc["ams_unit"];
     int slot_id  = doc["slot_id"];
+    // External holder -> (254, 0) whatever slot the client sent (legacy
+    // dashboards sent slot_id = 254); anything else out of range is a 400.
+    if (!normalizeAmsSlot(ams_unit, slot_id)) {
+        req->send(400, "application/json",
+                  "{\"error\":\"ams_unit 0..3 with slot_id 0..3, or ams_unit 254 (external, slot 0)\"}");
+        return;
+    }
     // spool_id: empty string (or missing / null) clears the override for
     // that slot; any other value sets it.
     String spool_id = doc["spool_id"] | "";
@@ -3209,6 +3230,60 @@ void ConsoleWebServer::_handlePrinterAmsMappingPost(AsyncWebServerRequest* req,
     }
 
     req->send(200, "application/json", "{\"ok\":true}");
+}
+
+// Explicitly assign the scanned ("pending") spool to a chosen slot, for
+// printers (H2S external holder) whose tray never goes empty -> populated so
+// the auto-claim can't fire. Body: {"ams_unit": 0..3|254, "slot_id": 0..3|0}.
+// Only validates + queues; BambuPrinter::loop() (loopTask) runs the exact
+// same _maybeAssignPendingSpool path as the auto-claim, so the MQTT publish
+// never happens from the AsyncTCP task.
+void ConsoleWebServer::_handlePrinterClaimPending(AsyncWebServerRequest* req,
+                                                  uint8_t* data, size_t len) {
+    String serial = spoolhard::pathArg(req, "/api/printers/", "/claim-pending", false);
+    BambuPrinter* p = g_bambu.find(serial);
+    if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
+    JsonDocument doc;
+    if (deserializeJson(doc, data, len)) {
+        req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+        return;
+    }
+    if (!doc["ams_unit"].is<int>() || !doc["slot_id"].is<int>()) {
+        req->send(400, "application/json", "{\"error\":\"ams_unit and slot_id (int) required\"}");
+        return;
+    }
+    int ams_unit = doc["ams_unit"];
+    int slot_id  = doc["slot_id"];
+    if (!normalizeAmsSlot(ams_unit, slot_id)) {
+        req->send(400, "application/json",
+                  "{\"error\":\"ams_unit 0..3 with slot_id 0..3, or ams_unit 254 (external, slot 0)\"}");
+        return;
+    }
+    const PrinterState& s = p->state();
+    if (s.link != BambuLinkState::Connected) {
+        req->send(409, "application/json", "{\"error\":\"printer not connected\"}");
+        return;
+    }
+    if (ams_unit == 254 ? !s.has_vt_tray : ams_unit >= s.ams_count) {
+        req->send(404, "application/json", "{\"error\":\"no such tray on this printer\"}");
+        return;
+    }
+    String pending = PendingAms::peek();
+    if (pending.isEmpty()) {
+        req->send(409, "application/json",
+                  "{\"error\":\"no scanned spool pending -- scan a tag first\"}");
+        return;
+    }
+    if (!p->requestClaimPending(ams_unit, slot_id)) {
+        req->send(409, "application/json", "{\"error\":\"another claim is already queued\"}");
+        return;
+    }
+    JsonDocument resp;
+    resp["ok"]       = true;
+    resp["queued"]   = true;
+    resp["spool_id"] = pending;
+    String out; serializeJson(resp, out);
+    req->send(202, "application/json", out);
 }
 
 // Adopt the AMS-reported filament info onto the SpoolRecord currently
@@ -3238,6 +3313,13 @@ void ConsoleWebServer::_handlePrinterImportAmsSpool(AsyncWebServerRequest* req,
     }
     int ams_unit = doc["ams_unit"];
     int slot_id  = doc["slot_id"];
+    // External holder -> (254, 0) whatever slot the client sent (legacy
+    // dashboards sent slot_id = 254); anything else out of range is a 400.
+    if (!normalizeAmsSlot(ams_unit, slot_id)) {
+        req->send(400, "application/json",
+                  "{\"error\":\"ams_unit 0..3 with slot_id 0..3, or ams_unit 254 (external, slot 0)\"}");
+        return;
+    }
 
     const PrinterState& s = p->state();
     const AmsTray* tr = nullptr;
