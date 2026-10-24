@@ -97,6 +97,21 @@ export function DebugSection() {
         />
       </div>
 
+      <div className="flex items-start justify-between gap-4 pt-3">
+        <div>
+          <div className="text-sm text-text-primary">NFC debug endpoint</div>
+          <div className="text-xs text-text-muted mt-0.5">
+            Enables <span className="font-mono">GET /api/debug/nfc</span>: raw reads, ATQA/SAK
+            and NDEF header decode for the last tag the console reader saw. Off on every boot.
+          </div>
+        </div>
+        <Toggle
+          on={!!cfg?.nfc_debug}
+          disabled={isLoading || update.isPending}
+          onClick={() => update.mutate({ nfc_debug: !cfg?.nfc_debug })}
+        />
+      </div>
+
       <div className="flex items-center justify-between pt-3">
         <div className="text-xs text-text-muted">
           {entries.length} {entries.length === 1 ? 'entry' : 'entries'}

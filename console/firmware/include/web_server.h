@@ -296,6 +296,8 @@ public:
     // a function call. When enabled, the producer forwards the raw JSON to
     // the /ws debug channel — the Config → Debug UI subscribes and renders.
     bool _logAmsRaw = false;
+    // Gates GET /api/debug/nfc (read-only dump of the last detected tag).
+    bool _nfcDebug = false;
 };
 
 extern ConsoleWebServer g_web;   // defined in main.cpp

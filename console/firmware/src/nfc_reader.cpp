@@ -24,7 +24,12 @@ static constexpr uint32_t kPollMs       = 200;
 static constexpr uint8_t  kRemovedMisses = 8;
 static constexpr uint8_t  kEvqDepth      = 4;
 
+NfcReader* NfcReader::s_instance = nullptr;
+
 void NfcReader::begin() {
+    s_instance = this;
+    memset(&_dbgWork, 0, sizeof(_dbgWork));
+    memset(&_dbgPub, 0, sizeof(_dbgPub));
     pinMode(PN532_IRQ_PIN, INPUT_PULLUP);
 
     // Dedicated SPI bus so we don't interfere with anything else.
@@ -102,6 +107,9 @@ void NfcReader::_pollStep() {
         if (_present && ++_misses >= kRemovedMisses) {
             _present = false;
             _lastUid[0] = 0;
+            _dbgWork.present = false;
+            _dbgWork.removedMs = millis();
+            _dbgPublish();
             _unreadUid[0] = 0;   // logged removal: a re-tap must always raise a new event
             Serial.printf("[NFC] tag removed, re-armed (polls=%u pings=%u pageReads=%u events=%u)\n",
                           (unsigned)_polls.load(), (unsigned)_pings.load(),
@@ -144,10 +152,23 @@ void NfcReader::_pollStep() {
     _readable = false;
     strncpy(_lastUid, ev.uid, sizeof(_lastUid) - 1);
 
+    _dbgWork.nReads = 0; _dbgWork.path = 0; _dbgWork.rawLen = 0;
+    memset(_dbgWork.raw, 0, sizeof(_dbgWork.raw));
     if (uidLen == 7) {
         _readable = _readNdefUrl(ev.url, sizeof(ev.url));
         if (!_readable) strncpy(_unreadUid, ev.uid, sizeof(_unreadUid) - 1);
     }
+    _dbgWork.valid     = true;
+    _dbgWork.present   = true;
+    _dbgWork.readable  = _readable;
+    _dbgWork.uidLen    = uidLen;
+    _dbgWork.sak       = sak;
+    _dbgWork.atqa      = atqa;
+    _dbgWork.detectMs  = nowMs;
+    _dbgWork.removedMs = 0;
+    strncpy(_dbgWork.uid, ev.uid, sizeof(_dbgWork.uid) - 1);
+    strncpy(_dbgWork.url, ev.url, sizeof(_dbgWork.url) - 1);
+    _dbgPublish();
 
     _events.fetch_add(1);
     Serial.printf("[NFC] new tag %s uidLen=%u sak=0x%02X atqa=0x%04X readable=%d url=%s (polls=%u pings=%u pageReads=%u events=%u stackHWM=%u)\n",
@@ -173,6 +194,15 @@ bool NfcReader::_readNdefUrl(char* out, size_t outLen) {
     uint8_t raw[64];
     size_t have = 0;
     bool first = true;
+    _dbgWork.nReads = 0;
+    _dbgWork.path   = 0;
+    auto rec = [this](uint8_t page, bool ok, const uint8_t* d, uint8_t len) {
+        if (_dbgWork.nReads >= 16) return;
+        DebugRead& r = _dbgWork.reads[_dbgWork.nReads++];
+        r.page = page; r.ok = ok; r.len = ok ? len : 0;
+        memset(r.raw, 0, sizeof(r.raw));
+        if (ok) memcpy(r.raw, d, len);
+    };
     // Root cause of "first READ failed": Adafruit_PN532::inDataExchange() uses
     // its private _inListedTag as the InDataExchange target number, and that
     // is only set by inListPassiveTarget() -- NOT by readPassiveTargetID().
@@ -185,12 +215,14 @@ bool NfcReader::_readNdefUrl(char* out, size_t outLen) {
         uint8_t rlen = sizeof(resp);
         _pageReads.fetch_add(1);
         if (!_pn->inDataExchange(cmd, 2, resp, &rlen) || rlen < 16) {
+            rec(page, false, nullptr, 0);
             if (first)
                 Serial.printf("[NFC] batch READ p%u failed (listed=%d rlen=%u)\n",
                               (unsigned)page, (int)listed, (unsigned)rlen);
             break;
         }
         first = false;
+        rec(page, true, resp, 16);
         memcpy(raw + have, resp, 16);
         have += 16;
     }
@@ -200,7 +232,8 @@ bool NfcReader::_readNdefUrl(char* out, size_t outLen) {
         for (uint8_t page = 4; page < 20; page++) {
             uint8_t b[4];
             _pageReads.fetch_add(1);
-            if (!_pn->ntag2xx_ReadPage(page, b)) break;
+            if (!_pn->ntag2xx_ReadPage(page, b)) { rec(page, false, nullptr, 0); break; }
+            rec(page, true, b, 4);
             memcpy(raw + have, b, 4);
             have += 4;
             first = false;
@@ -213,6 +246,10 @@ bool NfcReader::_readNdefUrl(char* out, size_t outLen) {
                   have > 3 ? raw[3] : 0, have > 4 ? raw[4] : 0, have > 5 ? raw[5] : 0,
                   have > 6 ? raw[6] : 0, have > 7 ? raw[7] : 0,
                   first ? " (first READ failed: unreadable)" : "");
+    _dbgWork.path   = first ? 3 : (single ? 2 : 1);
+    _dbgWork.rawLen = have;
+    memset(_dbgWork.raw, 0, sizeof(_dbgWork.raw));
+    memcpy(_dbgWork.raw, raw, have);
     if (first) return false;
     const uint8_t* p = nullptr;
     static const char* const pats[2] = {"https://", "http://"};
@@ -229,4 +266,26 @@ bool NfcReader::_readNdefUrl(char* out, size_t outLen) {
         out[i] = 0;
     }
     return true;
+}
+
+// Single writer (nfc_task). Seqlock: odd while writing; readers retry.
+void NfcReader::_dbgPublish() {
+    uint32_t q = _dbgSeq.load(std::memory_order_relaxed);
+    _dbgSeq.store(q + 1, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    memcpy((void*)&_dbgPub, &_dbgWork, sizeof(_dbgWork));
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _dbgSeq.store(q + 2, std::memory_order_release);
+}
+
+bool NfcReader::debugSnapshot(DebugSnap& out) const {
+    for (int tries = 0; tries < 8; tries++) {
+        uint32_t a = _dbgSeq.load(std::memory_order_acquire);
+        if (a & 1) { vTaskDelay(1); continue; }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        memcpy(&out, (const void*)&_dbgPub, sizeof(out));
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (_dbgSeq.load(std::memory_order_acquire) == a) return true;
+    }
+    return false;
 }
