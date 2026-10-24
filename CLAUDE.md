@@ -120,7 +120,12 @@ the headers are `#include`d).
   product's `_backupSource()` is the single list of namespaces, mounts and
   skip rules used by both directions.
 - `spoolhard/ring_log.h` / `src/ring_log.cpp` — bounded in-RAM log ring
-  + `dlog(tag, fmt, ...)` printf-style helper. Backs `/api/logs`.
+  + `dlog(tag, fmt, ...)` printf-style helper. Backs `/api/logs`. Fixed
+  80 x 160-char slot ring allocated once (PSRAM if present, else one
+  internal block); `push(const char*, len)` and `Serial.printf` via the
+  mirror (192-byte stack buffer, truncates with `...`) never allocate.
+  `snapshot()` still returns Strings (read path only); `forEach()` is
+  the allocation-free iterator (runs under the ring mutex).
 - `spoolhard/serial_mirror.h` / `src/serial_mirror.cpp` — `Serial`
   macro override that mirrors every `Serial.print*` to the ring log.
   Include AFTER all framework + project headers in each TU.
