@@ -20,6 +20,8 @@
 #include "spoolhard/ota.h"
 #include "sdcard.h"
 #include "housekeeping.h"
+#include <lvgl.h>
+#include <freertos/semphr.h>
 #include "bambu_manager.h"
 #include "bambu_cloud.h"
 #include "bambu_discovery.h"
@@ -69,6 +71,7 @@ static bool    g_scaleOtaActive = false;
 static String   g_activeSpoolId;
 static uint32_t g_activeSpoolOpenedMs  = 0;
 static uint32_t g_activeSpoolExpiresAt = 0;  // millis: AMS-load timeout deadline
+static void _homeUiBegin();   // defined with the home-UI snapshot below
 static uint32_t g_spoolAutoCloseAt     = 0;  // millis: loop() should ui_show_home() when crossed
 static constexpr uint32_t SPOOL_AUTOCLOSE_MS = 2500;  // confirmation dwell after AMS assign
 
@@ -255,6 +258,7 @@ void setup() {
     // Display + LVGL (task is pinned to Core 1 inside begin()).
     g_display.begin();
     ui_init();
+    _homeUiBegin();   // lv_timer on the lvgl task applies the home-tile snapshot
     ui_show_splash();
 
     // Apply the persisted screen-sleep timeout (NVS, seconds). 0 = off.
@@ -1169,6 +1173,95 @@ static inline void _fnvS(uint32_t& h, const String& s) {
 }
 template <typename T> static inline void _fnvV(uint32_t& h, T v) { _fnv(h, &v, sizeof(v)); }
 
+// ── Home-UI snapshot (loopTask -> lvgl task) ──────────────────────────
+// loopTask still hashes state, decides WHEN a tile needs repainting and builds
+// the display values (it owns PrinterState / Strings / store lookups). It no
+// longer calls ui_set_* (which block on lv_lock while the lvgl task renders):
+// it publishes a fixed-size POD section here and an lv_timer on the lvgl task
+// applies it. Sections are independent (own seq) so a later publish of one
+// never clobbers an unapplied other. No Strings cross the task boundary.
+//
+// LOCKING: lv_timer callbacks run inside lv_timer_handler() with lv_lock held
+// (LV_USE_OS=FREERTOS -> recursive mutex), and every ui_set_* does its own
+// lv_lock()/lv_unlock() -> recursive re-entry, no deadlock. Order is
+// lv_lock -> s_homeMtx (leaf, memcpy only, never held across a ui_* call);
+// loopTask takes only s_homeMtx and never lv_lock here.
+struct HomeSnap {
+    char     devNames[100]; bool devShow;
+    char     host[64];      uint8_t wifiState;
+    char     ip[20];
+    bool     amsHas;        char status[48];
+    UiAmsSlot slots[5];     UiPrinterSnapshot psnap;
+    bool     otaShow;       char otaText[96];
+};
+enum { HS_DEV, HS_FOOT, HS_IP, HS_AMS, HS_OTA, HS_N };
+static HomeSnap                  s_hs = {};
+static std::atomic<uint32_t>     s_hsSeq[HS_N];       // bumped by loopTask
+static uint32_t                  s_hsApplied[HS_N];   // lvgl task only
+static SemaphoreHandle_t         s_homeMtx = nullptr;
+
+static inline void _hsPublishBegin() { xSemaphoreTake(s_homeMtx, portMAX_DELAY); }
+static inline void _hsPublishEnd(int sec) {
+    s_hsSeq[sec].fetch_add(1);
+    xSemaphoreGive(s_homeMtx);
+}
+
+// lv_timer callback (lvgl task, lv_lock already held).
+static void _homeUiTimerCb(lv_timer_t*) {
+    if (s_hsSeq[HS_DEV].load() != s_hsApplied[HS_DEV]) {
+        char names[sizeof(s_hs.devNames)]; bool show;
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_DEV] = s_hsSeq[HS_DEV].load();
+        memcpy(names, s_hs.devNames, sizeof(names)); show = s_hs.devShow;
+        xSemaphoreGive(s_homeMtx);
+        ui_set_dev_mode_warning(show ? names : nullptr);
+    }
+    if (s_hsSeq[HS_FOOT].load() != s_hsApplied[HS_FOOT]) {
+        char host[sizeof(s_hs.host)]; uint8_t ws;
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_FOOT] = s_hsSeq[HS_FOOT].load();
+        memcpy(host, s_hs.host, sizeof(host)); ws = s_hs.wifiState;
+        xSemaphoreGive(s_homeMtx);
+        ui_set_hostname(host, (wifi_lcd_state_t)ws);
+    }
+    if (s_hsSeq[HS_IP].load() != s_hsApplied[HS_IP]) {
+        char ip[sizeof(s_hs.ip)];
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_IP] = s_hsSeq[HS_IP].load();
+        memcpy(ip, s_hs.ip, sizeof(ip));
+        xSemaphoreGive(s_homeMtx);
+        ui_set_ip(ip);
+    }
+    if (s_hsSeq[HS_AMS].load() != s_hsApplied[HS_AMS]) {
+        bool has; char status[sizeof(s_hs.status)];
+        UiAmsSlot slots[5]; UiPrinterSnapshot ps;
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_AMS] = s_hsSeq[HS_AMS].load();
+        has = s_hs.amsHas;
+        memcpy(status, s_hs.status, sizeof(status));
+        memcpy(slots, s_hs.slots, sizeof(slots));
+        ps = s_hs.psnap;
+        xSemaphoreGive(s_homeMtx);
+        if (has) { ui_set_ams_panel(status, slots); ui_set_printer_panel(&ps); }
+        else     { ui_set_ams_panel(nullptr, nullptr); ui_set_printer_panel(nullptr); }
+    }
+    if (s_hsSeq[HS_OTA].load() != s_hsApplied[HS_OTA]) {
+        char text[sizeof(s_hs.otaText)]; bool show;
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_OTA] = s_hsSeq[HS_OTA].load();
+        memcpy(text, s_hs.otaText, sizeof(text)); show = s_hs.otaShow;
+        xSemaphoreGive(s_homeMtx);
+        ui_set_ota_banner(show, show ? text : nullptr);
+    }
+}
+// Call once after ui_init() (setup, loopTask).
+static void _homeUiBegin() {
+    s_homeMtx = xSemaphoreCreateMutex();
+    lv_lock();
+    lv_timer_create(_homeUiTimerCb, 100, nullptr);
+    lv_unlock();
+}
+
 static void _refreshHomeFooterImpl();
 static void _refreshHomeFooter() {
     static uint32_t s_lastHash = 0, s_lastMs = 0;
@@ -1202,14 +1295,19 @@ static void _refreshHomeFooterImpl() {
     host.toLowerCase();
     host.replace(' ', '-');
     if (host.length()) host += ".local";
-    ui_set_hostname(host.c_str(), wifi_state);
+    _hsPublishBegin();
+    snprintf(s_hs.host, sizeof(s_hs.host), "%s", host.c_str());
+    s_hs.wifiState = (uint8_t)wifi_state;
+    _hsPublishEnd(HS_FOOT);
 
     // IP only makes sense when the STA interface is up.
     if (WiFi.status() == WL_CONNECTED) {
         static String s_last_ip;
         String ip = WiFi.localIP().toString();
         if (ip != s_last_ip) {
-            ui_set_ip(ip.c_str());
+            _hsPublishBegin();
+            snprintf(s_hs.ip, sizeof(s_hs.ip), "%s", ip.c_str());
+            _hsPublishEnd(HS_IP);
             s_last_ip = ip;
         }
     }
@@ -1237,7 +1335,10 @@ static void _refreshDevModeWarning() {
     }
     if (names == s_last) return;
     s_last = names;
-    ui_set_dev_mode_warning(names.length() ? names.c_str() : nullptr);
+    _hsPublishBegin();
+    snprintf(s_hs.devNames, sizeof(s_hs.devNames), "%s", names.c_str());
+    s_hs.devShow = names.length() > 0;
+    _hsPublishEnd(HS_DEV);
 }
 
 static void _refreshHomeAmsPanelImpl();
@@ -1375,7 +1476,7 @@ static void _refreshHomeAmsPanelImpl() {
             snprintf(slots[4].label, sizeof(slots[4].label), "Ext");
         }
 
-        ui_set_ams_panel(status, slots);
+        // Published below together with the printer-card snapshot.
 
         // Build + push the printer-card snapshot so the LCD's new strip
         // above the AMS tiles shows link state, gcode state, progress bar,
@@ -1394,12 +1495,18 @@ static void _refreshHomeAmsPanelImpl() {
         // report populates both, so "either is positive" is a reliable
         // "we have real data" proxy.
         snap.has_temps    = (s.nozzle_temp > 0.f) || (s.bed_temp > 0.f);
-        ui_set_printer_panel(&snap);
+        _hsPublishBegin();
+        s_hs.amsHas = true;
+        snprintf(s_hs.status, sizeof(s_hs.status), "%s", status);
+        memcpy(s_hs.slots, slots, sizeof(slots));
+        s_hs.psnap = snap;
+        _hsPublishEnd(HS_AMS);
         return;
     }
     // No connected printer — hide both panels.
-    ui_set_ams_panel(nullptr, nullptr);
-    ui_set_printer_panel(nullptr);
+    _hsPublishBegin();
+    s_hs.amsHas = false;
+    _hsPublishEnd(HS_AMS);
 }
 
 // Combined OTA-pending banner refresh. Reads the console's own pending
@@ -1433,7 +1540,9 @@ static void _refreshOtaBannerImpl() {
     static String _lastText;
     if (!consolePending && !scalePending) {
         if (!_lastText.isEmpty()) {
-            ui_set_ota_banner(false, nullptr);
+            _hsPublishBegin();
+            s_hs.otaShow = false;
+            _hsPublishEnd(HS_OTA);
             _lastText = "";
         }
         return;
@@ -1449,7 +1558,10 @@ static void _refreshOtaBannerImpl() {
         text = "Scale "   + sp.firmware_latest + " ready - tap to install";
     }
     if (text != _lastText) {
-        ui_set_ota_banner(true, text.c_str());
+        _hsPublishBegin();
+        s_hs.otaShow = true;
+        snprintf(s_hs.otaText, sizeof(s_hs.otaText), "%s", text.c_str());
+        _hsPublishEnd(HS_OTA);
         _lastText = text;
     }
 }

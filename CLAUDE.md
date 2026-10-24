@@ -530,6 +530,19 @@ least every 5 s (`kLcdSafetyMs`) and on the first tick after screen wake
 (the hash is invalidated while asleep). `pushScaleLink()` from the 1 Hz
 block is a keep-alive only every 5 s (or immediately on a connect flip);
 `ScaleLink` still pushes on every event/handshake transition itself.
+
+**Home-UI snapshot (step 5)**: loopTask still hashes state and decides when a
+tile needs repainting, but no longer calls `ui_set_*` for the AMS/printer
+panel, footer (hostname/IP), dev-mode warning or OTA banner. It publishes
+fixed-size POD sections (`HomeSnap` in main.cpp, 5 independent sections each
+with an atomic seq, short leaf mutex `s_homeMtx`, no Strings) and a 100 ms
+`lv_timer` (`_homeUiTimerCb`, created in `_homeUiBegin()` after `ui_init()`)
+applies changed sections on the lvgl task. `lv_timer` callbacks run with
+`lv_lock` held; LV_USE_OS=FREERTOS makes it a recursive mutex, so the
+`lv_lock()` inside each `ui_set_*` re-enters safely. Lock order:
+`lv_lock` -> `s_homeMtx` (leaf; never held across a `ui_*` call; loopTask
+never takes lv_lock for these). Don't add store/SD/String work to the timer
+callback. The devcfg live push (`ui_set_devcfg_live`) is still on loopTask.
 ## Console global SD mutex (`SdLock`)
 
 `console/firmware/include/sdcard.h` + `src/sdcard.cpp`: a recursive FreeRTOS
