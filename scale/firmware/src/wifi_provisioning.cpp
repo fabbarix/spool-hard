@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include "spoolhard/psram_json_alloc.h"
 #include <WiFi.h>
+#include "spoolhard/wifi_util.h"
 #include <ESPmDNS.h>
 #include "ssdp_notify.h"
 #include "spoolhard/serial_mirror.h"
@@ -12,32 +13,6 @@
 #define AP_PREFIX           "SpoolHardScale-"
 
 // ── Public ───────────────────────────────────────────────────
-
-// Map a WIFI_REASON_* code to a short tag for the ring log. Diagnostic
-// only — full numeric value is also printed for cross-referencing the
-// ESP-IDF wifi_err_reason_t enum. Most-relevant for pinning:
-//   201 NO_AP_FOUND        — BSSID not seen during scan
-//   202 AUTH_FAIL          — password wrong (or AP rejected creds)
-//   203 ASSOC_FAIL         — AP refused association (band-steering!)
-//   204 HANDSHAKE_TIMEOUT  — WPA 4-way handshake timed out
-//     2 AUTH_EXPIRE        — auth timed out
-//     4 ASSOC_EXPIRE       — assoc timed out
-//   200 BEACON_TIMEOUT     — was associated, lost beacons
-//     8 ASSOC_LEAVE        — we initiated disconnect (e.g. WiFi.disconnect())
-static const char* _wifiReasonTag(uint8_t r) {
-    switch (r) {
-        case 2:   return "AUTH_EXPIRE";
-        case 4:   return "ASSOC_EXPIRE";
-        case 8:   return "ASSOC_LEAVE";
-        case 200: return "BEACON_TIMEOUT";
-        case 201: return "NO_AP_FOUND";
-        case 202: return "AUTH_FAIL";
-        case 203: return "ASSOC_FAIL";   // band-steering rejection lands here
-        case 204: return "HANDSHAKE_TIMEOUT";
-        case 205: return "CONNECTION_FAIL";
-        default:  return "OTHER";
-    }
-}
 
 void WifiProvisioning::begin(AsyncWebServer& server) {
     _server = &server;
@@ -50,46 +25,7 @@ void WifiProvisioning::begin(AsyncWebServer& server) {
     // (band-steering), the driver fires WIFI_EVENT_STA_DISCONNECTED
     // with reason=ASSOC_FAIL and we log the BSSID + reason. Without
     // this you only see "fallback active" in the UI with no clue why.
-    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
-        switch (event) {
-            case ARDUINO_EVENT_WIFI_STA_CONNECTED: {
-                char bssid[18];
-                snprintf(bssid, sizeof(bssid),
-                         "%02X:%02X:%02X:%02X:%02X:%02X",
-                         info.wifi_sta_connected.bssid[0],
-                         info.wifi_sta_connected.bssid[1],
-                         info.wifi_sta_connected.bssid[2],
-                         info.wifi_sta_connected.bssid[3],
-                         info.wifi_sta_connected.bssid[4],
-                         info.wifi_sta_connected.bssid[5]);
-                Serial.printf("[WiFi-ev] STA_CONNECTED bssid=%s ch=%u\n",
-                              bssid, (unsigned)info.wifi_sta_connected.channel);
-                break;
-            }
-            case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
-                char bssid[18];
-                snprintf(bssid, sizeof(bssid),
-                         "%02X:%02X:%02X:%02X:%02X:%02X",
-                         info.wifi_sta_disconnected.bssid[0],
-                         info.wifi_sta_disconnected.bssid[1],
-                         info.wifi_sta_disconnected.bssid[2],
-                         info.wifi_sta_disconnected.bssid[3],
-                         info.wifi_sta_disconnected.bssid[4],
-                         info.wifi_sta_disconnected.bssid[5]);
-                Serial.printf("[WiFi-ev] STA_DISCONNECTED bssid=%s reason=%u(%s)\n",
-                              bssid,
-                              (unsigned)info.wifi_sta_disconnected.reason,
-                              _wifiReasonTag(info.wifi_sta_disconnected.reason));
-                break;
-            }
-            case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-                Serial.printf("[WiFi-ev] GOT_IP ip=%s\n",
-                              IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
-                break;
-            default:
-                break;
-        }
-    });
+    SpoolhardWifi::installEventLogger();
 
     _setupCaptiveRoutes();
 
@@ -242,26 +178,11 @@ void WifiProvisioning::update() {
 // ── Private ──────────────────────────────────────────────────
 
 void WifiProvisioning::_startAP() {
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    char apName[32];
-    snprintf(apName, sizeof(apName), "%s%02X%02X%02X",
-             AP_PREFIX, mac[3], mac[4], mac[5]);
-
-    // Stop STA retries first — they hog the radio and block scanning
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(apName);
-    Serial.printf("[WiFi] AP started: '%s'  IP: %s\n",
-                  apName, WiFi.softAPIP().toString().c_str());
-
-    // Kick off a scan so results are ready when the portal loads
-    WiFi.scanNetworks(true);
+    SpoolhardWifi::startProvisioningAp(AP_PREFIX);
 }
 
 void WifiProvisioning::_stopAP() {
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
+    SpoolhardWifi::stopProvisioningAp();
 }
 
 void WifiProvisioning::_startConnect(const String& ssid, const String& pass) {
@@ -325,58 +246,17 @@ void WifiProvisioning::_loadDeviceName() {
 }
 
 void WifiProvisioning::_loadPinnedBssid() {
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, true);
-    _pinnedBssid = prefs.getString(NVS_KEY_PINNED_BSSID, "");
-    prefs.end();
-    if (!_pinnedBssid.isEmpty()) {
-        Serial.printf("[WiFi] Pinned BSSID configured: %s\n", _pinnedBssid.c_str());
-    }
+    _pinnedBssid = SpoolhardWifi::loadPinnedBssid();
 }
 
 void WifiProvisioning::_saveCredentials(const String& ssid, const String& pass,
                                         const String& name,
                                         const String* pinnedBssid) {
-    Preferences prefs;
-    prefs.begin(NVS_NS_WIFI, false);
-    prefs.putString(NVS_KEY_SSID, ssid);
-    prefs.putString(NVS_KEY_PASS, pass);
-    if (!name.isEmpty()) {
-        prefs.putString(NVS_KEY_DEVICE_NAME, name);
-        _deviceName = name;
-    }
-    // pinned_bssid update is optional — null pointer leaves the existing
-    // NVS value alone. Empty string clears the pin. Any other value is
-    // stored verbatim and parsed at next connect.
-    if (pinnedBssid) {
-        prefs.putString(NVS_KEY_PINNED_BSSID, *pinnedBssid);
-        _pinnedBssid = *pinnedBssid;
-    }
-    prefs.end();
+    SpoolhardWifi::saveCredentials(ssid, pass, name, pinnedBssid, _deviceName, _pinnedBssid);
 }
 
 bool WifiProvisioning::_parseBssid(const String& s, uint8_t out[6]) {
-    if (s.length() != 17) return false;   // "AA:BB:CC:DD:EE:FF"
-    // Colons at positions 2, 5, 8, 11, 14 — that's `i*3 + 2` for byte i
-    // in 0..4. The previous formula `i*3 + 1` was off by one and matched
-    // the second hex digit instead, so every parse failed silently and
-    // _pinnedActive never became true. Confirmed via WiFi event log:
-    // "Connecting to 'Porcini' (no pin)" despite a stored pinned_bssid.
-    for (int i = 0; i < 6; ++i) {
-        if (i < 5 && s.charAt(i*3 + 2) != ':') return false;
-        char hi = s.charAt(i*3);
-        char lo = s.charAt(i*3 + 1);
-        auto val = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-            return -1;
-        };
-        int h = val(hi), l = val(lo);
-        if (h < 0 || l < 0) return false;
-        out[i] = (uint8_t)((h << 4) | l);
-    }
-    return true;
+    return SpoolhardWifi::parseBssid(s, out);
 }
 
 String WifiProvisioning::_buildScanJson() {

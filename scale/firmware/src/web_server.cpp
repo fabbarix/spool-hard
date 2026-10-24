@@ -17,6 +17,8 @@
 #include <SPIFFS.h>
 #include <Update.h>
 #include "spoolhard/path_route.h"
+#include "spoolhard/vector_print.h"
+#include "spoolhard/state_rate_gate.h"
 #include "spoolhard/serial_mirror.h"
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -40,24 +42,6 @@ void ScaleWebServer::start() {
     _server.begin();
     Serial.println("[WebServer] Started on port 80");
 }
-
-// Print sink that writes into a vector<uint8_t> by reference. Lets
-// `serializeJson(env, sink)` populate the WS shared buffer in-place
-// without an intermediate String. Mirrors the console's helper.
-namespace {
-struct VectorPrint : public Print {
-    std::vector<uint8_t>* v;
-    explicit VectorPrint(std::vector<uint8_t>* dst) : v(dst) {}
-    size_t write(uint8_t b) override {
-        v->push_back(b);
-        return 1;
-    }
-    size_t write(const uint8_t* buffer, size_t size) override {
-        v->insert(v->end(), buffer, buffer + size);
-        return size;
-    }
-};
-}  // namespace
 
 // ── Debug broadcast ──────────────────────────────────────────
 //
@@ -104,39 +88,17 @@ void ScaleWebServer::broadcastConsoleFrame(const char* dir, const String& frame)
 // console's table; the scale only needs entries for resources whose
 // producers can fire faster than ~2 Hz. Edge-only producers bypass.
 namespace {
-struct StateRateLimit { const char* key; uint32_t min_interval_ms; uint32_t last_ms; };
 static StateRateLimit s_stateRates[] = {
     {"wifi_status", 30000, 0},   // RSSI bucket changes only
     {"ota",          5000, 0},   // periodic-checker completion + edge updates
 };
+static StateRateGate s_stateGate(s_stateRates, sizeof(s_stateRates) / sizeof(s_stateRates[0]));
 
-// Non-consuming peek: would _stateRateGate let this resource through
-// right now? Lets the per-tick push helpers skip NVS reads + JSON
-// building while the gate would drop the frame anyway.
-static bool _stateRateDue(const char* resource) {
-    uint32_t now = millis();
-    for (auto& r : s_stateRates) {
-        if (strcmp(r.key, resource) != 0) continue;
-        return r.last_ms == 0 || (now - r.last_ms) >= r.min_interval_ms;
-    }
-    return true;
-}
-
-static bool _stateRateGate(const char* resource) {
-    uint32_t now = millis();
-    for (auto& r : s_stateRates) {
-        if (strcmp(r.key, resource) != 0) continue;
-        if (r.last_ms != 0 && (now - r.last_ms) < r.min_interval_ms) return false;
-        r.last_ms = now;
-        return true;
-    }
-    return true;
-}
 }  // namespace
 
 void ScaleWebServer::broadcastState(const char* resource, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
-    if (!_stateRateGate(resource)) return;
+    if (!s_stateGate.pass(resource)) return;
     auto buf = g_wsBufPool.acquire();
     if (!buf) return;
     char typeBuf[40];
@@ -879,7 +841,7 @@ void ScaleWebServer::_handleOtaStatus(AsyncWebServerRequest* req) {
 // bytes-identical data.
 void ScaleWebServer::pushWifiStatus() {
     if (_ws.count() == 0) return;
-    if (!_stateRateDue("wifi_status")) return;
+    if (!s_stateGate.due("wifi_status")) return;
     JsonDocument doc(&g_psramJsonAlloc);
     _buildWifiStatusDoc(doc);
     broadcastState("wifi_status", doc);
@@ -887,7 +849,7 @@ void ScaleWebServer::pushWifiStatus() {
 
 void ScaleWebServer::pushOtaStatus() {
     if (_ws.count() == 0) return;
-    if (!_stateRateDue("ota")) return;
+    if (!s_stateGate.due("ota")) return;
     OtaConfig cfg; cfg.load();
     auto p = g_ota_checker.pending();
     JsonDocument doc(&g_psramJsonAlloc);
