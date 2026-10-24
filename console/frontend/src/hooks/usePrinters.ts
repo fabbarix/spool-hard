@@ -42,6 +42,13 @@ export interface PrinterState {
   active_tray?: number;
   last_report_ms_ago?: number;
   error?: string;
+  // True when the printer refused our last control command with its
+  // authorization error (needs LAN Only + Developer Mode).
+  commands_rejected_auth?: boolean;
+  // Developer Mode (LAN control authorised): detected from command acks,
+  // persisted by the firmware across reboots. 'unknown' until first evidence.
+  developer_mode?: 'on' | 'off' | 'unknown';
+  last_command?: { command: string; result: string; reason: string; err_code: number; ms_ago: number };
   ams?: AmsUnit[];
   // External spool holder (single-extruder printers). Bambu calls this
   // `vt_tray`; id is typically 254. Absent on printers that don't report one.
@@ -55,6 +62,9 @@ export interface Printer {
   access_code_preview?: string;
   auto_restore_k?: boolean;
   track_print_consume?: boolean;
+  // Set while a scanned spool is armed on the console and waiting for a
+  // destination (see useClaimPendingSpool). Absent otherwise.
+  pending_spool_id?: string;
   state: PrinterState;
 }
 
@@ -173,6 +183,42 @@ export function useSetAmsMapping() {
         return r.json();
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['printers'] }),
+  });
+}
+
+// Forget what was last pushed to the printer so the spool settings are
+// re-sent on the next report (after enabling Developer Mode on the printer).
+export function useResyncPrinter() {
+  const qc = useQueryClient();
+  return useMutation<unknown, Error, { serial: string }>({
+    mutationFn: ({ serial }) =>
+      fetch(`/api/printers/${encodeURIComponent(serial)}/resync`, { method: 'POST' }).then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? 'resync failed');
+        return r.json();
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['printers'] }),
+  });
+}
+
+// Assign the spool the console just scanned (PendingAms) to a chosen slot.
+// For the external holder send ams_unit 254 / slot_id 0. The firmware queues
+// the claim (202); the printers query picks the new mapping up on the next push.
+export function useClaimPendingSpool() {
+  const qc = useQueryClient();
+  return useMutation<{ ok: true; spool_id: string }, Error, { serial: string; ams_unit: number; slot_id: number }>({
+    mutationFn: ({ serial, ams_unit, slot_id }) =>
+      fetch(`/api/printers/${encodeURIComponent(serial)}/claim-pending`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ams_unit, slot_id }),
+      }).then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? 'claim failed');
+        return r.json();
+      }),
+    onSuccess: () => {
+      setTimeout(() => qc.invalidateQueries({ queryKey: ['printers'] }), 800);
+      qc.invalidateQueries({ queryKey: ['printers'] });
+    },
   });
 }
 

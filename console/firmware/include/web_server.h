@@ -224,6 +224,9 @@ private:
     // onto the spool currently mapped to that slot. Lets the user "set up
     // a filament from the printer panel and adopt it locally."
     void _handlePrinterImportAmsSpool(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    // POST /api/printers/<serial>/claim-pending -- explicit "assign the scanned
+    // spool to this slot" (see BambuPrinter::requestClaimPending).
+    void _handlePrinterClaimPending(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     void _handlePrinterFtpDebug(AsyncWebServerRequest* req, uint8_t* data, size_t len);
 
     // Bambu Lab cloud authentication. The login flow is multi-step

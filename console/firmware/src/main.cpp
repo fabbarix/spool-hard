@@ -1102,7 +1102,24 @@ static void _refreshHomeFooter() {
 // dashboard shows all of them. The LCD is a glance-value aimed at "what's in
 // front of me right now"; cycling between printers on the LCD is a future
 // nicety.
+static void _refreshDevModeWarning() {
+    // Names of printers in Developer Mode (state seeded from NVS, so this
+    // is valid even before the first report). LVGL is only touched when
+    // the list changes.
+    static String s_last;
+    String names;
+    for (const auto& pp : g_bambu.printers()) {
+        if (!pp || pp->state().dev_mode != 2) continue;
+        if (names.length()) names += ", ";
+        names += pp->config().name.length() ? pp->config().name : pp->config().serial;
+    }
+    if (names == s_last) return;
+    s_last = names;
+    ui_set_dev_mode_warning(names.length() ? names.c_str() : nullptr);
+}
+
 static void _refreshHomeAmsPanel() {
+    _refreshDevModeWarning();
     // Nothing visible while the LCD is asleep; the next 1 s tick after wake
     // repaints (ui_set_*_panel also skip identical snapshots).
     if (ConsoleDisplay::isAsleep()) return;

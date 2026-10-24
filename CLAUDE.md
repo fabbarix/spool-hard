@@ -323,3 +323,45 @@ increments on each mutation. `list()` opens the file once. The LVGL
 `ui_set_ams_panel` / `ui_set_printer_panel` skip identical snapshots, the
 lvgl task sleeps per `lv_timer_handler()`'s return (5..30 ms awake, <=50 ms
 asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
+
+## Console AMS override keys + scanned-spool claim
+
+- `PrinterConfig::ams_overrides_json` keys are `"<ams_unit>:<slot_id>"`. The
+  external holder is ALWAYS `"254:0"` (its tray id 254 is NOT a slot). Real AMS
+  is `0..3:0..3`. `ams_slot.h::normalizeAmsSlot` enforces this in the
+  `ams-mapping`, `import-ams-spool` and `claim-pending` endpoints (254/255 ->
+  254:0, other out-of-range -> 400). `PrinterConfig::migrateAmsOverrides()` runs
+  on load and rewrites legacy `254:254`/`255:255` keys to `254:0`.
+  Host test: `console/firmware/test/host/test_ams_slot.cpp` (g++ one-liner in header).
+- PendingAms auto-claim only fires on an empty->populated tray transition, which
+  never happens on the H2S external holder. `POST /api/printers/<serial>/claim-pending`
+  `{ams_unit, slot_id}` queues an explicit claim (atomic in BambuPrinter,
+  consumed in `loop()` on loopTask -> same `_maybeAssignPendingSpool` path).
+  `/api/printers` rows carry `pending_spool_id` while a scanned spool is armed;
+  the dashboard external card shows "Assign scanned spool ... to External".
+  No LCD destination-choice step (ui.cpp has no small, safe place for it).
+- Command acks: every published Bambu command uses a unique `sequence_id`
+  (`BambuPrinter::_nextSeq`); `_recordCommandAck` parses `print.command/result/
+  reason/err_code` from reports, dlogs them and keeps `PrinterState::last_cmd*`.
+  `commands_rejected_auth` (reason "mqtt message verify failed" / err 84033543 =
+  printer not in LAN Only + Developer Mode) is exposed in `/api/printers`
+  state (`commands_rejected_auth`, `last_command`) and shown as a notice on the
+  dashboard card. No retry loop; `POST /api/printers/<serial>/resync` clears the
+  per-slot "last synced" cache so the next report re-pushes.
+- Developer Mode reminder: `PrinterState::dev_mode` (0 unknown / 1 off / 2 on)
+  is derived in `_recordCommandAck` (auth failure -> off; successful
+  ams_filament_setting / extrusion_cali_* ack -> on; pushall never counts),
+  persisted as `PrinterConfig::dev_mode` (JSON `developer_mode`) via
+  `_setDevMode`, and exposed as `state.developer_mode` in `/api/printers`.
+  Passive hook `kFunBitDevMode` (bambu_printer.cpp) is -1 = DISABLED: the bit
+  of `print.fun` is not yet known, do not guess. Web: `DevModeBanner` (App
+  level, non-dismissible) while any printer is "on"; the per-card
+  "refused commands" notice covers the off/rejected case. LCD: warning
+  triangle in the home footer (`ui_set_dev_mode_warning`, called from
+  `_refreshDevModeWarning` only when the name list changes); tap shows a
+  one-line explanation card, tap again to close.
+- `POST /api/printers` MERGES onto the stored record by serial
+  (`PrinterConfig::fromJson` only overwrites fields present in the body), so the
+  Config page's partial save (name/serial/ip/access_code) keeps ams_overrides,
+  dev_mode, auto_restore_k, track_print_consume. `?dry=1` returns the would-be
+  merged record (secret masked) without saving or reloading.

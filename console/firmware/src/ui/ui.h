@@ -208,6 +208,12 @@ struct UiAmsSlot {
 // Exactly 5 entries are expected (AMS unit 0 tray 0..3 + external).
 void ui_set_ams_panel(const char* status, const UiAmsSlot* slots);
 
+// Developer-Mode reminder on the home screen footer: a warning triangle that
+// shows while any printer is in Developer Mode (LAN control). `names` is a
+// comma-separated printer list for the tap explanation, or null/empty to
+// hide. Call only when the value changed (main.cpp keeps a snapshot).
+void ui_set_dev_mode_warning(const char* names);
+
 // ── Slot detail screen ─────────────────────────────────────────
 // Opens when the user taps one of the five AMS tiles. Shows everything
 // the console knows about that slot: printer-reported (material, colour,

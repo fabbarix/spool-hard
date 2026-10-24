@@ -10,6 +10,7 @@ void PrinterConfig::toJson(JsonDocument& doc, bool include_secret) const {
     doc["ip"]      = ip;
     doc["auto_restore_k"]      = auto_restore_k;
     doc["track_print_consume"] = track_print_consume;
+    doc["developer_mode"] = dev_mode == 2 ? "on" : dev_mode == 1 ? "off" : "unknown";
     // Serialize the manual-override table as a nested object so the API
     // consumer (frontend / NVS blob) can read and edit it directly.
     if (ams_overrides_json.length()) {
@@ -30,14 +31,21 @@ void PrinterConfig::toJson(JsonDocument& doc, bool include_secret) const {
 }
 
 bool PrinterConfig::fromJson(const JsonDocument& doc) {
-    name        = doc["name"]        | "";
-    serial      = doc["serial"]      | "";
-    ip          = doc["ip"]          | "";
+    // Merge semantics: only fields present in `doc` overwrite; everything
+    // else keeps its current value (callers seed `*this` with the stored
+    // record, so a partial POST /api/printers can't wipe ams_overrides etc.).
+    if (doc["name"].is<const char*>())   name   = doc["name"].as<String>();
+    if (doc["serial"].is<const char*>()) serial = doc["serial"].as<String>();
+    if (doc["ip"].is<const char*>())     ip     = doc["ip"].as<String>();
     if (doc["access_code"].is<const char*>()) {
         access_code = doc["access_code"].as<String>();
     }
     if (doc["auto_restore_k"].is<bool>())      auto_restore_k      = doc["auto_restore_k"];
     if (doc["track_print_consume"].is<bool>()) track_print_consume = doc["track_print_consume"];
+    if (doc["developer_mode"].is<const char*>()) {
+        String m = doc["developer_mode"].as<String>();
+        dev_mode = m == "on" ? 2 : m == "off" ? 1 : 0;
+    }
     if (doc["ams_overrides"].is<JsonObjectConst>()) {
         ams_overrides_json = "";
         serializeJson(doc["ams_overrides"], ams_overrides_json);
@@ -73,6 +81,33 @@ void PrinterConfig::setAmsOverride(int ams_unit, int slot_id, const String& spoo
     serializeJson(d, ams_overrides_json);
 }
 
+bool PrinterConfig::migrateAmsOverrides() {
+    if (ams_overrides_json.isEmpty()) return false;
+    JsonDocument d;
+    if (deserializeJson(d, ams_overrides_json)) return false;
+    JsonObject o = d.as<JsonObject>();
+    if (o.isNull()) return false;
+    // Collect first, mutate after -- don't modify the object while iterating.
+    std::vector<String> stray;
+    for (JsonPair kv : o) {
+        int u = -1, s = -1;
+        if (sscanf(kv.key().c_str(), "%d:%d", &u, &s) != 2) continue;
+        if ((u == 254 || u == 255) && !(u == 254 && s == 0)) stray.push_back(kv.key().c_str());
+    }
+    if (stray.empty()) return false;
+    for (const String& k : stray) {
+        const char* vp = o[k.c_str()] | "";
+        String v = vp;
+        o.remove(k.c_str());
+        const char* ex = o["254:0"] | "";
+        if (!*ex && v.length()) o["254:0"] = v;
+        else if (!*ex) o.remove("254:0");   // never leave a null/empty entry
+    }
+    ams_overrides_json = "";
+    if (o.size()) serializeJson(d, ams_overrides_json);
+    return true;
+}
+
 void PrintersConfig::load() {
     _list.clear();
     Preferences prefs;
@@ -86,12 +121,20 @@ void PrintersConfig::load() {
         Serial.println("[Printers] NVS blob invalid, starting empty");
         return;
     }
+    bool migrated = false;
     for (JsonVariant v : doc.as<JsonArray>()) {
         PrinterConfig p;
         JsonDocument d;
         d.set(v);
-        if (p.fromJson(d)) _list.push_back(std::move(p));
+        if (!p.fromJson(d)) continue;
+        if (p.migrateAmsOverrides()) {
+            Serial.printf("[Printers] %s: migrated legacy external ams-override key to 254:0\n",
+                          p.serial.c_str());
+            migrated = true;
+        }
+        _list.push_back(std::move(p));
     }
+    if (migrated) save();
     Serial.printf("[Printers] Loaded %u printer(s) from NVS\n", (unsigned)_list.size());
 }
 

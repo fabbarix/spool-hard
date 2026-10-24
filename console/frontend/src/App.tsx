@@ -5,6 +5,7 @@ import { WebSocketProvider } from '@spoolhard/ui/providers/WebSocketProvider';
 import { ReconnectProvider } from '@spoolhard/ui/providers/ReconnectProvider';
 import { ReconnectOverlay } from '@spoolhard/ui/components/ReconnectOverlay';
 import { Header } from './components/layout/Header';
+import { DevModeBanner } from './components/layout/DevModeBanner';
 import { NavTabs, BottomTabBar } from './components/layout/NavTabs';
 import { DashboardPage } from './pages/DashboardPage';
 import { SpoolsPage } from './pages/SpoolsPage';
@@ -74,6 +75,7 @@ export default function App() {
               <div className="shrink-0">
                 <Header />
                 <NavTabs activeTab={tab} onTabChange={navigate} />
+                <DevModeBanner />
               </div>
               <main className="flex-1 overflow-y-auto">
                 <div className="mx-auto max-w-[1100px] p-4">
