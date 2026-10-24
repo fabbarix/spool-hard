@@ -128,8 +128,15 @@ the headers are `#include`d).
   singleton: `JsonDocument doc(&g_psramJsonAlloc);` routes the node
   tree to PSRAM. All hot WS/HTTP paths use this.
 - `spoolhard/ws_buffer_pool.h` / `src/ws_buffer_pool.cpp` — `g_wsBufPool`
-  singleton: 8 × 8 KB pre-allocated `AsyncWebSocketSharedBuffer` slots.
+  singleton: up to 8 × 8 KB `AsyncWebSocketSharedBuffer` slots.
   Eliminates internal-DRAM churn on broadcastDebug/broadcastState pushes.
+  `begin(count, cap, lazy)`: console is eager (pre-allocated, PSRAM-backed);
+  the scale is **lazy** (no PSRAM, tight DRAM): slots are allocated on the
+  first `acquire()` (only if largest free internal block >= cap + 12 KB,
+  else the push is dropped, warning at most 1/min) and `maintain(wsCount)`
+  (1 Hz, from `ScaleWebServer::cleanupClients()`) frees idle slots
+  (`use_count()==1`) when no browser is connected and trims grown idle
+  slots back to cap otherwise. `/ws/console` does not use the pool.
 - `spoolhard/auth.h` / `src/auth.cpp` — `requireAuth`, `wsAuthHandshake`,
   `handleAuthStatus`, `handleTestKey`, `handleFixedKeyConfigPost`,
   `handleDeviceName{Get,Post}`. The fixed key is cached in RAM (constant-time

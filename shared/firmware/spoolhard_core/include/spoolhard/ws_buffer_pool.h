@@ -34,7 +34,25 @@ public:
     //        `acquire()` returns null and the broadcast is dropped
     //        (the next one will land — state.* is idempotent).
     // initial_capacity: bytes pre-reserved per slot's vector.
-    void begin(size_t count = 4, size_t initial_capacity = 8192);
+    //
+    // lazy: when true, begin() allocates NOTHING. Slots are created on
+    //        demand by `acquire()` (up to `count`), subject to an
+    //        internal-DRAM headroom floor (an allocation that would
+    //        leave < kLazyFloorBytes of largest-free-block is refused ->
+    //        acquire() returns null -> the push is dropped). `maintain()`
+    //        frees idle slots when no browser is connected. Used by the
+    //        scale (no PSRAM, tightest DRAM margin). Eager (default)
+    //        keeps the original pre-allocate-forever behaviour.
+    void begin(size_t count = 4, size_t initial_capacity = 8192, bool lazy = false);
+
+    // Lazy-mode housekeeping; call ~1 Hz from the loop task with the
+    // current number of connected WS clients. With zero clients, frees
+    // every slot whose use_count()==1 (not queued in any client). With
+    // clients, trims idle slots that grew past initial_capacity back to
+    // it. No-op in eager mode. Never blocks > 20 ms.
+    void maintain(size_t wsClientCount);
+
+    static constexpr size_t kLazyFloorBytes = 12288;
 
     // Returns a shared_ptr whose pointee is safe to mutate (only the
     // pool + the caller hold references). The caller is expected to
@@ -70,6 +88,9 @@ private:
     SemaphoreHandle_t _mtx = nullptr;
     size_t _next = 0;
     size_t _initialCap = 0;
+    size_t _count = 0;
+    bool _lazy = false;
+    uint32_t _lastWarnMs = 0;
 };
 
 extern WsBufferPool g_wsBufPool;

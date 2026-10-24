@@ -60,11 +60,17 @@ struct VectorPrint : public Print {
 
 // ── Debug broadcast ──────────────────────────────────────────
 //
-// All WS broadcast paths funnel through the WsBufferPool: an 8-slot
-// ring of pre-reserved 8 KB AsyncWebSocketSharedBuffers. The JSON
+// All WS broadcast paths funnel through the WsBufferPool: an up-to-8-slot
+// LAZY ring of 8 KB (allocated on first push, freed when no tab is open) AsyncWebSocketSharedBuffers. The JSON
 // envelope is built with the PSRAM-backed allocator so the node tree
 // lives in external RAM, then serialized directly into the pool slot.
 // Net per-broadcast internal-DRAM allocation under steady state: ZERO.
+
+void ScaleWebServer::cleanupClients() {
+    _ws.cleanupClients();
+    // Lazy pool: release/trim idle slots (frees DRAM after last tab closes).
+    g_wsBufPool.maintain(_ws.count());
+}
 
 void ScaleWebServer::broadcastDebug(const String& type, const JsonDocument& payload) {
     if (_ws.count() == 0) return;
