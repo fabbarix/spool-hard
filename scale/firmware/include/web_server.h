@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <functional>
 #include "spoolhard/product_signature.h"
+#include "spoolhard/version_marker.h"
 
 class ScaleWebServer {
 public:
@@ -102,6 +103,7 @@ private:
     // Per-upload state. Only one upload runs at a time (Arduino's Update lib
     // is a singleton), so a single matcher + rejection flag is sufficient.
     ProductSignatureMatcher _uploadMatcher;
+    VersionMarkerParser     _uploadVersion;   // log-only on the scale
     bool _uploadRejectedProduct = false;  // set on signature mismatch
     bool _uploadIsSpiffs        = false;  // remembered for the response path
 

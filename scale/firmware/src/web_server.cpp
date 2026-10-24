@@ -19,7 +19,18 @@
 
 // ── Lifecycle ────────────────────────────────────────────────
 
+// Firmware-version marker bytes (parsed by the console/browser OTA upload UI).
+// Real file-scope symbol with `used`, AND referenced from begin() below —
+// --gc-sections drops the .rodata section otherwise (same as the console).
+namespace {
+__attribute__((used))
+const char kSpoolHardVersionMarker[] = SPOOLHARD_VERSION_MARKER;
+}
+
 void ScaleWebServer::begin() {
+    // The %p reference forces the linker to retain kSpoolHardVersionMarker.
+    Serial.printf("[WebServer] fw=%s  version marker @ %p\n",
+                  FW_VERSION, (const void*)kSpoolHardVersionMarker);
     _setupRoutes();
 }
 
@@ -547,6 +558,7 @@ void ScaleWebServer::_setupRoutes() {
                 Serial.printf("[Upload] Firmware: %s\n", filename.c_str());
                 if (_onUploadStarted) _onUploadStarted("firmware");
                 _uploadMatcher.reset();
+                _uploadVersion.reset();
                 _uploadRejectedProduct = false;
                 _uploadIsSpiffs        = false;
                 if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
@@ -555,6 +567,10 @@ void ScaleWebServer::_setupRoutes() {
                 }
             }
             _uploadMatcher.feed(data, len);
+            bool versionWasParsed = _uploadVersion.parsed;
+            _uploadVersion.feed(data, len);
+            if (!versionWasParsed && _uploadVersion.parsed && _uploadVersion.version[0])
+                Serial.printf("[Upload] Firmware version detected: v%s\n", _uploadVersion.version);
             if (Update.isRunning()) Update.write(data, len);
             if (_onUploadProgress) _onUploadProgress();   // LED liveness ping
             if (final) {
