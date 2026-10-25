@@ -274,7 +274,7 @@ so the coordinator loop never blocks on hardware I/O:
 | Task            | Stack | Core | Owns                                       |
 |-----------------|-------|------|--------------------------------------------|
 | `loopTask`      | Arduino default | 1 | Coordinator: drains task event queues, dispatches WS broadcasts, runs the LED state machine, services WiFi state machine. |
-| `sensor_task`   | 4 KB  | 1    | `g_scale` (LoadCell). 100 Hz poll, drains command queue (tare/calibrate/addCalPoint/clear/reloadParams). Publishes a seqlock snapshot. |
+| `sensor_task`   | 4 KB (deliberately kept: measured peak ~0.9 KB covers only the poll loop; calibrate/addCalPoint paths with float printf + NVS commit are unmeasured, est. 2-2.5 KB) | 1    | `g_scale` (LoadCell). 100 Hz poll, drains command queue (tare/calibrate/addCalPoint/clear/reloadParams). Publishes a seqlock snapshot. |
 | `nfc_task`      | 4 KB  | 1    | `g_nfc` (NfcReader / PN532 SPI). 50 Hz poll, drains write/erase/emulate command queue. Publishes status as an atomic; the SpoolTag (Strings) is copied under a mutex, and events queue heap pointers. |
 | `console_tx`    | 4 KB  | 1    | Single writer to the port-80 `/ws/console` AsyncWebSocket. Drains a 32-deep frame queue. |
 | `ota_run`       | 12 KB | 0    | Spawned on demand by `otaTaskSpawn`; self-deletes when done. Handles HTTPS manifest + binary fetch, sha256, `Update.write`. |
@@ -325,7 +325,7 @@ constant is informational + drives the default `STABLE_COUNT_REQ`.
 ## Console NFC task
 
 The console's own PN532 (`console/firmware/src/nfc_reader.cpp`) runs in a
-dedicated `nfc_task` (4 KB internal stack, core 1, prio 2, 200 ms poll). The
+dedicated `nfc_task` (5 KB internal stack (raised from 4 KB), core 1, prio 2, 200 ms poll). The
 task is the sole PN532/SPI user (the console never writes/erases tags),
 debounces by UID BEFORE any page reads (a held tag yields exactly one event;
 removal (8 empty polls, ~2 s; held NTAGs are presence-pinged with a page-3 READ because an ACTIVE tag ignores REQA) re-arms), reads NTAG pages 4..19 as 4 x 16-byte READs, and

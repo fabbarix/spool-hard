@@ -17,7 +17,7 @@ extern byte pn532_packetbuffer[];
 // An unreadable tag seen again within this window of its last sighting is
 // resumed silently (no new event, no read retry).
 static constexpr uint32_t kUnreadResumeMs = 4000;
-static constexpr uint32_t kNfcTaskStack = 4096;
+static constexpr uint32_t kNfcTaskStack = 5120;   // was 4096: NFC read path (batch/fallback reads + debug snapshot) measured ~1.75 KB min-free, wanted margin
 static constexpr uint32_t kPollMs       = 200;
 // Consecutive empty polls (~2 s) before a tag counts as removed and the
 // UID debounce re-arms. Absorbs a single missed poll on a held tag.
