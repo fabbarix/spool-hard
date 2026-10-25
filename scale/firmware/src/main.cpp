@@ -569,7 +569,7 @@ void setup() {
     // connected browser and released by maintain() (from
     // g_web.cleanupClients(), 1 Hz) once no tab is open. The scale<->console
     // link (/ws/console) does not use this pool.
-    g_wsBufPool.begin(/*count*/ 8, /*initial_capacity*/ 8192, /*lazy*/ true);
+    g_wsBufPool.begin(/*count*/ SCALE_WS_POOL_SLOTS, /*initial_capacity*/ 8192, /*lazy*/ true);
 
     g_led.begin();
     g_led.showOffline();   // red solid until WiFi + console catch up
