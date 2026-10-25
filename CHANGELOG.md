@@ -8,6 +8,15 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.14.1] - 2026-10-25
+
+**Fixes**
+- Console web UI: the dashboard and printer slot cards now update a spool's
+  remaining weight live while it prints (it only refreshed on page reload).
+  The firmware saves print consumption every 5 % of progress, so the value
+  steps rather than moving continuously. No firmware change; the scale is
+  unchanged apart from the version number.
+
 ## [0.14.0] - 2026-10-25
 
 A console responsiveness and NFC release: a redesigned printer-first LCD
