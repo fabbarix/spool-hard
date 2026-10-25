@@ -58,6 +58,11 @@ static bool    g_showedHome = false;
 // routes back to device-config's Info tab. The console-side apply path
 // reuses g_pendingOta (the console just reboots, so it needs no routing).
 static bool    g_scaleOtaActive = false;
+// Banner tap with BOTH devices pending: the scale goes first and the console
+// follows once the scale is back (or gave up), so the two never flash at
+// once and fight over the progress screen. The console goes last because
+// its own reboot ends the sequence.
+static bool    g_consoleOtaAfterScale = false;
 
 // Spool-detail screen state. Set when a known tag is scanned on either the
 // on-device PN532 or via the scale. Used by:
@@ -1567,9 +1572,9 @@ static void _refreshOtaBannerImpl() {
 }
 
 // Banner-tap handler — fires on either device that has a pending update.
-// Sets g_pendingOta for the console and forwards RunOtaUpdate to the scale.
-// Both can run together: the scale's update runs in its own task; the
-// console reboots after its own otaRun returns.
+// With both pending, only the scale starts now; the console follows when the
+// scale is back (g_consoleOtaAfterScale), so the progress screen shows one
+// device at a time. Console alone: sets g_pendingOta directly.
 static void _onOtaBannerTap() {
     auto cp = g_ota_checker.pending();
     const auto& sp = g_scale.scaleOtaPending();
@@ -1578,8 +1583,12 @@ static void _onOtaBannerTap() {
         // Same as the Settings "Update scale" path: arm the progress mirror,
         // otherwise the scale updates silently and the tap looks ignored.
         g_scaleOtaActive = true;
+        // Console (if also pending) runs after the scale; see
+        // g_consoleOtaAfterScale.
+        g_consoleOtaAfterScale = cp.firmware || cp.frontend;
+        return;
     }
-    if (cp.firmware || cp.frontend) {
+    if ((cp.firmware || cp.frontend) && !g_scaleOtaActive) {
         g_pendingOta = true;
     }
 }
@@ -1768,33 +1777,36 @@ void loop() {
     // timeout so a scale that never starts / never returns can't strand us.
     if (g_scaleOtaActive) {
         static bool     s_scaleSawProgress = false;
+        static bool     s_scaleSawDrop     = false;
         static int      s_lastScalePct     = -1;
         static uint32_t s_scaleArmedAt     = 0;
+        static uint32_t s_scaleLastActMs   = 0;
+        uint32_t now = millis();
         if (s_scaleArmedAt == 0) {
-            s_scaleArmedAt = millis();
+            s_scaleArmedAt = s_scaleLastActMs = now;
             // Immediate feedback: the scale's first progress frame only
             // arrives after its manifest fetch.
             ConsoleDisplay::wake();
             ui_show_ota_progress(0, "Updating scale", "starting");
         }
         const auto& sf = g_scale.scaleOtaInFlight();
-        bool timedOut = (millis() - s_scaleArmedAt) > 180000;
-        auto disarm = [&]() {
-            g_scaleOtaActive = false; s_scaleSawProgress = false;
+        // Ignore a progress record left over from an earlier run.
+        bool fresh     = sf.valid && (int32_t)(sf.last_update_ms - s_scaleArmedAt) >= 0;
+        bool connected = g_scale.isConnected();
+        auto finish = [&](bool ok) {
+            g_scaleOtaActive = false; s_scaleSawProgress = false; s_scaleSawDrop = false;
             s_lastScalePct = -1; s_scaleArmedAt = 0;
-        };
-        if (sf.valid && !timedOut) {
-            s_scaleSawProgress = true;
-            if (sf.percent != s_lastScalePct) {
-                s_lastScalePct = sf.percent;
-                ConsoleDisplay::wake();
-                ui_show_ota_progress(sf.percent, "Updating scale",
-                                     sf.kind.length() ? sf.kind.c_str() : "");
+            if (g_consoleOtaAfterScale) {
+                g_consoleOtaAfterScale = false;
+                auto cp = g_ota_checker.pending();
+                if (cp.firmware || cp.frontend) {
+                    // Console next; its OTA block below takes over the screen.
+                    g_pendingOta = true;
+                    return;
+                }
             }
-        } else if (s_scaleSawProgress && g_scale.isConnected()) {
-            // Flashed → rebooted → reconnected. Land on Info to show the
-            // bumped scale version.
-            disarm();
+            if (!ok) { ui_show_home(); return; }
+            // Land on Info to show the bumped scale version.
             String host = g_wifi.getDeviceName();
             host.toLowerCase(); host.replace(' ', '-');
             if (host.length()) host += ".local";
@@ -1802,12 +1814,26 @@ void loop() {
                                                          : String("—");
             ui_show_device_config(host.c_str(), ip.c_str(), FW_VERSION, FE_VERSION,
                                   /*startOnInfo=*/true);
-        } else if (timedOut) {
-            // Never started, or the scale didn't come back in time — bail to
-            // home rather than leave a stale progress screen up.
-            disarm();
-            ui_show_home();
+        };
+        if (fresh) {
+            s_scaleSawProgress = true;
+            s_scaleLastActMs   = now;
+            if (sf.percent != s_lastScalePct) {
+                s_lastScalePct = sf.percent;
+                ConsoleDisplay::wake();
+                ui_show_ota_progress(sf.percent, "Updating scale",
+                                     sf.kind.length() ? sf.kind.c_str() : "");
+            }
+        } else if (s_scaleSawProgress && !connected) {
+            // Link dropped after progress: the scale is rebooting into the
+            // new image (the in-flight record clears on disconnect).
+            s_scaleSawDrop = true;
+        } else if (s_scaleSawDrop && connected) {
+            finish(true);   // flashed -> rebooted -> reconnected
         }
+        // No progress for 2 min (never started, stalled, or never came
+        // back): give up rather than strand a stale progress screen.
+        if (g_scaleOtaActive && (now - s_scaleLastActMs) > 120000) finish(false);
     }
 
     // Pending OTA triggered via web API / LCD. otaRun executes on its own
