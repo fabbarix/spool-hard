@@ -32,12 +32,12 @@
 // consumes a slot, so it is always admitted regardless of tabs.
 // Dashboard tabs beyond SCALE_WS_MAX_DASHBOARDS are closed (code 1013).
 #ifndef SCALE_WS_MAX_DASHBOARDS
-#define SCALE_WS_MAX_DASHBOARDS 2
+#define SCALE_WS_MAX_DASHBOARDS 3
 #endif
 // Hard cap on pool slots (one spare over the dashboard count for a slow
 // client still holding a frame in flight). Shrinks toward ws_clients.
 #ifndef SCALE_WS_POOL_SLOTS
-#define SCALE_WS_POOL_SLOTS 3
+#define SCALE_WS_POOL_SLOTS 4
 #endif
 
 // ── PN532 SPI pins ───────────────────────────────────────────
