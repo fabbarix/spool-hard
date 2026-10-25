@@ -8,6 +8,17 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.14.2] - 2026-10-25
+
+**Fixes**
+- Console LCD: tapping the "Scale x.y.z ready - tap to install" banner now
+  shows the scale's update progress and lands on the Info screen with the
+  new version. Before, the scale updated silently in the background and
+  the tap looked like it did nothing.
+- Console: scale update progress was being discarded (in both the LCD
+  progress screen and the web UI), so it stayed at 0 % for the whole
+  update.
+
 ## [0.14.1] - 2026-10-25
 
 **Fixes**
