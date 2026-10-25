@@ -58,7 +58,7 @@ scale, a much lighter console main loop, and leaner MQTT parsing.
   memory 24.5 KB → 6.0 KB and about 4x faster, with identical results
   (host test over 50 real H2S reports).
 - Hot JSON documents and the stock-filament list moved to PSRAM; LVGL
-  trimmed. Console firmware is 77 KB smaller (2,256,031 → 2,178,783 B)
+  trimmed. Console firmware is 75 KB smaller (2,320,800 → 2,245,616 B)
   despite the new features.
 - Scale minimum free memory with 3 dashboards open: ~75-82 KB (was 25 KB
   with unbounded tabs).
