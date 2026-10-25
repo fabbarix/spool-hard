@@ -265,7 +265,7 @@ runs. Both need auth (`?key=` / Bearer).
   renders (`lv_snapshot_take`, `LV_USE_SNAPSHOT=1`) into one PSRAM RGB565
   buffer (~300 KB); poll again for `200 image/bmp`, streamed through a
   chunked fill callback that converts RGB565->BGR24 per chunk (no big
-  internal alloc). Buffer freed on last chunk / disconnect (per-stream generation, stale disconnects ignored) / 30 s stale (swept by the LVGL loop) / toggle off.
+  internal alloc). Once claimed, the buffer is owned by the response's fill lambda (shared_ptr `SnapStream`) and freed only when that response is destroyed (end/disconnect/lib timeout) - never swept or aborted mid-stream. An unclaimed buffer is swept after 30 s / on toggle off.
   A stream in progress -> 409. Implemented in `display.cpp`.
 - `POST /api/debug/lcd/touch {"x":0..479,"y":0..319,"action":"tap|press|release"}`
   — packed atomic command word consumed by `touch_cb` (LVGL task). tap =

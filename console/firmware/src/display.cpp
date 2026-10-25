@@ -247,13 +247,22 @@ enum : uint8_t { SN_IDLE, SN_CAPTURING, SN_READY, SN_STREAMING, SN_FAILED };
 static std::atomic<uint8_t> s_snap_state{SN_IDLE};
 static lv_draw_buf_t*       s_snap_buf = nullptr;
 static volatile uint32_t    s_snap_ts  = 0;
-static std::atomic<uint32_t> s_snap_gen{0};   // bumped per claimed stream
 static constexpr uint32_t   SNAP_STALE_MS = 30000;
 
 static void snap_free() {
     if (s_snap_buf) { lv_draw_buf_destroy(s_snap_buf); s_snap_buf = nullptr; }
     s_snap_state.store(SN_IDLE);
 }
+
+// Owns the pixel buffer for the lifetime of one HTTP response.
+struct SnapStream {
+    lv_draw_buf_t* buf;
+    explicit SnapStream(lv_draw_buf_t* b) : buf(b) {}
+    ~SnapStream() {
+        if (buf) lv_draw_buf_destroy(buf);
+        s_snap_state.store(SN_IDLE);
+    }
+};
 
 static void snap_task(void*) {
     lv_lock();
@@ -269,20 +278,12 @@ static void snap_task(void*) {
 ConsoleDisplay::SnapStatus ConsoleDisplay::snapshotRequest() {
     switch (s_snap_state.load()) {
     case SN_CAPTURING: return SNAP_PENDING;
+    case SN_STREAMING: return SNAP_BUSY;
     case SN_FAILED:    s_snap_state.store(SN_IDLE); return SNAP_FAILED;
     case SN_READY:
-        if (millis() - s_snap_ts < SNAP_STALE_MS) {
-            s_snap_ts = millis();
-            s_snap_gen.fetch_add(1);
-            s_snap_state.store(SN_STREAMING);
-            return SNAP_READY;
-        }
+        if (millis() - s_snap_ts < SNAP_STALE_MS) return SNAP_READY;
         snap_free();
         break;                                   // stale: recapture below
-    case SN_STREAMING:
-        if (millis() - s_snap_ts < SNAP_STALE_MS) return SNAP_BUSY;
-        snap_free();                             // abandoned stream
-        break;
     default: break;
     }
     s_snap_state.store(SN_CAPTURING);
@@ -293,26 +294,24 @@ ConsoleDisplay::SnapStatus ConsoleDisplay::snapshotRequest() {
     return SNAP_PENDING;
 }
 
-void ConsoleDisplay::snapshotAbort(uint32_t gen) {
-    if (gen == s_snap_gen.load() && s_snap_state.load() == SN_STREAMING) snap_free();
+std::shared_ptr<SnapStream> ConsoleDisplay::snapshotClaim() {
+    if (s_snap_state.load() != SN_READY || !s_snap_buf) return nullptr;
+    auto st = std::make_shared<SnapStream>(s_snap_buf);
+    s_snap_buf = nullptr;                        // ownership moved into the stream
+    s_snap_state.store(SN_STREAMING);
+    return st;
 }
 
-uint32_t ConsoleDisplay::snapshotGeneration() { return s_snap_gen.load(); }
-
 void ConsoleDisplay::snapshotRelease() {
-    uint8_t st = s_snap_state.load();
-    if (st == SN_READY || st == SN_STREAMING) snap_free();
+    if (s_snap_state.load() == SN_READY) snap_free();
 }
 
 void ConsoleDisplay::snapshotSweep() {
-    uint8_t st = s_snap_state.load();
-    if ((st == SN_READY || st == SN_STREAMING) && millis() - s_snap_ts >= SNAP_STALE_MS) snap_free();
+    if (s_snap_state.load() == SN_READY && millis() - s_snap_ts >= SNAP_STALE_MS) snap_free();
 }
 
-size_t ConsoleDisplay::snapshotFill(uint8_t* out, size_t maxLen, size_t index) {
-    if (s_snap_state.load() != SN_STREAMING || !s_snap_buf) return 0;
-    if (index >= SNAP_BMP_BYTES) { snap_free(); return 0; }
-    s_snap_ts = millis();
+size_t ConsoleDisplay::snapshotFill(const SnapStream& st, uint8_t* out, size_t maxLen, size_t index) {
+    if (index >= SNAP_BMP_BYTES) return 0;   // true end of body
     size_t n = 0;
     if (index < 54) {
         uint8_t h[54] = {0};
@@ -326,8 +325,8 @@ size_t ConsoleDisplay::snapshotFill(uint8_t* out, size_t maxLen, size_t index) {
         memcpy(out, h + index, n);
         index += n;
     }
-    const uint8_t* base = s_snap_buf->data;
-    const uint32_t stride = s_snap_buf->header.stride;
+    const uint8_t* base = st.buf->data;
+    const uint32_t stride = st.buf->header.stride;
     while (n < maxLen && index < SNAP_BMP_BYTES) {
         size_t p = index - 54;
         size_t px = p / 3; int c = p % 3;
@@ -340,6 +339,7 @@ size_t ConsoleDisplay::snapshotFill(uint8_t* out, size_t maxLen, size_t index) {
     }
     return n;
 }
+
 
 static uint32_t tick_cb() { return millis(); }
 

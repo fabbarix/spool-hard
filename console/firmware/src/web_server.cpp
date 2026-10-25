@@ -1405,13 +1405,15 @@ void ConsoleWebServer::_setupRoutes() {
             return;
         case ConsoleDisplay::SNAP_READY: break;
         }
+        auto st = ConsoleDisplay::snapshotClaim();
+        if (!st) { req->send(500, "application/json", "{\"error\":\"snapshot lost\"}"); return; }
+        // The lambda's shared_ptr owns the pixel buffer; it is released when
+        // the response is destroyed (completion or disconnect).
         auto* resp = req->beginChunkedResponse("image/bmp",
-            [](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
-                return ConsoleDisplay::snapshotFill(buf, maxLen, index);
+            [st](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
+                return ConsoleDisplay::snapshotFill(*st, buf, maxLen, index);
             });
         resp->addHeader("Cache-Control", "no-store");
-        const uint32_t gen = ConsoleDisplay::snapshotGeneration();
-        req->onDisconnect([gen]() { ConsoleDisplay::snapshotAbort(gen); });
         req->send(resp);
     });
     _server.on(AsyncURIMatcher::exact("/api/debug/lcd/touch"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
