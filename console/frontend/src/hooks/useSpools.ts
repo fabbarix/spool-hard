@@ -72,7 +72,10 @@ export function remainingGrams(r: Pick<SpoolRecord, 'weight_current' | 'consumed
   return Math.max(0, Math.round(r.weight_current - used));
 }
 
-export function useSpools(offset = 0, limit = 50, material?: string) {
+// `material` defaults to '' (not undefined): React Query hashes an undefined
+// key element as null, so useSpools(0, 200) would miss the WS-pushed
+// ['spools', 0, 200, ''] entry and the dashboard weights would go stale.
+export function useSpools(offset = 0, limit = 50, material = '') {
   const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
   if (material) params.set('material', material);
   return useQuery<SpoolsPage>({
