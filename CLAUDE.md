@@ -140,8 +140,17 @@ the headers are `#include`d).
   PSRAM buffer + a PSRAM index and parses rows on demand (no resident
   FilamentRecord Strings).
 - `spoolhard/ws_buffer_pool.h` / `src/ws_buffer_pool.cpp` — `g_wsBufPool`
-  singleton: up to 8 × 8 KB `AsyncWebSocketSharedBuffer` slots.
+  singleton: up to 8 × 8 KB (console; scale caps at 3) `AsyncWebSocketSharedBuffer` slots.
   Eliminates internal-DRAM churn on broadcastDebug/broadcastState pushes.
+  Scale uses it lazy (`begin(count, cap, lazy=true)`): slots are created
+  on demand up to `SCALE_WS_POOL_SLOTS` (3, `scale/firmware/include/config.h`),
+  and `maintain(wsClients)` (1 Hz) shrinks idle slots down to the client
+  count once the surplus has persisted 3 s (0 clients -> 0 slots). Only
+  dashboard tabs (`/ws`) use the pool; the console link (`/ws/console`,
+  separate AsyncWebSocket fed by ConsoleTx) takes no slot and is never
+  refused. Dashboard tabs beyond `SCALE_WS_MAX_DASHBOARDS` (2) are closed
+  in `WS_EVT_CONNECT` with code 1013 + `[WS] ... REFUSED` log. Console
+  keeps its eager 8-slot pool (PSRAM-backed).
   `begin(count, cap, lazy)`: console is eager (pre-allocated, PSRAM-backed);
   the scale is **lazy** (no PSRAM, tight DRAM): slots are allocated on the
   first `acquire()` (only if largest free internal block >= cap + 12 KB,

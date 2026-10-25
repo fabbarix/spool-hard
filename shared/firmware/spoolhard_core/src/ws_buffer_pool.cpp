@@ -130,7 +130,28 @@ void WsBufferPool::maintain(size_t wsClientCount) {
                           (unsigned)(before - _slots.size()), (unsigned)_slots.size());
         if (_slots.empty()) std::vector<AsyncWebSocketSharedBuffer>().swap(_slots);
         _next = 0;
+        _excessSinceMs = 0;
     } else {
+        // Shrink: more slots than connected clients is surplus. Once it
+        // has persisted kShrinkDelayMs (hysteresis vs. broadcast bursts),
+        // erase idle (use_count()==1) slots down to the client count.
+        if (_slots.size() > wsClientCount) {
+            uint32_t now = millis();
+            if (_excessSinceMs == 0) _excessSinceMs = now ? now : 1;
+            else if (now - _excessSinceMs >= kShrinkDelayMs) {
+                size_t before = _slots.size();
+                for (size_t i = _slots.size(); i-- > 0 && _slots.size() > wsClientCount;)
+                    if (_slots[i].use_count() == 1) _slots.erase(_slots.begin() + i);
+                if (_slots.size() != before)
+                    Serial.printf("[WsPool] shrunk %u -> %u slot(s), ws_clients=%u\n",
+                                  (unsigned)before, (unsigned)_slots.size(),
+                                  (unsigned)wsClientCount);
+                if (_slots.size() <= wsClientCount) _excessSinceMs = 0;
+                if (_next >= _slots.size()) _next = 0;
+            }
+        } else {
+            _excessSinceMs = 0;
+        }
         for (auto& s : _slots) {
             if (s.use_count() == 1 && s->capacity() > _initialCap) {
                 std::vector<uint8_t>().swap(*s);

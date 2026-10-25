@@ -25,6 +25,21 @@
 // further changes.
 #define HX711_HW_RATE_HZ   80
 
+// ── Dashboard WebSocket (/ws) budget ─────────────────────────
+// The scale has no PSRAM; every WsBufferPool slot is 8 KB of internal DRAM.
+// Only dashboard tabs (/ws) draw from the pool; the console link
+// (/ws/console) is a separate AsyncWebSocket fed by ConsoleTx and never
+// consumes a slot, so it is always admitted regardless of tabs.
+// Dashboard tabs beyond SCALE_WS_MAX_DASHBOARDS are closed (code 1013).
+#ifndef SCALE_WS_MAX_DASHBOARDS
+#define SCALE_WS_MAX_DASHBOARDS 2
+#endif
+// Hard cap on pool slots (one spare over the dashboard count for a slow
+// client still holding a frame in flight). Shrinks toward ws_clients.
+#ifndef SCALE_WS_POOL_SLOTS
+#define SCALE_WS_POOL_SLOTS 3
+#endif
+
 // ── PN532 SPI pins ───────────────────────────────────────────
 #define PN532_SCK_PIN    15
 #define PN532_MISO_PIN   16

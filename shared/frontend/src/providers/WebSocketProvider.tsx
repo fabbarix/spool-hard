@@ -172,10 +172,13 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
       const url = `ws://${location.host}/ws?key=${encodeURIComponent(key)}`;
       const ws = new WebSocket(url);
       wsRef.current = ws;
+      // Backoff resets only once the server actually talks to us (first
+      // message). A device that accepts the upgrade then immediately
+      // closes (scale dashboard cap, close code 1013) must not reset it.
+      let gotMessage = false;
 
       ws.onopen = () => {
         setIsConnected(true);
-        retryDelay.current = 1000;
         bumpSilenceTimer();
         // After a fresh connect (including reconnect), invalidate the
         // live resources so React Query refetches once via HTTP and
@@ -184,14 +187,19 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
         resyncCaches();
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         setIsConnected(false);
         if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
         if (!unmounted) {
-          timer = setTimeout(() => {
+          let delay = retryDelay.current;
+          if (ev.code === 1013) {
+            // Device refused: too many dashboards open. Retry slowly.
+            console.warn('[WS] refused by device (too many dashboards open); retrying in 30 s');
+            delay = 30000;
+          } else {
             retryDelay.current = Math.min(retryDelay.current * 2, 10000);
-            connect();
-          }, retryDelay.current);
+          }
+          timer = setTimeout(connect, delay);
         }
       };
 
@@ -200,6 +208,7 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
       };
 
       ws.onmessage = (ev) => {
+        if (!gotMessage) { gotMessage = true; retryDelay.current = 1000; }
         bumpSilenceTimer();
         let msg: WsMessage;
         try {

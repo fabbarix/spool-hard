@@ -61,6 +61,7 @@ public:
     bool isLazy() const { return _lazy; }
 
     static constexpr size_t kLazyFloorBytes = 12288;
+    static constexpr uint32_t kShrinkDelayMs = 3000;   // surplus-slot grace before shrink
 
     // Returns a shared_ptr whose pointee is safe to mutate (only the
     // pool + the caller hold references). The caller is expected to
@@ -100,6 +101,7 @@ private:
     bool _lazy = false;
     uint32_t _lastWarnMs = 0;
     uint32_t _lastLogMs = 0;
+    uint32_t _excessSinceMs = 0;
     std::atomic<uint32_t> _wsClients{0};
     std::atomic<uint32_t> _consoleClients{0};
 };

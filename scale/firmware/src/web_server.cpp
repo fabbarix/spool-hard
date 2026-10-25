@@ -50,8 +50,8 @@ void ScaleWebServer::start() {
 
 // ── Debug broadcast ──────────────────────────────────────────
 //
-// All WS broadcast paths funnel through the WsBufferPool: an up-to-8-slot
-// LAZY ring of 8 KB (allocated on first push, freed when no tab is open) AsyncWebSocketSharedBuffers. The JSON
+// All WS broadcast paths funnel through the WsBufferPool: an up-to-SCALE_WS_POOL_SLOTS
+// LAZY ring of 8 KB (allocated on first push, shrunk to the tab count) AsyncWebSocketSharedBuffers. The JSON
 // envelope is built with the PSRAM-backed allocator so the node tree
 // lives in external RAM, then serialized directly into the pool slot.
 // Net per-broadcast internal-DRAM allocation under steady state: ZERO.
@@ -143,6 +143,17 @@ void ScaleWebServer::_setupRoutes() {
     _ws.onEvent([](AsyncWebSocket* server, AsyncWebSocketClient* client,
                    AwsEventType type, void*, uint8_t*, size_t) {
         if (type == WS_EVT_CONNECT) {
+            // Dashboard cap (no PSRAM: each tab costs pool DRAM). count()
+            // already includes this client. The console link lives on
+            // /ws/console and is unaffected. Close with 1013 "try again
+            // later"; the browser's reconnect backoff handles the rest.
+            if (server->count() > (size_t)SCALE_WS_MAX_DASHBOARDS) {
+                Serial.printf("[WS] Client #%u from %s REFUSED: dashboard cap %d reached\n",
+                              client->id(), client->remoteIP().toString().c_str(),
+                              (int)SCALE_WS_MAX_DASHBOARDS);
+                client->close(1013, "too many dashboards");
+                return;
+            }
             client->setCloseClientOnQueueFull(false);
             // Periodic ping so stale browser tabs (closed laptop lid,
             // sleeping phone) get cleaned up in seconds instead of hours.
