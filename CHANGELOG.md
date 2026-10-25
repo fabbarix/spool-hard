@@ -8,6 +8,67 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.14.0] - 2026-10-25
+
+A console responsiveness and NFC release: a redesigned printer-first LCD
+home screen, reliable tag reads on the console, no more tag flapping on the
+scale, a much lighter console main loop, and leaner MQTT parsing.
+
+**Behaviour changes — read before updating**
+- **Scale dashboard: at most 3 browser tabs at once.** Extra tabs get
+  "too many dashboards" and retry after 30 s. This keeps the scale (which
+  has no PSRAM) from running out of memory with many tabs open.
+- **Console NFC: one event per tag presentation.** A tag left on the
+  reader no longer re-fires every 3 s; it is reported once and counted as
+  removed after ~2 s without seeing it. Lifting and re-tapping still works.
+- SD card access (crash log, spool/filament stores, downloads,
+  backup/restore) now goes through a single lock, and the crash-log flush
+  runs on a background housekeeping task.
+
+**Features**
+- Console LCD: new printer-first home — large progress percentage and bar,
+  five centred slot tiles (AMS 1-4 + External) with colour swatches, a
+  FEEDING badge on the active slot, and an offline card with Retry.
+- Console LCD: "Load into slot..." on the spool screen lets you pick the
+  destination (AMS slot 1-4 or External) for a scanned spool.
+- Debug tools (off by default; session-only toggles under Config → Debug):
+  LCD screenshot (`/api/debug/lcd.bmp`) and touch injection, NFC tag dump
+  (`/api/debug/nfc` on console and scale), gcode-analysis timing
+  (`/api/debug/analysis`), and loop timing in `/api/heap`.
+
+**Fixes**
+- Console NFC: NTAG tags that failed to read (shown as unknown/generic) now
+  read reliably — the PN532 target number was uninitialised. Pages are read
+  four at a time and polling runs on its own task.
+- Scale NFC: a tag held on the reader no longer flaps between removed and
+  read every 0.4-2 s; brief contact drop-outs are absorbed. The log no
+  longer labels every 7-byte UID as "BambuLab".
+- Scale: idle WebSocket buffers are released when dashboards close (all of
+  them when no dashboard is connected).
+- LCD: missing glyphs (g/cm³, Import icon), clipped rows, small touch
+  targets (all now ≥ 44 px), low-contrast muted text, and the gap between
+  the FEEDING badge and the slot border.
+- LCD screenshot endpoint no longer returns truncated images.
+
+**Performance**
+- Console main loop busy time down from ~50 % to ~18 % at idle (OTA config
+  cached instead of ~200 NVS opens/s, SD and crash-log work moved to a
+  housekeeping task, home tiles updated by an LVGL timer).
+- Bambu MQTT reports are parsed through an ArduinoJson filter: parse
+  memory 24.5 KB → 6.0 KB and about 4x faster, with identical results
+  (host test over 50 real H2S reports).
+- Hot JSON documents and the stock-filament list moved to PSRAM; LVGL
+  trimmed. Console firmware is 77 KB smaller (2,256,031 → 2,178,783 B)
+  despite the new features.
+- Scale minimum free memory with 3 dashboards open: ~75-82 KB (was 25 KB
+  with unbounded tabs).
+- Duplicated console/scale code (WiFi helpers, rate gating, printing)
+  moved into the shared `spoolhard_core` library.
+
+**Known limitations**
+- Printer control still requires LAN Only + Developer Mode on newer Bambu
+  firmware (see 0.13.0).
+
 ## [0.13.0] - 2026-10-24
 
 A reliability, memory and UI release: the scale's NFC heap-corruption
