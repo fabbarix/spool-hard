@@ -503,8 +503,8 @@ The old `[LoopLat]` >200 ms per-step / >500 ms first-half lines remain.
 
 **Housekeeping task (step 4)**: `console/firmware/src/housekeeping.cpp` runs
 `SdCard::update()` (2 s mount/liveness gate) and `CrashLogger::update()` (3 s
-spill gate) from one `housekeeping` task (4 KB internal stack, core 0, prio 1,
-100 ms tick; logs `[HK] stack_hwm` at +30 s then every 5 min). `loop()` only
+spill gate) from one `housekeeping` task (5 KB internal stack, core 0, prio 1,
+100 ms tick; logs `[HK] stack_hwm` at +30 s then every 5 min; 4 KB measured only ~1.1 KB free, so raised; keep >= ~1 KB free). `loop()` only
 calls them when `housekeepingActive()` is false (task-create failure
 fallback), so LoopStat `sd`/`crash_log` now read ~0. `SdCard::_mounted` is
 `std::atomic<bool>`. `CrashLogger::flush(sdLockTimeoutMs=50)` is still callable

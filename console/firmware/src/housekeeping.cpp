@@ -7,12 +7,12 @@
 #include <freertos/task.h>
 #include "spoolhard/serial_mirror.h"
 
-// Stack: 4096 B internal. Worst path is SdCard::_tryMount() (SD.begin ->
+// Stack: 5120 B internal (4096 measured ~1.1 KB free; SD.begin remount path unexercised). Worst path is SdCard::_tryMount() (SD.begin ->
 // sdmmc/FATFS mount, ~2 KB) or CrashLogger::flush() (260 B line buffer + File
 // + snprintf; the entry vector lives on the heap). The two never nest. The
 // high-water mark is logged ("[HK] stack_hwm") at +30 s and then every 5 min
-// so a verifier can confirm headroom; bump kStack if it drops below ~800 B.
-static constexpr uint32_t kStack  = 4096;
+// so a verifier can confirm headroom; bump kStack if it drops below ~1 KB.
+static constexpr uint32_t kStack  = 5120;
 static constexpr uint32_t kTickMs = 100;
 static std::atomic<bool> s_active{false};
 
