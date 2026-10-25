@@ -412,6 +412,7 @@ static void build_home() {
         lv_obj_set_style_border_color(tile, COL_BORDER, 0);
         lv_obj_set_style_border_width(tile, 2, 0);
         lv_obj_set_style_radius(tile, 8, 0);
+        lv_obj_set_style_clip_corner(tile, true, 0);
         lv_obj_set_style_pad_all(tile, 0, 0);
         lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
         // Tap-to-open the slot detail screen. The slot index rides along as
@@ -462,12 +463,15 @@ static void build_home() {
 
         // "FEEDING" badge for the active tray (replaces the K line).
         lv_obj_t* badge = lv_obj_create(tile);
-        lv_obj_set_pos(badge, 1, 98);
-        lv_obj_set_size(badge, 82, 22);
+        // Flush footer: child coords are inside the 2 px border, so the content
+        // area is 84x124 and the badge spans it fully (x 0..84, y 102..124).
+        // The tile clips children to its rounded corners (inner radius 6).
+        lv_obj_set_pos(badge, 0, 102);
+        lv_obj_set_size(badge, 84, 22);
         lv_obj_set_style_bg_color(badge, COL_BRAND, 0);
         lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(badge, 0, 0);
-        lv_obj_set_style_radius(badge, 4, 0);
+        lv_obj_set_style_radius(badge, 0, 0);
         lv_obj_set_style_pad_all(badge, 0, 0);
         lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(badge, LV_OBJ_FLAG_CLICKABLE);
