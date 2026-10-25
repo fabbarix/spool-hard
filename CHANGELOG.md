@@ -8,6 +8,15 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.14.3] - 2026-10-25
+
+**Fixes**
+- Console LCD: when both the console and the scale have an update, one tap
+  on the banner now updates the scale first (with its progress) and then
+  the console, instead of starting both at once with the two progress
+  displays fighting each other. If the scale update fails or stalls for
+  2 minutes, the console update still runs.
+
 ## [0.14.2] - 2026-10-25
 
 **Fixes**
