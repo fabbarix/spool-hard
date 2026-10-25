@@ -1,6 +1,9 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <memory>
+
+struct SnapStream;   // opaque per-stream snapshot ownership (display.cpp)
 
 // Brings up the WT32-SC01-Plus LCD + touch via LovyanGFX, wires it into
 // LVGL 9, and spawns an LVGL task pinned to Core 1. After begin() returns,
@@ -45,27 +48,28 @@ public:
 
     // ── Debug LCD access (gated by the web-layer debug toggle) ──────────
     // Snapshot: the screen is rendered by a one-shot task into a single
-    // lazily-allocated PSRAM buffer (RGB565, ~300 KB), then streamed as a
-    // 24-bit BMP (negative height = top-down) through snapshotFill() and
-    // freed on the last chunk / disconnect / 30 s staleness. All calls
-    // are made from the AsyncTCP task (serialised), none block.
+    // PSRAM buffer (RGB565, ~300 KB). When a client claims it
+    // (snapshotClaim) ownership moves into a SnapStream held by the chunked
+    // response's fill lambda, so the buffer lives exactly as long as that
+    // response (freed when the response is destroyed: end of body, client
+    // disconnect, or lib timeout) and nothing else can free it mid-stream.
+    // An unclaimed READY buffer is swept after 30 s / on toggle-off.
+    // All request-side calls run on the AsyncTCP task (serialised).
     enum SnapStatus : uint8_t { SNAP_PENDING, SNAP_READY, SNAP_BUSY, SNAP_FAILED };
     static constexpr size_t SNAP_BMP_BYTES = 54 + 480 * 320 * 3;
     // IDLE: starts a capture -> PENDING. PENDING: still rendering.
-    // READY: claims the buffer for streaming (caller must then stream via
-    // snapshotFill). BUSY: a stream is in progress. FAILED: capture failed.
+    // READY: a buffer is waiting; call snapshotClaim(). BUSY: a stream is
+    // in progress. FAILED: capture failed.
     static SnapStatus snapshotRequest();
-    // AsyncWebServer chunked-response fill callback; returns 0 at end.
-    static size_t     snapshotFill(uint8_t* out, size_t maxLen, size_t index);
-    // Release a claimed buffer early (client disconnected).
-    // `gen` is snapshotGeneration() captured when the stream was claimed;
-    // a stale disconnect (older stream) is ignored.
-    static void       snapshotAbort(uint32_t gen);
-    static uint32_t   snapshotGeneration();
-    // Free any READY/STREAMING buffer now (debug toggle turned off).
+    // Only valid right after snapshotRequest() returned SNAP_READY.
+    static std::shared_ptr<SnapStream> snapshotClaim();
+    // Chunked-response fill callback; pure function of `index` (idempotent
+    // under lib retries); returns 0 only at the true end of the body.
+    static size_t snapshotFill(const SnapStream& st, uint8_t* out, size_t maxLen, size_t index);
+    // Free an unclaimed READY buffer now (debug toggle turned off).
     static void       snapshotRelease();
-    // Frees an abandoned (>30 s) READY/STREAMING buffer; called from the
-    // LVGL task loop.
+    // Frees an unclaimed READY buffer older than 30 s; called from the
+    // LVGL task loop. Never touches a stream in progress.
     static void       snapshotSweep();
 
     // Touch injection into the LVGL indev. action: 0 = tap (press, ~100 ms,
