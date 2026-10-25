@@ -565,7 +565,7 @@ void ScaleLink::_dispatch(const ScaleToConsole::Message& msg) {
             // We read the structured fields when present; the human-
             // readable `text` is also surfaced in the recorded event.
             JsonVariantConst st = msg.doc["Status"];
-            if (!st.is<JsonObject>()) break;
+            if (!st.is<JsonObjectConst>()) break;   // const view: is<JsonObject>() is always false
             int pct = st["percent"] | -1;
             const char* kind = st["kind"] | "";
             if (pct >= 0) {

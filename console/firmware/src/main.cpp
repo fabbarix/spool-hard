@@ -1573,8 +1573,11 @@ static void _refreshOtaBannerImpl() {
 static void _onOtaBannerTap() {
     auto cp = g_ota_checker.pending();
     const auto& sp = g_scale.scaleOtaPending();
-    if (sp.valid && (sp.firmware_update || sp.frontend_update)) {
+    if (sp.valid && (sp.firmware_update || sp.frontend_update) && !g_scaleOtaActive) {
         g_scale.requestScaleOtaUpdate();
+        // Same as the Settings "Update scale" path: arm the progress mirror,
+        // otherwise the scale updates silently and the tap looks ignored.
+        g_scaleOtaActive = true;
     }
     if (cp.firmware || cp.frontend) {
         g_pendingOta = true;
@@ -1767,7 +1770,13 @@ void loop() {
         static bool     s_scaleSawProgress = false;
         static int      s_lastScalePct     = -1;
         static uint32_t s_scaleArmedAt     = 0;
-        if (s_scaleArmedAt == 0) s_scaleArmedAt = millis();
+        if (s_scaleArmedAt == 0) {
+            s_scaleArmedAt = millis();
+            // Immediate feedback: the scale's first progress frame only
+            // arrives after its manifest fetch.
+            ConsoleDisplay::wake();
+            ui_show_ota_progress(0, "Updating scale", "starting");
+        }
         const auto& sf = g_scale.scaleOtaInFlight();
         bool timedOut = (millis() - s_scaleArmedAt) > 180000;
         auto disarm = [&]() {
