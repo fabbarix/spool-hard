@@ -19,6 +19,9 @@
 #include "protocol.h"
 #include "spoolhard/ota.h"
 #include "sdcard.h"
+#include "housekeeping.h"
+#include <lvgl.h>
+#include <freertos/semphr.h>
 #include "bambu_manager.h"
 #include "bambu_cloud.h"
 #include "bambu_discovery.h"
@@ -68,6 +71,7 @@ static bool    g_scaleOtaActive = false;
 static String   g_activeSpoolId;
 static uint32_t g_activeSpoolOpenedMs  = 0;
 static uint32_t g_activeSpoolExpiresAt = 0;  // millis: AMS-load timeout deadline
+static void _homeUiBegin();   // defined with the home-UI snapshot below
 static uint32_t g_spoolAutoCloseAt     = 0;  // millis: loop() should ui_show_home() when crossed
 static constexpr uint32_t SPOOL_AUTOCLOSE_MS = 2500;  // confirmation dwell after AMS assign
 
@@ -241,6 +245,7 @@ void setup() {
     // present and the previous boot ended in a panic / watchdog reset,
     // begin() also archives the prior session's log under crashes/.
     CrashLogger::begin();
+    housekeepingBegin();   // SdCard::update + CrashLogger::update off loopTask
     g_bambu.begin();
     g_bambu_cloud.begin();
     // SNTP — gives the OTA checker a real wall-clock for "last
@@ -253,6 +258,7 @@ void setup() {
     // Display + LVGL (task is pinned to Core 1 inside begin()).
     g_display.begin();
     ui_init();
+    _homeUiBegin();   // lv_timer on the lvgl task applies the home-tile snapshot
     ui_show_splash();
 
     // Apply the persisted screen-sleep timeout (NVS, seconds). 0 = off.
@@ -284,6 +290,7 @@ void setup() {
             // first so the user keeps their data without manual action.
             want_sd = g_sd.isMounted();
             if (want_sd) {
+                SdLock sdl(5000);   // boot-time migration; scope = this block
                 bool have_internal_data = LittleFS.exists(SPOOLS_PATH_INTERNAL);
                 bool have_sd_data       = SD.exists(SPOOLS_PATH_SD);
                 if (have_internal_data && !have_sd_data) {
@@ -327,7 +334,10 @@ void setup() {
                     "Spool store is set to SD but no SD card is mounted. "
                     "Insert the card or override to internal flash.");
             } else {
-                if (!SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                {
+                    SdLock sdl(5000);
+                    if (!SD.exists(SPOOLEASE_SD_DIR)) SD.mkdir(SPOOLEASE_SD_DIR);
+                }
                 g_store.begin(SD, SPOOLS_PATH_SD);
                 g_store.markBackendIsSd(true);
             }
@@ -1149,7 +1159,123 @@ void setup() {
 // stored — the onboarding → home transition block in loop() below never
 // fires, so the footer labels would otherwise stay on their "—"
 // placeholders forever.
+// ── Change-detection helpers for the 1 Hz LCD refresh (loopTask only) ──
+// FNV-1a over the displayed values. Hashing happens on loopTask, which is
+// also the only writer of PrinterState (g_bambu.update()), so no cross-task
+// reads. A skipped refresh is always re-forced after kLcdSafetyMs.
+static constexpr uint32_t kLcdSafetyMs = 5000;
+static inline void _fnv(uint32_t& h, const void* p, size_t n) {
+    const uint8_t* b = (const uint8_t*)p;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 16777619u; }
+}
+static inline void _fnvS(uint32_t& h, const String& s) {
+    _fnv(h, s.c_str(), s.length()); uint8_t z = 0xff; _fnv(h, &z, 1);
+}
+template <typename T> static inline void _fnvV(uint32_t& h, T v) { _fnv(h, &v, sizeof(v)); }
+
+// ── Home-UI snapshot (loopTask -> lvgl task) ──────────────────────────
+// loopTask still hashes state, decides WHEN a tile needs repainting and builds
+// the display values (it owns PrinterState / Strings / store lookups). It no
+// longer calls ui_set_* (which block on lv_lock while the lvgl task renders):
+// it publishes a fixed-size POD section here and an lv_timer on the lvgl task
+// applies it. Sections are independent (own seq) so a later publish of one
+// never clobbers an unapplied other. No Strings cross the task boundary.
+//
+// LOCKING: lv_timer callbacks run inside lv_timer_handler() with lv_lock held
+// (LV_USE_OS=FREERTOS -> recursive mutex), and every ui_set_* does its own
+// lv_lock()/lv_unlock() -> recursive re-entry, no deadlock. Order is
+// lv_lock -> s_homeMtx (leaf, memcpy only, never held across a ui_* call);
+// loopTask takes only s_homeMtx and never lv_lock here.
+struct HomeSnap {
+    char     devNames[100]; bool devShow;
+    char     host[64];      uint8_t wifiState;
+    char     ip[20];
+    bool     amsHas;        char status[48];
+    UiAmsSlot slots[5];     UiPrinterSnapshot psnap;
+    bool     otaShow;       char otaText[96];
+};
+enum { HS_DEV, HS_FOOT, HS_IP, HS_AMS, HS_OTA, HS_N };
+static HomeSnap                  s_hs = {};
+static std::atomic<uint32_t>     s_hsSeq[HS_N];       // bumped by loopTask
+static uint32_t                  s_hsApplied[HS_N];   // lvgl task only
+static SemaphoreHandle_t         s_homeMtx = nullptr;
+
+static inline void _hsPublishBegin() { xSemaphoreTake(s_homeMtx, portMAX_DELAY); }
+static inline void _hsPublishEnd(int sec) {
+    s_hsSeq[sec].fetch_add(1);
+    xSemaphoreGive(s_homeMtx);
+}
+
+// lv_timer callback (lvgl task, lv_lock already held).
+static void _homeUiTimerCb(lv_timer_t*) {
+    if (s_hsSeq[HS_DEV].load() != s_hsApplied[HS_DEV]) {
+        char names[sizeof(s_hs.devNames)]; bool show;
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_DEV] = s_hsSeq[HS_DEV].load();
+        memcpy(names, s_hs.devNames, sizeof(names)); show = s_hs.devShow;
+        xSemaphoreGive(s_homeMtx);
+        ui_set_dev_mode_warning(show ? names : nullptr);
+    }
+    if (s_hsSeq[HS_FOOT].load() != s_hsApplied[HS_FOOT]) {
+        char host[sizeof(s_hs.host)]; uint8_t ws;
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_FOOT] = s_hsSeq[HS_FOOT].load();
+        memcpy(host, s_hs.host, sizeof(host)); ws = s_hs.wifiState;
+        xSemaphoreGive(s_homeMtx);
+        ui_set_hostname(host, (wifi_lcd_state_t)ws);
+    }
+    if (s_hsSeq[HS_IP].load() != s_hsApplied[HS_IP]) {
+        char ip[sizeof(s_hs.ip)];
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_IP] = s_hsSeq[HS_IP].load();
+        memcpy(ip, s_hs.ip, sizeof(ip));
+        xSemaphoreGive(s_homeMtx);
+        ui_set_ip(ip);
+    }
+    if (s_hsSeq[HS_AMS].load() != s_hsApplied[HS_AMS]) {
+        bool has; char status[sizeof(s_hs.status)];
+        UiAmsSlot slots[5]; UiPrinterSnapshot ps;
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_AMS] = s_hsSeq[HS_AMS].load();
+        has = s_hs.amsHas;
+        memcpy(status, s_hs.status, sizeof(status));
+        memcpy(slots, s_hs.slots, sizeof(slots));
+        ps = s_hs.psnap;
+        xSemaphoreGive(s_homeMtx);
+        if (has) { ui_set_ams_panel(status, slots); ui_set_printer_panel(&ps); }
+        else     { ui_set_ams_panel(nullptr, nullptr); ui_set_printer_panel(nullptr); }
+    }
+    if (s_hsSeq[HS_OTA].load() != s_hsApplied[HS_OTA]) {
+        char text[sizeof(s_hs.otaText)]; bool show;
+        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
+        s_hsApplied[HS_OTA] = s_hsSeq[HS_OTA].load();
+        memcpy(text, s_hs.otaText, sizeof(text)); show = s_hs.otaShow;
+        xSemaphoreGive(s_homeMtx);
+        ui_set_ota_banner(show, show ? text : nullptr);
+    }
+}
+// Call once after ui_init() (setup, loopTask).
+static void _homeUiBegin() {
+    s_homeMtx = xSemaphoreCreateMutex();
+    lv_lock();
+    lv_timer_create(_homeUiTimerCb, 100, nullptr);
+    lv_unlock();
+}
+
+static void _refreshHomeFooterImpl();
 static void _refreshHomeFooter() {
+    static uint32_t s_lastHash = 0, s_lastMs = 0;
+    static bool s_valid = false;
+    uint32_t h = 2166136261u;
+    _fnvV(h, (int)g_wifi.getState());
+    _fnvV(h, (int)WiFi.status());
+    _fnvS(h, g_wifi.getDeviceName());
+    uint32_t now = millis();
+    if (s_valid && h == s_lastHash && (now - s_lastMs) < kLcdSafetyMs) return;
+    s_valid = true; s_lastHash = h; s_lastMs = now;
+    _refreshHomeFooterImpl();
+}
+static void _refreshHomeFooterImpl() {
     // Map the firmware-facing WifiState into the UI's four-state enum.
     // Unconfigured/Failed both drive the provisioning SoftAP (orange);
     // Connecting is yellow; Connected is green; anything else renders
@@ -1169,14 +1295,19 @@ static void _refreshHomeFooter() {
     host.toLowerCase();
     host.replace(' ', '-');
     if (host.length()) host += ".local";
-    ui_set_hostname(host.c_str(), wifi_state);
+    _hsPublishBegin();
+    snprintf(s_hs.host, sizeof(s_hs.host), "%s", host.c_str());
+    s_hs.wifiState = (uint8_t)wifi_state;
+    _hsPublishEnd(HS_FOOT);
 
     // IP only makes sense when the STA interface is up.
     if (WiFi.status() == WL_CONNECTED) {
         static String s_last_ip;
         String ip = WiFi.localIP().toString();
         if (ip != s_last_ip) {
-            ui_set_ip(ip.c_str());
+            _hsPublishBegin();
+            snprintf(s_hs.ip, sizeof(s_hs.ip), "%s", ip.c_str());
+            _hsPublishEnd(HS_IP);
             s_last_ip = ip;
         }
     }
@@ -1204,14 +1335,52 @@ static void _refreshDevModeWarning() {
     }
     if (names == s_last) return;
     s_last = names;
-    ui_set_dev_mode_warning(names.length() ? names.c_str() : nullptr);
+    _hsPublishBegin();
+    snprintf(s_hs.devNames, sizeof(s_hs.devNames), "%s", names.c_str());
+    s_hs.devShow = names.length() > 0;
+    _hsPublishEnd(HS_DEV);
 }
 
+static void _refreshHomeAmsPanelImpl();
+static void _hashTray(uint32_t& h, const AmsTray& t) {
+    _fnvV(h, t.id); _fnvS(h, t.tray_type); _fnvS(h, t.tray_color);
+    _fnvS(h, t.tag_uid); _fnvV(h, t.remain_pct); _fnvV(h, t.k);
+    _fnvS(h, t.mapped_spool_id);
+}
 static void _refreshHomeAmsPanel() {
     _refreshDevModeWarning();
     // Nothing visible while the LCD is asleep; the next 1 s tick after wake
-    // repaints (ui_set_*_panel also skip identical snapshots).
-    if (ConsoleDisplay::isAsleep()) return;
+    // repaints (ui_set_*_panel also skip identical snapshots). Invalidate
+    // the change-hash so the first awake tick always repaints.
+    static uint32_t s_lastHash = 0, s_lastMs = 0;
+    static bool s_valid = false;
+    if (ConsoleDisplay::isAsleep()) { s_valid = false; return; }
+
+    // Hash everything the panel/printer card displays (plus the spool-store
+    // generation, which covers weight/colour/material fallbacks).
+    uint32_t h = 2166136261u;
+    _fnvV(h, g_store.generation());
+    for (const auto& pp : g_bambu.printers()) {
+        if (!pp) continue;
+        const PrinterState& s = pp->state();
+        _fnvV(h, (int)s.link);
+        if (s.link != BambuLinkState::Connected) continue;
+        _fnvS(h, pp->config().name); _fnvS(h, pp->config().serial);
+        _fnvS(h, s.gcode_state);
+        _fnvV(h, s.progress_pct); _fnvV(h, s.layer_num); _fnvV(h, s.total_layers);
+        _fnvV(h, (int)(s.nozzle_temp * 10.f)); _fnvV(h, (int)(s.bed_temp * 10.f));
+        _fnvV(h, s.active_tray); _fnvV(h, s.ams_count); _fnvV(h, s.has_vt_tray);
+        if (s.ams_count > 0)
+            for (int t = 0; t < 4; ++t) _hashTray(h, s.ams[0].trays[t]);
+        if (s.has_vt_tray) _hashTray(h, s.vt_tray);
+        break;   // LCD shows the first connected printer only
+    }
+    uint32_t now = millis();
+    if (s_valid && h == s_lastHash && (now - s_lastMs) < kLcdSafetyMs) return;
+    s_valid = true; s_lastHash = h; s_lastMs = now;
+    _refreshHomeAmsPanelImpl();
+}
+static void _refreshHomeAmsPanelImpl() {
     for (const auto& pp : g_bambu.printers()) {
         if (!pp) continue;
         const PrinterState& s = pp->state();
@@ -1307,7 +1476,7 @@ static void _refreshHomeAmsPanel() {
             snprintf(slots[4].label, sizeof(slots[4].label), "Ext");
         }
 
-        ui_set_ams_panel(status, slots);
+        // Published below together with the printer-card snapshot.
 
         // Build + push the printer-card snapshot so the LCD's new strip
         // above the AMS tiles shows link state, gcode state, progress bar,
@@ -1326,12 +1495,18 @@ static void _refreshHomeAmsPanel() {
         // report populates both, so "either is positive" is a reliable
         // "we have real data" proxy.
         snap.has_temps    = (s.nozzle_temp > 0.f) || (s.bed_temp > 0.f);
-        ui_set_printer_panel(&snap);
+        _hsPublishBegin();
+        s_hs.amsHas = true;
+        snprintf(s_hs.status, sizeof(s_hs.status), "%s", status);
+        memcpy(s_hs.slots, slots, sizeof(slots));
+        s_hs.psnap = snap;
+        _hsPublishEnd(HS_AMS);
         return;
     }
     // No connected printer — hide both panels.
-    ui_set_ams_panel(nullptr, nullptr);
-    ui_set_printer_panel(nullptr);
+    _hsPublishBegin();
+    s_hs.amsHas = false;
+    _hsPublishEnd(HS_AMS);
 }
 
 // Combined OTA-pending banner refresh. Reads the console's own pending
@@ -1339,7 +1514,24 @@ static void _refreshHomeAmsPanel() {
 // and reflects either / both on the LCD home screen. Hides the banner when
 // nothing is pending. Cheap — one LVGL call only when the message text
 // actually changed.
+static void _refreshOtaBannerImpl();
 static void _refreshOtaBanner() {
+    static uint32_t s_lastHash = 0, s_lastMs = 0;
+    static bool s_valid = false;
+    uint32_t h = 2166136261u;
+    {
+        auto cp = g_ota_checker.pending();
+        const auto& sp = g_scale.scaleOtaPending();
+        _fnvV(h, cp.firmware); _fnvV(h, cp.frontend); _fnvS(h, cp.firmware_latest);
+        _fnvV(h, sp.valid); _fnvV(h, sp.firmware_update);
+        _fnvV(h, sp.frontend_update); _fnvS(h, sp.firmware_latest);
+    }
+    uint32_t now = millis();
+    if (s_valid && h == s_lastHash && (now - s_lastMs) < kLcdSafetyMs) return;
+    s_valid = true; s_lastHash = h; s_lastMs = now;
+    _refreshOtaBannerImpl();
+}
+static void _refreshOtaBannerImpl() {
     auto cp = g_ota_checker.pending();
     const auto& sp = g_scale.scaleOtaPending();
     bool consolePending = cp.firmware || cp.frontend;
@@ -1348,7 +1540,9 @@ static void _refreshOtaBanner() {
     static String _lastText;
     if (!consolePending && !scalePending) {
         if (!_lastText.isEmpty()) {
-            ui_set_ota_banner(false, nullptr);
+            _hsPublishBegin();
+            s_hs.otaShow = false;
+            _hsPublishEnd(HS_OTA);
             _lastText = "";
         }
         return;
@@ -1364,7 +1558,10 @@ static void _refreshOtaBanner() {
         text = "Scale "   + sp.firmware_latest + " ready - tap to install";
     }
     if (text != _lastText) {
-        ui_set_ota_banner(true, text.c_str());
+        _hsPublishBegin();
+        s_hs.otaShow = true;
+        snprintf(s_hs.otaText, sizeof(s_hs.otaText), "%s", text.c_str());
+        _hsPublishEnd(HS_OTA);
         _lastText = text;
     }
 }
@@ -1399,8 +1596,10 @@ void loop() {
     LAT_STEP(S_WIFI, "wifi",            g_wifi.update());
     LAT_STEP(S_SCALE, "scale",           g_scale.update());
     LAT_STEP(S_NFC, "nfc",             g_nfc.update());
-    LAT_STEP(S_SD, "sd",              g_sd.update());
-    LAT_STEP(S_CRASH_LOG, "crash_log",       CrashLogger::update());
+    if (!housekeepingActive()) {   // fallback only; normally the housekeeping task owns these
+        LAT_STEP(S_SD, "sd",              g_sd.update());
+        LAT_STEP(S_CRASH_LOG, "crash_log",       CrashLogger::update());
+    }
     LAT_STEP(S_BAMBU, "bambu",           g_bambu.update());
     LAT_STEP(S_SSDP, "ssdp",            ssdp_hub_poll());
     LAT_STEP(S_BAMBU_DISC, "bambu_discovery", g_bambu_discovery.update());
@@ -1467,7 +1666,21 @@ void loop() {
         // watching, and the scale_link key has no rate gate so it goes
         // out every second when a tab IS open. The "ago_ms" alone
         // updating every second tells the user the link is alive.
-        g_web.pushScaleLink();
+        // Event-driven now: ScaleLink pushes on every event/handshake
+        // transition itself. This is only the keep-alive so the dashboard's
+        // *_ago_ms fields (weight/event/heartbeat) refresh — gated to 5 s
+        // (or immediately on a connect/disconnect flip).
+        {
+            static uint32_t s_lastLinkPush = 0;
+            static bool s_lastLinked = false;
+            bool linked = g_scale.isConnected();
+            uint32_t nowp = millis();
+            if (linked != s_lastLinked || nowp - s_lastLinkPush >= 5000) {
+                s_lastLinked = linked;
+                s_lastLinkPush = nowp;
+                g_web.pushScaleLink();
+            }
+        }
         // ESPAsyncWebServer holds AsyncWebSocketClient instances even
         // after the underlying TCP connection drops abruptly (page
         // navigated away, network change, browser killed). Without a

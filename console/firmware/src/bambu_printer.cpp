@@ -2352,6 +2352,7 @@ void BambuPrinter::_maybeRetryAnalysis() {
 //              to GET /api/ftp-download to save the file.
 #include <SD.h>
 #include "config.h"       // SD_MOUNT
+#include "sdcard.h"       // SdLock
 #include "spoolhard/serial_mirror.h"
 
 BambuPrinter::FtpStreamCtx::FtpStreamCtx() {
@@ -2513,8 +2514,14 @@ void BambuPrinter::_runFtpDebug(const String& op, const String& path,
         // on writes (and on exists()/remove(), giving the false "doesn't
         // exist" answer that lets us fall through to open() and 0).
         const char* dest_path = "/ftp_dl.bin";
-        if (SD.exists(dest_path)) SD.remove(dest_path);
-        File out = SD.open(dest_path, FILE_WRITE);
+        File out;
+        {
+            SdLock sdl(1000);
+            if (sdl) {
+                if (SD.exists(dest_path)) SD.remove(dest_path);
+                out = SD.open(dest_path, FILE_WRITE);
+            }
+        }
         if (!out) {
             emitDone(s, serial, op, false, String("open ") + dest_path + " failed");
             ftp.quit();
@@ -2525,6 +2532,9 @@ void BambuPrinter::_runFtpDebug(const String& op, const String& path,
         size_t total_bytes = 0;
         uint32_t last_report_ms = 0;
         bool ok = ftp.retrieveStream(path, [&](const uint8_t* d, size_t n, size_t t) {
+            // SD lock per chunk only (never across the FTP network read).
+            SdLock sdl(500);
+            if (!sdl) return false;
             size_t w = out.write(d, n);
             total_bytes = t;
             if (w != n) return false;
@@ -2534,7 +2544,7 @@ void BambuPrinter::_runFtpDebug(const String& op, const String& path,
             }
             return true;
         });
-        out.close();
+        { SdLock sdl(1000); out.close(); }
         if (!ok) {
             emitDone(s, serial, op, false, String("download failed: ") + ftp.lastError());
         } else {

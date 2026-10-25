@@ -61,28 +61,43 @@ void StockFilamentsStore::reload() {
         install(nullptr, nullptr, 0, false);
         return;
     }
-    File f = SD.open(FILAMENTS_PATH, FILE_READ);
+    File f;
+    {
+        SdLock sdl(1000);
+        if (sdl) f = SD.open(FILAMENTS_PATH, FILE_READ);
+    }
     if (!f) {
         Serial.printf("[StockFilaments] %s not found — upload via web UI\n",
                       FILAMENTS_PATH);
         install(nullptr, nullptr, 0, false);
         return;
     }
-    size_t sz = f.size();
+    size_t sz;
+    { SdLock sdl(1000); sz = f.size(); }
     if (!sz) {  // empty file == loaded, zero rows
+        SdLock sdl(1000);
         f.close();
         install(nullptr, nullptr, 0, true);
         return;
     }
     char* buf = (char*)psramAlloc(sz + 1);
     if (!buf) {
-        f.close();
+        { SdLock sdl(1000); f.close(); }
         Serial.println("[StockFilaments] OOM allocating stock buffer");
         install(nullptr, nullptr, 0, false);
         return;
     }
-    size_t got = f.read((uint8_t*)buf, sz);
-    f.close();
+    // Chunked read, SD lock per 4 KB chunk (file can be hundreds of KB).
+    size_t got = 0;
+    while (got < sz) {
+        SdLock sdl(500);
+        if (!sdl) break;
+        size_t want = sz - got < 4096 ? sz - got : 4096;
+        size_t r = f.read((uint8_t*)buf + got, want);
+        if (r == 0) break;
+        got += r;
+    }
+    { SdLock sdl(1000); f.close(); }
     buf[got] = 0;
 
     // Upper bound on row count = number of newlines + 1.

@@ -109,6 +109,8 @@ void _ensureDirs() {
 // Walk crashes/ and return entries ordered by seq ascending.
 std::vector<CrashEntry> _listInternal() {
     std::vector<CrashEntry> out;
+    SdLock sdl;                       // recursive; callers may already hold it
+    if (!sdl) return out;
     File dir = SD.open(kCrashesDir);
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
@@ -230,6 +232,9 @@ void begin() {
         return;
     }
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+    // Lock order: s_mtx -> SdLock.
+    SdLock sdl(2000);
+    if (!sdl) { xSemaphoreGive(s_mtx); return; }
 
     _ensureDirs();
 
@@ -266,16 +271,23 @@ void update() {
     uint32_t now = millis();
     if (now - s_lastFlushAtMs < kFlushIntervalMs) return;
     s_lastFlushAtMs = now;
-    flush();
+    flush(200);   // housekeeping task: can afford to wait for the SD lock
 }
 
-void flush() {
+void flush(uint32_t sdLockTimeoutMs) {
     if (!s_active) return;
     if (!g_sd.isMounted()) return;   // card hot-removed; skip silently
-    auto snap = RingLog::snapshot(s_lastFlushedSeq, /*limit*/ 256);
-    if (snap.empty()) return;
-
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(200)) != pdTRUE) return;
+    // Snapshot under s_mtx: flush() is called from the housekeeping task, from
+    // AsyncTCP (/api/logs/current) and from loopTask (pre-restart), so
+    // s_lastFlushedSeq must not be read/advanced concurrently (dup lines).
+    auto snap = RingLog::snapshot(s_lastFlushedSeq, /*limit*/ 256);
+    if (snap.empty()) { xSemaphoreGive(s_mtx); return; }
+    // Lock order: s_mtx -> SdLock. Short timeout; on contention skip and
+    // retry next tick (s_lastFlushedSeq only advances after a successful
+    // write, so nothing is lost).
+    SdLock sdl(sdLockTimeoutMs);
+    if (!sdl) { xSemaphoreGive(s_mtx); return; }
 
     // FILE_APPEND opens for write at end-of-file — exactly what we want
     // for a streaming log. Single open/close per flush keeps the SD's
@@ -330,7 +342,8 @@ bool remove(uint32_t seq) {
     for (const auto& e : entries) {
         if (e.seq == seq) {
             String p = _crashFilenameFor(e.seq, e.reason.c_str());
-            ok = SD.remove(p);
+            SdLock sdl;
+            ok = sdl && SD.remove(p);
             break;
         }
     }
@@ -345,7 +358,8 @@ size_t removeAll() {
     auto entries = _listInternal();
     for (const auto& e : entries) {
         String p = _crashFilenameFor(e.seq, e.reason.c_str());
-        if (SD.remove(p)) ++removed;
+        SdLock sdl;
+        if (sdl && SD.remove(p)) ++removed;
     }
     xSemaphoreGive(s_mtx);
     return removed;

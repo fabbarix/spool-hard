@@ -510,6 +510,17 @@ served under `loop_stat` in `GET /api/heap` (added via
 `SpoolhardCommonRoutes::setHeapExtra()`, add-only; scale doesn't set it).
 The old `[LoopLat]` >200 ms per-step / >500 ms first-half lines remain.
 
+**Housekeeping task (step 4)**: `console/firmware/src/housekeeping.cpp` runs
+`SdCard::update()` (2 s mount/liveness gate) and `CrashLogger::update()` (3 s
+spill gate) from one `housekeeping` task (5 KB internal stack, core 0, prio 1,
+100 ms tick; logs `[HK] stack_hwm` at +30 s then every 5 min; 4 KB measured only ~1.1 KB free, so raised; keep >= ~1 KB free). `loop()` only
+calls them when `housekeepingActive()` is false (task-create failure
+fallback), so LoopStat `sd`/`crash_log` now read ~0. `SdCard::_mounted` is
+`std::atomic<bool>`. `CrashLogger::flush(sdLockTimeoutMs=50)` is still callable
+synchronously (pre-restart in `wifi_provisioning.cpp`, `/api/logs/current`);
+the housekeeping call uses 200 ms, and the ring snapshot is now taken under
+`s_mtx` so concurrent flushers can't write duplicate lines.
+
 **OTA checker config cache**: `OtaChecker::update()` runs every loop tick
 (~200 Hz on the console). It used to `OtaConfig::load()` (NVS open + 9
 reads) each tick; it now caches only `check_enabled` + `check_interval_h`
@@ -518,6 +529,52 @@ and re-reads when `OtaConfig::save()` bumps a static generation counter
 (safety net for writers that bypass `save()`, e.g. `/api/restore`). A real
 check start does one fresh full `load()` for url/ssl flags. `kickNow()`,
 the 5-min force floor and the interval/boot gates are unchanged.
+
+**Event-driven 1 Hz block (step 2)**: the LCD refreshes in `loop()`
+(`_refreshHomeAmsPanel` / `_refreshHomeFooter` / `_refreshOtaBanner`) now
+FNV-hash the values they display (printer state incl. trays/temps/progress,
+`g_store.generation()`, wifi state/name, OTA pending) on loopTask and skip the
+LVGL/String-building work when the hash is unchanged, forcing a refresh at
+least every 5 s (`kLcdSafetyMs`) and on the first tick after screen wake
+(the hash is invalidated while asleep). `pushScaleLink()` from the 1 Hz
+block is a keep-alive only every 5 s (or immediately on a connect flip);
+`ScaleLink` still pushes on every event/handshake transition itself.
+
+**Home-UI snapshot (step 5)**: loopTask still hashes state and decides when a
+tile needs repainting, but no longer calls `ui_set_*` for the AMS/printer
+panel, footer (hostname/IP), dev-mode warning or OTA banner. It publishes
+fixed-size POD sections (`HomeSnap` in main.cpp, 5 independent sections each
+with an atomic seq, short leaf mutex `s_homeMtx`, no Strings) and a 100 ms
+`lv_timer` (`_homeUiTimerCb`, created in `_homeUiBegin()` after `ui_init()`)
+applies changed sections on the lvgl task. `lv_timer` callbacks run with
+`lv_lock` held; LV_USE_OS=FREERTOS makes it a recursive mutex, so the
+`lv_lock()` inside each `ui_set_*` re-enters safely. Lock order:
+`lv_lock` -> `s_homeMtx` (leaf; never held across a `ui_*` call; loopTask
+never takes lv_lock for these). Don't add store/SD/String work to the timer
+callback. The devcfg live push (`ui_set_devcfg_live`) is still on loopTask.
+## Console global SD mutex (`SdLock`)
+
+`console/firmware/include/sdcard.h` + `src/sdcard.cpp`: a recursive FreeRTOS
+mutex (created in `SdCard::begin`, lazy-safe fallback) guards ALL SD file I/O —
+the Arduino SD/FAT stack is not thread-safe and loopTask, AsyncTCP handlers,
+scale_link, FTP/analyse tasks all touch the card. Use `SdLock l(timeout_ms);
+if (!l) { /* log+skip */ }` (default 500 ms, `[SD] lock timeout` logged on
+failure; never block forever). `SdCard::update()` (mount/unmount) takes it too.
+
+**Lock order** (outermost first): `CrashLogger::s_mtx` -> store mutexes
+(`SpoolStore::_mtx`) -> `SdLock` -> leaf (RingLog mutex / Serial). Never take the
+LVGL lock, a queue/other mutex, or do a network send / FTP read while holding
+`SdLock`. Hold it only for short bounded ops; chunked streams re-take it per
+chunk (`sendSdFile()` in web_server.cpp for downloads — replaces
+`req->send(SD, ...)`, which read the File unlocked from AsyncTCP; the
+backup tar stream/restore via `FsMount::lock/unlock` hooks in
+`spoolhard/backup.h`, add-only, null on scale). `CrashLogger::flush()` (loopTask)
+uses a 50 ms timeout and retries next tick. Covered: crash logger, spool store,
+user/stock filament stores, cloud public cache, filaments upload/info/delete,
+ftp_dl.bin write + download, /api/logs/{current,previous}, crash downloads,
+backup/restore, storage migration, boot-time first-boot migration.
+New SD code must take the lock.
+
 ## Gcode-analysis inflate placement measurement (console only)
 
 `analyseRemote()` times every run (`InflateStats` in `bambu_printer.h`:

@@ -176,6 +176,27 @@ bool applyNvsEntry(Preferences& prefs, JsonObjectConst e) {
 // ── FS helpers ──────────────────────────────────────────────────
 constexpr const char* kRestoreSuffix = ".restore";
 
+// RAII bracket around one short FS operation on a mount that has an I/O
+// lock hook; a no-op for mounts without one. ok() is false on timeout.
+struct MountLock {
+    void (*_un)() = nullptr;
+    bool _ok = true;
+    MountLock(bool (*l)(uint32_t), void (*u)(), uint32_t ms = 500) {
+        if (l) { _ok = l(ms); if (_ok) _un = u; }
+    }
+    explicit MountLock(const FsMount& m, uint32_t ms = 500) : MountLock(m.lock, m.unlock, ms) {}
+    ~MountLock() { if (_un) _un(); }
+    MountLock(const MountLock&) = delete;
+    MountLock& operator=(const MountLock&) = delete;
+    bool ok() const { return _ok; }
+};
+
+const FsMount* mountForFs(const Source* src, const FS* fs) {
+    if (!src) return nullptr;
+    for (const auto& m : src->fs_mounts) if (m.fs == fs) return &m;
+    return nullptr;
+}
+
 bool isSkipped(const String& full, const FsMount& mount) {
     for (const char* p : mount.skip_prefixes) {
         if (full.startsWith(p)) return true;
@@ -187,6 +208,8 @@ bool isSkipped(const String& full, const FsMount& mount) {
 }
 
 void walkDir(FS& fs, const String& path, const FsMount& mount, JsonArray files) {
+    MountLock ml(mount, 5000);   // legacy v1 path (tests/tools only); recursive lock
+    if (!ml.ok()) return;
     File dir = fs.open(path);
     if (!dir || !dir.isDirectory()) {
         // path was a file (or didn't exist) — caller handles file case.
@@ -386,7 +409,9 @@ bool applyRestore(const Source&       src,
                 }
                 continue;
             }
-            if (writeFile(*target, path, bytes)) {
+            const FsMount* wm = mountForFs(&src, target);
+            MountLock wml(wm ? wm->lock : nullptr, wm ? wm->unlock : nullptr, 2000);
+            if (wml.ok() && writeFile(*target, path, bytes)) {
                 out.files_written++;
             } else {
                 out.errors++;
@@ -470,6 +495,8 @@ struct TarMember {
     String   name;          // archive path
     String   mem;           // in-memory payload (manifest/nvs)
     FS*      fs = nullptr;  // file payload when non-null
+    bool   (*lock)(uint32_t) = nullptr;   // from the owning FsMount
+    void   (*unlock)()       = nullptr;
     String   path;
     size_t   size  = 0;
     uint32_t mtime = 0;
@@ -510,7 +537,7 @@ public:
                 if (_off == kBlk) { _phase = Phase::Data; _off = 0; }
             } else if (_phase == Phase::Data) {
                 if (_off >= m.size) {
-                    if (_file) _file.close();
+                    closeFile(m);
                     _phase = Phase::Pad; _off = 0;
                     continue;
                 }
@@ -518,6 +545,9 @@ public:
                 if (!m.fs) {
                     memcpy(buf + w, m.mem.c_str() + _off, n);
                 } else {
+                    // One lock per chunk read (never across the socket send).
+                    MountLock ml(m.lock, m.unlock, 200);
+                    if (!ml.ok()) return w ? w : (size_t)RESPONSE_TRY_AGAIN;
                     if (!_file) _file = m.fs->open(m.path, FILE_READ);
                     size_t got = _file ? _file.read(buf + w, n) : 0;
                     if (got == 0) {
@@ -539,7 +569,10 @@ public:
         return w;
     }
 
-    ~TarStream() { if (_file) _file.close(); }
+    ~TarStream() {
+        if (_file && _cur < members.size()) closeFile(members[_cur]);
+        else if (_file) _file.close();
+    }
 
 private:
     enum class Phase { Header, Data, Pad };
@@ -551,9 +584,16 @@ private:
     File    _file;
     bool    _aborted = false;
 
+    void closeFile(TarMember& m) {
+        if (!_file) return;
+        MountLock ml(m.lock, m.unlock, 500);
+        _file.close();
+    }
+
     size_t _abort(size_t w, const String& why) {
         dlog("Backup", "tar stream aborted: %s", why.c_str());
-        if (_file) _file.close();
+        if (_cur < members.size()) closeFile(members[_cur]);
+        else if (_file) _file.close();
         _aborted = true;
         return w;   // flush what's buffered; next fill() returns 0
     }
@@ -561,6 +601,8 @@ private:
 
 void collectFiles(FS& fs, const String& path, const FsMount& mount,
                   std::vector<TarMember>& out) {
+    MountLock ml(mount, 5000);   // directory walk only (no file bytes); recursive
+    if (!ml.ok()) return;
     File dir = fs.open(path);
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
@@ -577,6 +619,8 @@ void collectFiles(FS& fs, const String& path, const FsMount& mount,
                 TarMember m;
                 m.name  = String(mount.label) + (full.startsWith("/") ? "" : "/") + full;
                 m.fs    = &fs;
+                m.lock   = mount.lock;
+                m.unlock = mount.unlock;
                 m.path  = full;
                 m.size  = f.size();
                 m.mtime = (uint32_t)f.getLastWrite();
@@ -693,10 +737,16 @@ struct RestoreSession::Impl {
 
     void discardTemps() {
         if (out) {
+            const FsMount* m = mountForFs(src, cur.fs);
+            MountLock ml(m ? m->lock : nullptr, m ? m->unlock : nullptr, 1000);
             out.close();
             if (cur.fs) cur.fs->remove(cur.tmp);
         }
-        for (auto& p : pending) p.fs->remove(p.tmp);
+        for (auto& p : pending) {
+            const FsMount* m = mountForFs(src, p.fs);
+            MountLock ml(m ? m->lock : nullptr, m ? m->unlock : nullptr, 1000);
+            p.fs->remove(p.tmp);
+        }
         pending.clear();
     }
 
@@ -764,8 +814,13 @@ struct RestoreSession::Impl {
             return;
         }
         cur = Pending{target, path, path + kRestoreSuffix};
-        ensureParentDirs(*target, cur.tmp);
-        out = target->open(cur.tmp, FILE_WRITE);
+        {
+            const FsMount* m = mountForFs(src, target);
+            MountLock ml(m ? m->lock : nullptr, m ? m->unlock : nullptr, 1000);
+            if (!ml.ok()) { fail("storage busy for " + cur.tmp); return; }
+            ensureParentDirs(*target, cur.tmp);
+            out = target->open(cur.tmp, FILE_WRITE);
+        }
         if (!out) { fail("cannot write " + cur.tmp); return; }
         sink = Sink::File;
     }
@@ -775,6 +830,9 @@ struct RestoreSession::Impl {
             if (memDst->length() + n > memCap) { fail("archive member too large"); return; }
             memDst->concat((const char*)data, n);
         } else if (sink == Sink::File) {
+            const FsMount* m = mountForFs(src, cur.fs);
+            MountLock ml(m ? m->lock : nullptr, m ? m->unlock : nullptr, 500);
+            if (!ml.ok()) { fail("storage busy writing " + cur.tmp); return; }
             if (out.write(data, n) != n) fail("write failed for " + cur.tmp);
         }
     }
@@ -791,7 +849,11 @@ struct RestoreSession::Impl {
             if (!validate(d, product, why)) { fail(why); return; }
             manifestOk = true;
         } else if (sink == Sink::File) {
-            out.close();
+            {
+                const FsMount* m = mountForFs(src, cur.fs);
+                MountLock ml(m ? m->lock : nullptr, m ? m->unlock : nullptr, 1000);
+                out.close();
+            }
             pending.push_back(cur);
             cur = Pending{};
         }
@@ -913,6 +975,13 @@ int RestoreSession::finish(RestoreReport& rep, String& error) {
 
     // Files first (rename temps over originals), then NVS.
     for (auto& p : s->pending) {
+        const FsMount* pm = mountForFs(s->src, p.fs);
+        MountLock ml(pm ? pm->lock : nullptr, pm ? pm->unlock : nullptr, 2000);
+        if (!ml.ok()) {
+            rep.errors++;
+            if (rep.first_error.isEmpty()) rep.first_error = "storage busy renaming " + p.path;
+            continue;
+        }
         if (p.fs->exists(p.path)) p.fs->remove(p.path);
         if (p.fs->rename(p.tmp, p.path)) {
             rep.files_written++;
