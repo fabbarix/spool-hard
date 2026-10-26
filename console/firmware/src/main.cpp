@@ -1192,14 +1192,14 @@ template <typename T> static inline void _fnvV(uint32_t& h, T v) { _fnv(h, &v, s
 // lv_lock -> s_homeMtx (leaf, memcpy only, never held across a ui_* call);
 // loopTask takes only s_homeMtx and never lv_lock here.
 struct HomeSnap {
-    char     devNames[100]; bool devShow;
     char     host[64];      uint8_t wifiState;
     char     ip[20];
     bool     amsHas;        char status[48];
+    bool     prnShow;       // show the printer card (connected OR offline-with-name)
     UiAmsSlot slots[5];     UiPrinterSnapshot psnap;
     bool     otaShow;       char otaText[96];
 };
-enum { HS_DEV, HS_FOOT, HS_IP, HS_AMS, HS_OTA, HS_N };
+enum { HS_FOOT, HS_IP, HS_AMS, HS_OTA, HS_N };
 static HomeSnap                  s_hs = {};
 static std::atomic<uint32_t>     s_hsSeq[HS_N];       // bumped by loopTask
 static uint32_t                  s_hsApplied[HS_N];   // lvgl task only
@@ -1213,14 +1213,6 @@ static inline void _hsPublishEnd(int sec) {
 
 // lv_timer callback (lvgl task, lv_lock already held).
 static void _homeUiTimerCb(lv_timer_t*) {
-    if (s_hsSeq[HS_DEV].load() != s_hsApplied[HS_DEV]) {
-        char names[sizeof(s_hs.devNames)]; bool show;
-        xSemaphoreTake(s_homeMtx, portMAX_DELAY);
-        s_hsApplied[HS_DEV] = s_hsSeq[HS_DEV].load();
-        memcpy(names, s_hs.devNames, sizeof(names)); show = s_hs.devShow;
-        xSemaphoreGive(s_homeMtx);
-        ui_set_dev_mode_warning(show ? names : nullptr);
-    }
     if (s_hsSeq[HS_FOOT].load() != s_hsApplied[HS_FOOT]) {
         char host[sizeof(s_hs.host)]; uint8_t ws;
         xSemaphoreTake(s_homeMtx, portMAX_DELAY);
@@ -1238,17 +1230,23 @@ static void _homeUiTimerCb(lv_timer_t*) {
         ui_set_ip(ip);
     }
     if (s_hsSeq[HS_AMS].load() != s_hsApplied[HS_AMS]) {
-        bool has; char status[sizeof(s_hs.status)];
+        bool has, prn; char status[sizeof(s_hs.status)];
         UiAmsSlot slots[5]; UiPrinterSnapshot ps;
         xSemaphoreTake(s_homeMtx, portMAX_DELAY);
         s_hsApplied[HS_AMS] = s_hsSeq[HS_AMS].load();
-        has = s_hs.amsHas;
+        has = s_hs.amsHas; prn = s_hs.prnShow;
         memcpy(status, s_hs.status, sizeof(status));
         memcpy(slots, s_hs.slots, sizeof(slots));
         ps = s_hs.psnap;
         xSemaphoreGive(s_homeMtx);
-        if (has) { ui_set_ams_panel(status, slots); ui_set_printer_panel(&ps); }
-        else     { ui_set_ams_panel(nullptr, nullptr); ui_set_printer_panel(nullptr); }
+        // AMS tiles only when a connected printer reports them; the printer
+        // card shows whenever a printer is configured (its own `connected`
+        // flag picks "online" vs the offline/retry card). A null card is the
+        // only "No printer" (nothing configured) state.
+        if (has) ui_set_ams_panel(status, slots);
+        else     ui_set_ams_panel(nullptr, nullptr);
+        if (prn) ui_set_printer_panel(&ps);
+        else     ui_set_printer_panel(nullptr);
     }
     if (s_hsSeq[HS_OTA].load() != s_hsApplied[HS_OTA]) {
         char text[sizeof(s_hs.otaText)]; bool show;
@@ -1327,25 +1325,6 @@ static void _refreshHomeFooterImpl() {
 // dashboard shows all of them. The LCD is a glance-value aimed at "what's in
 // front of me right now"; cycling between printers on the LCD is a future
 // nicety.
-static void _refreshDevModeWarning() {
-    // Names of printers in Developer Mode (state seeded from NVS, so this
-    // is valid even before the first report). LVGL is only touched when
-    // the list changes.
-    static String s_last;
-    String names;
-    for (const auto& pp : g_bambu.printers()) {
-        if (!pp || pp->state().dev_mode != 2) continue;
-        if (names.length()) names += ", ";
-        names += pp->config().name.length() ? pp->config().name : pp->config().serial;
-    }
-    if (names == s_last) return;
-    s_last = names;
-    _hsPublishBegin();
-    snprintf(s_hs.devNames, sizeof(s_hs.devNames), "%s", names.c_str());
-    s_hs.devShow = names.length() > 0;
-    _hsPublishEnd(HS_DEV);
-}
-
 static void _refreshHomeAmsPanelImpl();
 static void _hashTray(uint32_t& h, const AmsTray& t) {
     _fnvV(h, t.id); _fnvS(h, t.tray_type); _fnvS(h, t.tray_color);
@@ -1353,7 +1332,6 @@ static void _hashTray(uint32_t& h, const AmsTray& t) {
     _fnvS(h, t.mapped_spool_id);
 }
 static void _refreshHomeAmsPanel() {
-    _refreshDevModeWarning();
     // Nothing visible while the LCD is asleep; the next 1 s tick after wake
     // repaints (ui_set_*_panel also skip identical snapshots). Invalidate
     // the change-hash so the first awake tick always repaints.
@@ -1502,15 +1480,38 @@ static void _refreshHomeAmsPanelImpl() {
         snap.has_temps    = (s.nozzle_temp > 0.f) || (s.bed_temp > 0.f);
         _hsPublishBegin();
         s_hs.amsHas = true;
+        s_hs.prnShow = true;
         snprintf(s_hs.status, sizeof(s_hs.status), "%s", status);
         memcpy(s_hs.slots, slots, sizeof(slots));
         s_hs.psnap = snap;
         _hsPublishEnd(HS_AMS);
         return;
     }
-    // No connected printer — hide both panels.
+    // No *connected* printer. If one is configured, still show the printer
+    // card as offline (name + "Offline - reconnecting…") so the user sees
+    // their printer, not a bare "No printer". Only a truly empty config
+    // falls through to the null-card "No printer" state.
+    const char* offName = nullptr;
+    for (const auto& pp : g_bambu.printers()) {
+        if (!pp) continue;
+        offName = pp->config().name.length() ? pp->config().name.c_str()
+                                             : pp->config().serial.c_str();
+        break;   // LCD shows the first printer only
+    }
     _hsPublishBegin();
     s_hs.amsHas = false;
+    if (offName) {
+        UiPrinterSnapshot off = {};
+        off.connected    = false;
+        off.progress_pct = -1;
+        off.layer_num    = -1;
+        off.total_layers = -1;
+        snprintf(off.name, sizeof(off.name), "%s", offName);
+        s_hs.psnap = off;
+        s_hs.prnShow = true;
+    } else {
+        s_hs.prnShow = false;
+    }
     _hsPublishEnd(HS_AMS);
 }
 

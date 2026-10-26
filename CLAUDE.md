@@ -456,10 +456,9 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   Passive hook `kFunBitDevMode` (bambu_printer.cpp) is -1 = DISABLED: the bit
   of `print.fun` is not yet known, do not guess. Web: `DevModeBanner` (App
   level, non-dismissible) while any printer is "on"; the per-card
-  "refused commands" notice covers the off/rejected case. LCD: warning
-  triangle in the home footer (`ui_set_dev_mode_warning`, called from
-  `_refreshDevModeWarning` only when the name list changes); tap shows a
-  one-line explanation card, tap again to close.
+  "refused commands" notice covers the off/rejected case. LCD: no Dev Mode
+  indicator (removed; the header warning triangle now means printer
+  offline / none configured, see LCD design rules).
 - `POST /api/printers` MERGES onto the stored record by serial
   (`PrinterConfig::fromJson` only overwrites fields present in the body), so the
   Config page's partial save (name/serial/ip/access_code) keeps ams_overrides,
@@ -487,7 +486,9 @@ active tray shows a **FEEDING** badge in place of the K line), 44 px footer
 (host / version / IP, tap -> device config). Offline / no printer: a red
 card at y=44..92 with message + 44 px **Retry** button (reconnect all +
 re-probe) replaces bar/state rows; the tile area shows a hint. The OTA banner
-is a 44 px amber strip over the footer.
+is a 44 px amber strip over the footer. A yellow warning triangle at the
+right end of the header (the percent's spot; never both) shows only while the
+printer is offline or none is configured; tap = Retry.
 
 Rules for any new LCD UI: text >= 16pt (fonts shipped: 16/18/22/28/36; no
 new sizes needed so far — `console/scripts/build_fonts.sh` has them);

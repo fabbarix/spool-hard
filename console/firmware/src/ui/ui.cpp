@@ -125,9 +125,7 @@ static lv_obj_t*           s_footer_hit     = nullptr;
 static ui_devcfg_open_cb_t s_devcfg_open_cb = nullptr;
 // Hostname line is split in two so the WiFi glyph can be coloured by link
 // state (green/yellow/orange/grey) while the name itself stays white.
-static lv_obj_t* s_lbl_devmode_icon = nullptr; // Developer-Mode warning triangle
-static lv_obj_t* s_devmode_panel    = nullptr; // tap explanation (hidden)
-static lv_obj_t* s_devmode_text     = nullptr;
+static lv_obj_t* s_lbl_offline_icon = nullptr; // header warning triangle (offline / no printer)
 static lv_obj_t* s_lbl_wifi_icon  = nullptr;   // coloured WiFi symbol
 static lv_obj_t* s_lbl_hostname   = nullptr;   // e.g. "spoolhard-console.local"
 
@@ -141,7 +139,8 @@ static lv_obj_t* s_lbl_printer_detail = nullptr;   // "RUNNING · layer 120/250"
 static lv_obj_t* s_lbl_printer_pct    = nullptr;   // big "82%"
 static lv_obj_t* s_lbl_printer_temps  = nullptr;   // "N 255°C  B 60°C"
 static lv_obj_t* s_lbl_printer_offline = nullptr;  // offline card message
-static lv_obj_t* s_lbl_ams_empty      = nullptr;   // hint when no printer
+static lv_obj_t* s_lbl_ams_empty      = nullptr;   // hint sub-line when no printer
+static lv_obj_t* s_lbl_ams_empty_head = nullptr;   // hint headline when no printer
 static lv_obj_t* s_ams_badge[5]       = {nullptr}; // FEEDING badge per tile
 static lv_obj_t* s_btn_printer_refresh = nullptr;  // top-right refresh icon
 static ui_printer_refresh_cb_t s_printer_refresh_cb = nullptr;
@@ -383,13 +382,22 @@ static void build_home() {
     lv_obj_clear_flag(s_ams_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_ams_panel, LV_OBJ_FLAG_HIDDEN);
 
-    // Hint shown in the same area while no printer is connected.
-    s_lbl_ams_empty = make_label(s_home, "Filament slots appear when the printer is connected",
+    // Empty-state block shown in the tile area (y=144..272) while no printer
+    // is connected: a brand headline over a muted sub-line, centred, so the
+    // area reads as a composed waiting state rather than one dull sentence.
+    s_lbl_ams_empty_head = make_label(s_home, "Looking for your printer\xE2\x80\xA6",
+                                      COL_BRAND, &spoolhard_mont_22);
+    lv_obj_set_width(s_lbl_ams_empty_head, 440);
+    lv_obj_set_style_text_align(s_lbl_ams_empty_head, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lbl_ams_empty_head, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_lbl_ams_empty_head, LV_ALIGN_TOP_MID, 0, 176);
+
+    s_lbl_ams_empty = make_label(s_home, "Filament slots appear once it's online",
                                  COL_TEXT_MUTED, &spoolhard_mont_16);
-    lv_obj_set_width(s_lbl_ams_empty, 400);
+    lv_obj_set_width(s_lbl_ams_empty, 440);
     lv_obj_set_style_text_align(s_lbl_ams_empty, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_lbl_ams_empty, LV_LABEL_LONG_WRAP);
-    lv_obj_align(s_lbl_ams_empty, LV_ALIGN_TOP_MID, 0, 188);
+    lv_obj_align(s_lbl_ams_empty, LV_ALIGN_TOP_MID, 0, 212);
 
     // Kept as a hidden placeholder so existing status-setter calls stay valid.
     s_lbl_ams_status = make_label(s_ams_panel, "", COL_TEXT_MUTED, &spoolhard_mont_16);
@@ -516,17 +524,19 @@ static void build_home() {
         if (s_devcfg_open_cb) s_devcfg_open_cb();
     }, LV_EVENT_CLICKED, nullptr);
 
-    // Developer-Mode warning triangle in the header row (x=292..312, between
-    // the name (ends x=282) and the percent (starts >= x=378)). 14 px extra
-    // click area -> ~48 px target. Hidden until a printer reports it.
-    s_lbl_devmode_icon = make_label(s_home, LV_SYMBOL_WARNING,
+    // Warning triangle at the right end of the header line (where the print
+    // percent sits while printing - the two never show together): shown
+    // only while the printer is offline or none is configured. Inset 18 px
+    // so its sharp tip stays inside the rounded right edge of the card below
+    // (x=468). Tap = Retry; 14 px extra click area -> ~48 px target.
+    s_lbl_offline_icon = make_label(s_home, LV_SYMBOL_WARNING,
                                     lv_color_hex(0xfacc15), &spoolhard_mont_18);
-    lv_obj_set_pos(s_lbl_devmode_icon, 292, 14);
-    lv_obj_add_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(s_lbl_devmode_icon, 14);
-    lv_obj_add_event_cb(s_lbl_devmode_icon, [](lv_event_t*) {
-        if (s_devmode_panel) lv_obj_clear_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(s_lbl_offline_icon, LV_ALIGN_TOP_RIGHT, -18, 12);
+    lv_obj_add_flag(s_lbl_offline_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_lbl_offline_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(s_lbl_offline_icon, 14);
+    lv_obj_add_event_cb(s_lbl_offline_icon, [](lv_event_t*) {
+        if (s_printer_refresh_cb) s_printer_refresh_cb();
     }, LV_EVENT_CLICKED, nullptr);
 
     // OTA banner: full-width 44 px amber strip over the footer.
@@ -550,18 +560,6 @@ static void build_home() {
     lv_obj_set_style_text_align(s_ota_banner_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_ota_banner_label, LV_LABEL_LONG_DOT);
     lv_obj_center(s_ota_banner_label);
-
-    // Developer-Mode explanation: a card over the tile area, tap to dismiss.
-    s_devmode_panel = make_card(s_home, 12, 144, 456, 96);
-    lv_obj_set_style_border_color(s_devmode_panel, lv_color_hex(0xfacc15), 0);
-    lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_devmode_panel, [](lv_event_t*) {
-        lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
-    }, LV_EVENT_CLICKED, nullptr);
-    s_devmode_text = make_label(s_devmode_panel, "", COL_TEXT, &spoolhard_mont_16);
-    lv_obj_set_width(s_devmode_text, 430);
-    lv_label_set_long_mode(s_devmode_text, LV_LABEL_LONG_WRAP);
 }
 
 static void on_spool_btn(lv_event_t* e) {
@@ -1945,12 +1943,14 @@ void ui_set_printer_panel(const UiPrinterSnapshot* snap) {
         lv_label_set_text(s_lbl_printer_status,
                           (snap && snap->name[0]) ? snap->name : "No printer");
         lv_label_set_text(s_lbl_printer_offline,
-                          snap ? "Printer offline - retrying" : "No printer connected");
+                          snap ? "Offline - reconnecting\xE2\x80\xA6"
+                               : "Check power & network");
         lv_obj_add_flag(s_bar_printer_prog, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_lbl_printer_pct, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(s_lbl_printer_detail, "");
         lv_label_set_text(s_lbl_printer_temps, "");
         lv_obj_clear_flag(s_printer_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_lbl_offline_icon, LV_OBJ_FLAG_HIDDEN);
         lv_unlock();
         return;
     }
@@ -1958,6 +1958,7 @@ void ui_set_printer_panel(const UiPrinterSnapshot* snap) {
     lv_led_set_color(s_led_printer, COL_CONNECTED);
     lv_led_on(s_led_printer);
     lv_obj_add_flag(s_printer_card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_lbl_offline_icon, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(s_lbl_printer_status, snap->name);
 
     // State + layer (left) and temps (right) on one 16pt row.
@@ -2022,11 +2023,13 @@ void ui_set_ams_panel(const char* status, const UiAmsSlot* slots) {
     const bool show = status && *status;
     if (!show) {
         lv_obj_add_flag(s_ams_panel, LV_OBJ_FLAG_HIDDEN);
+        if (s_lbl_ams_empty_head) lv_obj_clear_flag(s_lbl_ams_empty_head, LV_OBJ_FLAG_HIDDEN);
         if (s_lbl_ams_empty) lv_obj_clear_flag(s_lbl_ams_empty, LV_OBJ_FLAG_HIDDEN);
         lv_unlock();
         return;
     }
     lv_obj_clear_flag(s_ams_panel, LV_OBJ_FLAG_HIDDEN);
+    if (s_lbl_ams_empty_head) lv_obj_add_flag(s_lbl_ams_empty_head, LV_OBJ_FLAG_HIDDEN);
     if (s_lbl_ams_empty) lv_obj_add_flag(s_lbl_ams_empty, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(s_lbl_ams_status, status);
 
@@ -2152,22 +2155,6 @@ void ui_set_onboarding(const char* ap_ssid, const char* security_key, const char
     if (s_lbl_ssid       && ap_ssid)       lv_label_set_text(s_lbl_ssid,       ap_ssid);
     if (s_lbl_key        && security_key)  lv_label_set_text(s_lbl_key,        security_key);
     if (s_lbl_onboard_ip && ip_or_mdns)    lv_label_set_text(s_lbl_onboard_ip, ip_or_mdns);
-    lv_unlock();
-}
-
-void ui_set_dev_mode_warning(const char* names) {
-    if (!s_lbl_devmode_icon || !s_devmode_panel || !s_devmode_text) return;
-    lv_lock();
-    if (names && *names) {
-        char buf[160];
-        snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING " %s: Developer Mode (LAN only). "
-                 "SpoolHard can control it. Tap to close.", names);
-        lv_label_set_text(s_devmode_text, buf);
-        lv_obj_clear_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(s_lbl_devmode_icon, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_devmode_panel, LV_OBJ_FLAG_HIDDEN);
-    }
     lv_unlock();
 }
 
