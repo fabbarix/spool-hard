@@ -53,6 +53,13 @@ inline void bambuBuildReportFilter(JsonDocument& f) {
     p["ams"]      = true;
     p["vt_tray"]  = true;
     p["vir_slot"] = true;
+    // Signing-certificate registration replies (_onSecurityReport).
+    JsonObject sec = f["security"].to<JsonObject>();
+    sec["command"]     = true;
+    sec["result"]      = true;
+    sec["reason"]      = true;
+    sec["sequence_id"] = true;
+    sec["cert_ids"]    = true;
 }
 
 // Process-wide filter document, built once on first use. Pass the allocator

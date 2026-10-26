@@ -198,7 +198,7 @@ function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds, libr
               )}
             </div>
           )}
-          {s.commands_rejected_auth && <AuthRejectedNotice serial={p.serial} />}
+          {s.commands_rejected_auth && <AuthRejectedNotice serial={p.serial} signed={!!s.last_command?.signed} />}
           <AnalysisBlock serial={p.serial} gcodeState={gcode} />
         </>
       ) : (
@@ -210,12 +210,15 @@ function PrinterRow({ p, spoolById, filamentByFilamentId, stockFilamentIds, libr
 
 // Shown while the printer's last control command was refused with its
 // authorization error: unsigned LAN MQTT commands only work on printers in
-// LAN Only + Developer Mode. Clears itself on the next successful ack.
-function AuthRejectedNotice({ serial }: { serial: string }) {
+// LAN Only + Developer Mode (or when signed with a slicer certificate).
+// Clears itself on the next successful ack.
+function AuthRejectedNotice({ serial, signed }: { serial: string; signed: boolean }) {
   const resync = useResyncPrinter();
   return (
     <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-300">
-      Printer refused SpoolHard's settings. Enable LAN Only + Developer Mode on the printer to let SpoolHard set filament / K values.
+      {signed
+        ? "Printer refused SpoolHard's signed settings: it did not accept the certificate in Config → Printers → Command signing."
+        : "Printer refused SpoolHard's settings. Enable LAN Only + Developer Mode on the printer, or add a slicer certificate in Config → Printers → Command signing."}
       <button
         type="button"
         disabled={resync.isPending}

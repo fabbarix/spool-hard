@@ -14,6 +14,7 @@
 #include "spoolhard/ring_log.h"
 #include "spoolhard/psram_json_alloc.h"
 #include "spoolhard/psram_task.h"   // SPOOLHARD_PSRAM_STACKS_ENABLED
+#include "bambu_signer.h"
 #include <WiFiClientSecure.h>
 // Raw-deflate inflater bundled in ROM. Bambu's slicer started shipping
 // some 3MFs with the gcode entry deflate-compressed (method=8) instead
@@ -326,6 +327,8 @@ void BambuPrinter::_ensureConnected() {
             String topic = "device/" + _cfg.serial + "/report";
             _mqtt->subscribe(topic.c_str());
             requestFullStatus();
+            _sendDevModeProbe();
+            _certStart("connected");
         } else {
             _state.link = BambuLinkState::Failed;
             char err[32];
@@ -435,6 +438,24 @@ void BambuPrinter::loop() {
                           ok ? "assigned" : "nothing pending");
         }
     }
+    _certLoop();
+    if (_signTestReq.exchange(false)) _runSignTest();
+    if (_signTestAwaitTrust && _state.cert_trust != 1 && _state.cert_trust != 2) {
+        _signTestAwaitTrust = false;
+        if (_state.cert_trust == 3) _sendSignTest();
+        else {
+            String why = "certificate registration failed: " +
+                         (_state.cert_detail.length() ? _state.cert_detail : String("unknown"));
+            _setSignTest(SignTestState::Failed, why.c_str());
+        }
+    }
+    // An ack that never comes (the printer drops what it cannot verify on
+    // some firmware) ends the test after 10 s.
+    if (_signTestSeq.length() && millis() - _signTestStartMs > 10000) {
+        _signTestSeq = "";
+        _setSignTest(SignTestState::Timeout, "no reply from the printer within 10 s");
+        dlog("Bambu", "%s sign test: no ack (timeout)", _cfg.serial.c_str());
+    }
     // Skip _mqtt->loop() while the connect task owns _mqtt; PubSubClient
     // and WiFiClientSecure are not safe to read from the main loop while
     // mbedtls is in the middle of a handshake on the task.
@@ -536,6 +557,19 @@ void BambuPrinter::_recordCommandAck(JsonObjectConst print) {
     String result = print["result"].as<String>();
     String reason = print["reason"] | "";
     int32_t err   = print["err_code"].as<long>();
+    if (_devProbeSeq.length() && _devProbeSeq == (print["sequence_id"] | "")) {
+        _devProbeSeq = "";
+        if (err == 84033543)                   _setDevMode(1, "probe: printer requires signed commands");
+        else if (result.equalsIgnoreCase("success")) _setDevMode(2, "probe: unsigned command accepted");
+        dlog("Bambu", "%s dev-mode probe -> %s err=%ld", _cfg.serial.c_str(), result.c_str(), (long)err);
+        return;
+    }
+    // A signed command refused because the cert is not registered (the
+    // printer power-cycled since we installed it): register again.
+    if (err == 84033545 && _state.last_cmd_signed) {
+        _resyncAfterTrust = true;
+        _certStart("printer no longer trusts the certificate");
+    }
     // Only control commands we issue matter; ignore other result-bearing acks.
     if (cmd != "ams_filament_setting" && cmd != "extrusion_cali_set" &&
         cmd != "extrusion_cali_sel" && cmd != "pushall") return;
@@ -545,13 +579,27 @@ void BambuPrinter::_recordCommandAck(JsonObjectConst print) {
     _state.last_cmd_err    = err;
     _state.last_cmd_ms     = millis() ? millis() : 1;
     bool ok = result.equalsIgnoreCase("success");
-    bool auth = !ok && (err == 84033543 || reason.indexOf("verify failed") >= 0);
+    // 0x05024007 (84033543) = no signature envelope, 0x05024009 (84033545)
+    // = envelope present but refused/malformed.
+    bool auth = !ok && (err == 84033543 || err == 84033545 ||
+                        reason.indexOf("verify failed") >= 0);
     if (auth) _state.commands_rejected_auth = true;
     else if (ok && cmd != "pushall") _state.commands_rejected_auth = false;
-    // Ack-based Developer Mode detection (control commands only, never pushall).
-    if (cmd != "pushall") {
+    // Ack-based Developer Mode detection (control commands only, never
+    // pushall). A signed command says nothing about Developer Mode: it is
+    // accepted with the mode off, and a refusal means the cert was rejected.
+    if (cmd != "pushall" && !_state.last_cmd_signed) {
         if (auth)    _setDevMode(1, "control command rejected (verify failed)");
         else if (ok) _setDevMode(2, "control command accepted");
+    }
+    // Ack for the sign test: same seq, or a seq-less ack of the same command.
+    if (_signTestSeq.length() && cmd == "ams_filament_setting") {
+        const char* aseq = print["sequence_id"] | "";
+        if (!*aseq || _signTestSeq == aseq) {
+            _signTestSeq = "";
+            _setSignTest(ok ? SignTestState::Accepted : SignTestState::Refused,
+                         reason.length() ? reason.c_str() : result.c_str(), err);
+        }
     }
     dlog("Bambu", "%s ack %s -> %s reason='%s' err=%ld seq=%s",
          _cfg.serial.c_str(), cmd.c_str(), result.c_str(), reason.c_str(),
@@ -559,6 +607,8 @@ void BambuPrinter::_recordCommandAck(JsonObjectConst print) {
 }
 
 void BambuPrinter::_parseReport(const JsonDocument& doc) {
+    JsonObjectConst sec = doc["security"];
+    if (sec) _onSecurityReport(sec);
     // Bambu publishes {"print": {...}} or {"info": {...}}; we only care about print.
     JsonObjectConst print = doc["print"];
     if (!print) return;
@@ -847,13 +897,19 @@ void BambuPrinter::_pushKRestore(int ams_id, int slot_id, const AmsTray& tr, flo
     f["slot_id"]         = slot_id;
     f["tray_id"]         = -1;
 
-    String payload;
-    serializeJson(doc, payload);
+    _publishPrint(doc);
+    Serial.printf("[Bambu %s] auto-restore K=%.3f to AMS %d/%d (nozzle %.1f)%s\n",
+                  _cfg.serial.c_str(), k, ams_id, slot_id, nozzle,
+                  _state.last_cmd_signed ? " signed" : "");
+}
 
+bool BambuPrinter::_publishPrint(const JsonDocument& doc, size_t* len) {
+    String payload;
+    _state.last_cmd_signed = BambuSigner::wrap("print", doc["print"], payload);
+    if (!_state.last_cmd_signed) serializeJson(doc, payload);
+    if (len) *len = payload.length();
     String topic = "device/" + _cfg.serial + "/request";
-    _mqtt->publish(topic.c_str(), payload.c_str());
-    Serial.printf("[Bambu %s] auto-restore K=%.3f to AMS %d/%d (nozzle %.1f)\n",
-                  _cfg.serial.c_str(), k, ams_id, slot_id, nozzle);
+    return _mqtt->publish(topic.c_str(), payload.c_str());
 }
 
 std::vector<String> applyAmsTrayToSpool(const AmsTray& tr, SpoolRecord& rec) {
@@ -1112,6 +1168,122 @@ BambuPrinter::ClaimResult BambuPrinter::claimPendingExplicit(int& ams_unit, int&
     return ClaimResult::Queued;
 }
 
+bool BambuPrinter::requestSignTest() {
+    portENTER_CRITICAL(&_signTestMux);
+    bool busy = _signTest.state == SignTestState::Queued ||
+                _signTest.state == SignTestState::Registering ||
+                _signTest.state == SignTestState::Sent;
+    if (!busy) {
+        _signTest = SignTestResult{};
+        _signTest.state = SignTestState::Queued;
+    }
+    portEXIT_CRITICAL(&_signTestMux);
+    if (!busy) _signTestReq.store(true);
+    return !busy;
+}
+
+BambuPrinter::SignTestResult BambuPrinter::signTest() const {
+    portENTER_CRITICAL(&_signTestMux);
+    SignTestResult r = _signTest;
+    portEXIT_CRITICAL(&_signTestMux);
+    if (r.state == SignTestState::Sent) r.elapsed_ms = millis() - _signTestStartMs;
+    return r;
+}
+
+void BambuPrinter::_setSignTest(SignTestState st, const char* reason, int32_t err) {
+    uint32_t el = millis() - _signTestStartMs;
+    portENTER_CRITICAL(&_signTestMux);
+    _signTest.state = st;
+    _signTest.err   = err;
+    strlcpy(_signTest.reason, reason ? reason : "", sizeof(_signTest.reason));
+    if (st != SignTestState::Failed) _signTest.elapsed_ms = el;
+    portEXIT_CRITICAL(&_signTestMux);
+}
+
+void BambuPrinter::_runSignTest() {
+    _signTestStartMs = millis();
+    if (!BambuSigner::enabled()) {
+        _setSignTest(SignTestState::Failed, "signing is not enabled");
+        return;
+    }
+    if (!_mqtt || !_mqtt->connected() || _state.link != BambuLinkState::Connected) {
+        _setSignTest(SignTestState::Failed, "printer is not connected");
+        return;
+    }
+    if (_state.cert_trust != 3) {
+        _certStart("printer test");
+        _signTestAwaitTrust = true;
+        _setSignTest(SignTestState::Registering, "registering the certificate with the printer");
+        return;
+    }
+    _sendSignTest();
+}
+
+void BambuPrinter::_sendSignTest() {
+    // First loaded tray: AMS slots in order, then the external holder.
+    const AmsTray* tr = nullptr;
+    int unit = -1, slot = -1;
+    for (int u = 0; u < _state.ams_count && !tr; ++u)
+        for (int t = 0; t < 4 && !tr; ++t)
+            if (_state.ams[u].trays[t].tray_type.length()) {
+                tr = &_state.ams[u].trays[t]; unit = u; slot = t;
+            }
+    if (!tr && _state.has_vt_tray && _state.vt_tray.tray_type.length()) {
+        tr = &_state.vt_tray; unit = 254; slot = 0;
+    }
+    if (!tr) {
+        _setSignTest(SignTestState::Failed,
+                     "no loaded slot to test with: load a spool in the AMS or external holder");
+        return;
+    }
+    char where[24];
+    if (unit == 254) strlcpy(where, "External", sizeof(where));
+    else snprintf(where, sizeof(where), "AMS %d slot %d", unit + 1, slot + 1);
+    portENTER_CRITICAL(&_signTestMux);
+    strlcpy(_signTest.slot, where, sizeof(_signTest.slot));
+    portEXIT_CRITICAL(&_signTestMux);
+
+    // Echo what the printer reports for the slot, so accepting it is a no-op.
+    String color = tr->tray_color.length() ? tr->tray_color : String("FFFFFFFF");
+    color.toUpperCase();
+    JsonDocument doc;
+    JsonObject print = doc["print"].to<JsonObject>();
+    print["command"] = "ams_filament_setting";
+    if (unit == 254) {
+        print["ams_id"]  = _state.vt_is_vir_slot ? _state.vt_wire_id : 255;
+        print["tray_id"] = 254;
+        print["slot_id"] = 0;
+    } else {
+        print["ams_id"]  = unit;
+        print["tray_id"] = slot;
+        print["slot_id"] = slot;
+    }
+    print["tray_info_idx"]   = tr->tray_info_idx;
+    print["tray_color"]      = color;
+    print["nozzle_temp_min"] = tr->nozzle_min_c;
+    print["nozzle_temp_max"] = tr->nozzle_max_c;
+    print["tray_type"]       = tr->tray_type;
+    String seq = _nextSeq();
+    print["sequence_id"]     = seq;
+
+    size_t len = 0;
+    bool ok = _publishPrint(doc, &len);
+    if (!_state.last_cmd_signed) {
+        _setSignTest(SignTestState::Failed, "could not sign the command (see logs)");
+        return;
+    }
+    if (!ok) {
+        _setSignTest(SignTestState::Failed, "MQTT publish failed");
+        return;
+    }
+    _signTestSeq     = seq;
+    _signTestStartMs = millis();
+    _setSignTest(SignTestState::Sent, "");
+    dlog("Bambu", "%s sign test: ams_filament_setting %s (unchanged %s %s) signed len=%u seq=%s",
+         _cfg.serial.c_str(), where, tr->tray_type.c_str(), color.c_str(),
+         (unsigned)len, seq.c_str());
+}
+
 bool BambuPrinter::_maybeAssignPendingSpool(int ams_unit, int slot_id) {
     String spool_id;
     if (!PendingAms::claim(spool_id)) return false;   // nothing armed, or already claimed by another printer
@@ -1321,15 +1493,13 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
     print["tray_type"]       = rec.material_type;
     print["sequence_id"]     = _nextSeq();
 
-    String payload;
-    serializeJson(doc, payload);
-    String topic = "device/" + _cfg.serial + "/request";
-    bool ok = _mqtt->publish(topic.c_str(), payload.c_str());
+    size_t len = 0;
+    bool ok = _publishPrint(doc, &len);
     dlog("Bambu", "%s ams_filament_setting AMS=%d slot=%d %s %s %u-%u°C "
-                  "pub=%s len=%u heap=%u",
+                  "pub=%s%s len=%u heap=%u",
          _cfg.serial.c_str(), ams_unit, slot_id,
          rec.material_type.c_str(), color.c_str(), tmin, tmax,
-         ok ? "ok" : "FAIL", (unsigned)payload.length(),
+         ok ? "ok" : "FAIL", _state.last_cmd_signed ? " signed" : "", (unsigned)len,
          (unsigned)ESP.getFreeHeap());
 }
 
@@ -2747,4 +2917,128 @@ void BambuPrinter::_commitIncrementalConsumption() {
     _commitConsumptionTo(stepTarget, _jobKey(),
                          _lastAnalysis.has_pct_table ? "live/M73" : "live/linear");
     _progressCommittedPct = stepTarget;
+}
+
+// ---------------------------------------------------------------------------
+// Signing certificate registration (app_cert_install / app_cert_list) and the
+// Developer Mode probe. All on loopTask.
+
+void BambuPrinter::_sendDevModeProbe() {
+    if (!_mqtt || !_mqtt->connected()) return;
+    char name[40];
+    snprintf(name, sizeof(name), "spoolhard_probe_%08lx", (unsigned long)esp_random());
+    _devProbeSeq = _nextSeq();
+    JsonDocument doc;
+    doc["print"]["command"]     = name;
+    doc["print"]["sequence_id"] = _devProbeSeq;
+    String payload; serializeJson(doc, payload);
+    String topic = "device/" + _cfg.serial + "/request";
+    _mqtt->publish(topic.c_str(), payload.c_str());   // deliberately unsigned
+}
+
+void BambuPrinter::_certStart(const char* why) {
+    if (!BambuSigner::enabled()) { _state.cert_trust = 0; _certPhase = CertPhase::Idle; return; }
+    if (_certPhase != CertPhase::Idle) return;
+    // Don't hammer a printer that keeps refusing: one round per 30 s.
+    if (_certLastStart && millis() - _certLastStart < 30000 && _state.cert_trust == 4) return;
+    _certLastStart = millis();
+    _certInstalled = false;
+    _certPolls     = 0;
+    _state.cert_trust  = 1;
+    _state.cert_detail = "";
+    dlog("Sign", "%s registering certificate (%s)", _cfg.serial.c_str(), why);
+    _certPhase = CertPhase::Listing;
+    _certQueryList();
+}
+
+void BambuPrinter::_certQueryList() {
+    if (!_mqtt || !_mqtt->connected()) { _certPhase = CertPhase::Idle; return; }
+    _certSeq = _nextSeq();
+    char payload[160];
+    snprintf(payload, sizeof(payload),
+        "{\"security\":{\"command\":\"app_cert_list\",\"sequence_id\":\"%s\",\"type\":\"app\"}}",
+        _certSeq.c_str());
+    String topic = "device/" + _cfg.serial + "/request";
+    _mqtt->publish(topic.c_str(), payload);
+    _certDeadline = millis() + 5000;
+}
+
+void BambuPrinter::_onSecurityReport(JsonObjectConst sec) {
+    if (sec["command"] == "app_cert_list" && _certSeq.length() &&
+        _certSeq == (sec["sequence_id"] | "")) {
+        _certSeq = "";
+        _certOnList(sec);
+    }
+}
+
+void BambuPrinter::_certOnList(JsonObjectConst sec) {
+    String mine = BambuSigner::status().cert_id;
+    bool listed = false;
+    size_t n = 0;
+    for (JsonVariantConst id : sec["cert_ids"].as<JsonArrayConst>()) {
+        ++n;
+        if (mine == (id | "")) listed = true;
+    }
+    dlog("Sign", "%s app_cert_list: result=%s reason='%s' %u ids%s", _cfg.serial.c_str(),
+         sec["result"] | "?", sec["reason"] | "", (unsigned)n, listed ? ", ours listed" : "");
+    // Bambu Studio installs its certificate on every connection even when
+    // already listed; a listing alone has not been enough (signed commands
+    // still came back 84033545), so trust only after our own install.
+    if (listed && _certInstalled) {
+        _certPhase = CertPhase::Idle;
+        _state.cert_trust  = 3;
+        _state.cert_detail = "";
+        dlog("Sign", "%s certificate trusted by the printer", _cfg.serial.c_str());
+        if (_resyncAfterTrust) { _resyncAfterTrust = false; requestResync(); }
+        return;
+    }
+    if (!_certInstalled) {
+        String msg, why;
+        if (!BambuSigner::buildCertInstall(_nextSeq(), msg, &why)) {
+            _certPhase = CertPhase::Idle;
+            _state.cert_trust  = 4;
+            _state.cert_detail = why;
+            dlog("Sign", "%s cannot register: %s", _cfg.serial.c_str(), why.c_str());
+            return;
+        }
+        String topic = "device/" + _cfg.serial + "/request";
+        bool ok = _mqtt && _mqtt->publish(topic.c_str(), msg.c_str());
+        dlog("Sign", "%s app_cert_install sent (%u bytes) %s", _cfg.serial.c_str(),
+             (unsigned)msg.length(), ok ? "ok" : "FAIL");
+        _certInstalled = true;
+        _state.cert_trust = 2;
+    }
+    // The printer never answers app_cert_install: poll the list.
+    _certPhase    = CertPhase::Polling;
+    _certDeadline = millis() + 3000;
+    (void)sec;
+}
+
+void BambuPrinter::_certLoop() {
+    // New / re-enabled / removed certificate: start over.
+    uint32_t gen = BambuSigner::generation();
+    if (gen != _signerGen) {
+        _signerGen = gen;
+        _certPhase = CertPhase::Idle;
+        _certSeq   = "";
+        _certLastStart = 0;
+        _state.cert_trust = 0;
+        if (_state.link == BambuLinkState::Connected) _certStart("certificate changed");
+    }
+    if (_certPhase == CertPhase::Idle || (int32_t)(millis() - _certDeadline) < 0) return;
+    if (_state.link != BambuLinkState::Connected) { _certPhase = CertPhase::Idle; return; }
+    if (_certSeq.length() || _certPhase == CertPhase::Polling) {
+        // Reply timed out, or time for the next poll.
+        if (++_certPolls > 8) {
+            _certPhase = CertPhase::Idle;
+            _certSeq   = "";
+            _state.cert_trust  = 4;
+            _state.cert_detail = _certInstalled
+                ? "the printer did not add the certificate to its trusted list"
+                : "the printer did not answer app_cert_list";
+            dlog("Sign", "%s registration failed: %s", _cfg.serial.c_str(), _state.cert_detail.c_str());
+            return;
+        }
+        _certQueryList();
+    }
 }

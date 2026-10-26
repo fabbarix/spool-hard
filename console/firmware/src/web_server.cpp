@@ -30,6 +30,7 @@
 #include "bambu_manager.h"
 #include "bambu_cloud.h"
 #include "bambu_discovery.h"
+#include "bambu_signer.h"
 #include "scale_discovery.h"
 #include <Preferences.h>
 #include <ArduinoJson.h>
@@ -940,6 +941,120 @@ void ConsoleWebServer::_setupRoutes() {
             _handlePrinterPost(req, data, len);
         }
     );
+    // Bambu MQTT command signing identity (bambu_signer.h). The key is
+    // write-only: GET never returns PEM material.
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing/test"), HTTP_POST, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        // Signs a fixed, harmless payload (not caller-supplied data, so this
+        // is no signing oracle) for verifying the envelope off-device.
+        JsonDocument doc;
+        JsonObject p = doc["print"].to<JsonObject>();
+        p["command"]     = "spoolhard_sign_test";
+        p["sequence_id"] = "0";
+        p["param"]       = "z";
+        p["ams_id"]      = 0;
+        JsonObject n = p["filaments"].to<JsonArray>().add<JsonObject>();   // nested: sort at depth
+        n["tray_id"] = -1;
+        n["k_value"] = "0.020";
+        String payload, toSign;
+        if (!BambuSigner::wrap("print", doc["print"], payload, &toSign)) {
+            req->send(409, "application/json", "{\"error\":\"signing not enabled\"}");
+            return;
+        }
+        JsonDocument out;
+        out["to_sign"] = toSign;
+        out["payload"] = payload;
+        String body; serializeJson(out, body);
+        req->send(200, "application/json", body);
+    });
+    // Live test against a printer: ?serial= (optional with one printer).
+    // POST queues a signed no-op ams_filament_setting (BambuPrinter::
+    // requestSignTest); GET polls the result until it is no longer "sent".
+    auto signTestPrinter = [](AsyncWebServerRequest* req) -> BambuPrinter* {
+        if (req->hasParam("serial")) return g_bambu.find(req->getParam("serial")->value());
+        return g_bambu.printers().size() == 1 ? g_bambu.printers()[0].get() : nullptr;
+    };
+    auto sendSignTest = [](AsyncWebServerRequest* req, int code, BambuPrinter* p) {
+        static const char* kNames[] = { "idle", "queued", "registering", "sent", "accepted",
+                                        "refused", "failed", "timeout" };
+        BambuPrinter::SignTestResult r = p->signTest();
+        JsonDocument doc;
+        doc["serial"]     = p->config().serial;
+        doc["state"]      = kNames[(int)r.state];
+        doc["slot"]       = r.slot;
+        doc["reason"]     = r.reason;
+        doc["err"]        = r.err;
+        doc["elapsed_ms"] = r.elapsed_ms;
+        String out; serializeJson(doc, out);
+        req->send(code, "application/json", out);
+    };
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing/printer-test"), HTTP_POST,
+        [this, signTestPrinter, sendSignTest](AsyncWebServerRequest* req) {
+            if (!_requireAuth(req)) return;
+            BambuPrinter* p = signTestPrinter(req);
+            if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
+            if (!BambuSigner::enabled()) {
+                req->send(409, "application/json", "{\"error\":\"signing is not enabled\"}");
+                return;
+            }
+            if (p->state().link != BambuLinkState::Connected) {
+                req->send(409, "application/json", "{\"error\":\"printer is not connected\"}");
+                return;
+            }
+            if (!p->requestSignTest()) {
+                req->send(409, "application/json", "{\"error\":\"a test is already running\"}");
+                return;
+            }
+            sendSignTest(req, 202, p);
+        });
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing/printer-test"), HTTP_GET,
+        [this, signTestPrinter, sendSignTest](AsyncWebServerRequest* req) {
+            if (!_requireAuth(req)) return;
+            BambuPrinter* p = signTestPrinter(req);
+            if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
+            sendSignTest(req, 200, p);
+        });
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing"), HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        _sendSigningStatus(req, 200);
+    });
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing"), HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        BambuSigner::remove();
+        _sendSigningStatus(req, 200);
+    });
+    // Body: {"cert_pem","key_pem","crl_pem"?} installs (and enables) a new
+    // identity; {"enabled":bool} alone toggles the stored one.
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+            if (index == 0 && !_requireAuth(req)) return;
+            if (!_accumulateBody(req, data, len, index, total, 32 * 1024)) return;
+            JsonDocument body(&g_psramJsonAlloc);
+            if (deserializeJson(body, (const char*)req->_tempObject, total)) {
+                req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+                return;
+            }
+            if (body["cert_pem"].is<const char*>() || body["key_pem"].is<const char*>()) {
+                String err = BambuSigner::install(body["cert_pem"] | "", body["key_pem"] | "",
+                                                  body["crl_pem"] | "");
+                if (err.length()) {
+                    JsonDocument e; e["error"] = err;
+                    String s; serializeJson(e, s);
+                    req->send(400, "application/json", s);
+                    return;
+                }
+            } else if (body["enabled"].is<bool>()) {
+                if (!BambuSigner::status().configured) {
+                    req->send(409, "application/json", "{\"error\":\"no certificate installed\"}");
+                    return;
+                }
+                BambuSigner::setEnabled(body["enabled"].as<bool>());
+            } else {
+                req->send(400, "application/json", "{\"error\":\"need cert_pem+key_pem or enabled\"}");
+                return;
+            }
+            _sendSigningStatus(req, 200);
+        });
     _server.on(AsyncURIMatcher::exact("/api/discovery/printers"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         _handleDiscoveryPrinters(req);
     });
@@ -1911,6 +2026,51 @@ void ConsoleWebServer::_handleFirmwareInfo(AsyncWebServerRequest* req) {
 
 // ── Backup / restore ─────────────────────────────────────────
 
+// Collects a (possibly multi-chunk) request body into req->_tempObject
+// (PSRAM, NUL-terminated; the request frees it). Returns true once the
+// whole body has arrived. Over `cap` -> 413 and false.
+bool ConsoleWebServer::_accumulateBody(AsyncWebServerRequest* req, uint8_t* data, size_t len,
+                                       size_t index, size_t total, size_t cap) {
+    if (index == 0) {
+        if (total == 0 || total > cap) {
+            req->send(total ? 413 : 400, "application/json",
+                      total ? "{\"error\":\"body too large\"}" : "{\"error\":\"empty body\"}");
+            return false;
+        }
+        req->_tempObject = heap_caps_malloc(total + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!req->_tempObject) {
+            req->send(507, "application/json", "{\"error\":\"out of memory\"}");
+            return false;
+        }
+    }
+    if (!req->_tempObject || index + len > total) return false;
+    memcpy((uint8_t*)req->_tempObject + index, data, len);
+    if (index + len < total) return false;
+    ((char*)req->_tempObject)[total] = 0;
+    return true;
+}
+
+void ConsoleWebServer::_sendSigningStatus(AsyncWebServerRequest* req, int code) {
+    BambuSigner::Status st = BambuSigner::status();
+    JsonDocument doc;
+    doc["configured"] = st.configured;
+    doc["enabled"]    = st.enabled;
+    if (st.configured) {
+        doc["cert_id"]    = st.cert_id;
+        doc["subject"]    = st.subject;
+        doc["issuer"]     = st.issuer;
+        doc["not_before"] = st.not_before;
+        doc["not_after"]  = st.not_after;
+        doc["crl_present"] = st.crl_present;
+        if (st.crl_present) doc["crl_next_update"] = st.crl_next_update;
+        doc["revoked"]    = st.revoked;
+        doc["chain_certs"] = st.chain_certs;
+    }
+    if (st.error.length()) doc["error"] = st.error;
+    String body; serializeJson(doc, body);
+    req->send(code, "application/json", body);
+}
+
 const SpoolhardBackup::Source& ConsoleWebServer::_backupSource() {
     // Ownership list — every namespace the console writes to, plus the
     // two filesystems. userfs (LittleFS) and SD each may hold the spool
@@ -1926,7 +2086,9 @@ const SpoolhardBackup::Source& ConsoleWebServer::_backupSource() {
             NVS_NS_CORE_WEIGHTS, NVS_NS_CONSOLE, NVS_NS_STORE,
             NVS_NS_BAMBU_CLOUD, "ota_cfg",
         };
-        SpoolhardBackup::FsMount lfs{"littlefs", &LittleFS, /*max*/ 0, {}, {".tmp"}};
+        // /bambu_sign holds the user's Bambu signing key: a secret, never
+        // exported (re-upload it after a restore onto new hardware).
+        SpoolhardBackup::FsMount lfs{"littlefs", &LittleFS, /*max*/ 0, {"/bambu_sign"}, {".tmp"}};
         SpoolhardBackup::FsMount sdm{"sd", &SD, /*max*/ 0,
             { "/filaments.jsonl", "/filaments.db", "/STORE", "/STATE",
               "/spoolease/logs", "/spoolease/crashes",
@@ -3278,6 +3440,11 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
     if (s.error_message.length()) st["error"] = s.error_message;
     st["commands_rejected_auth"] = s.commands_rejected_auth;
     st["developer_mode"] = s.dev_mode == 2 ? "on" : s.dev_mode == 1 ? "off" : "unknown";
+    {
+        static const char* kTrust[] = { "off", "checking", "installing", "trusted", "failed" };
+        st["signing_cert"] = kTrust[s.cert_trust < 5 ? s.cert_trust : 0];
+        if (s.cert_detail.length()) st["signing_cert_detail"] = s.cert_detail;
+    }
     if (s.last_cmd_ms) {
         JsonObject lc = st["last_command"].to<JsonObject>();
         lc["command"] = s.last_cmd;
@@ -3285,6 +3452,7 @@ static void serializePrinter(JsonObject out, const PrinterConfig& cfg, const Bam
         lc["reason"]  = s.last_cmd_reason;
         lc["err_code"] = s.last_cmd_err;
         lc["ms_ago"]  = (uint32_t)(millis() - s.last_cmd_ms);
+        lc["signed"]  = s.last_cmd_signed;
     }
 
     auto writeTray = [](JsonObject j, const AmsTray& tr) {

@@ -221,6 +221,9 @@ private:
     void _handlePrinterAnalysisGet(AsyncWebServerRequest* req);
     void _handleDisplayConfigGet(AsyncWebServerRequest* req);
     void _handleDisplayConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
+    bool _accumulateBody(AsyncWebServerRequest* req, uint8_t* data, size_t len,
+                         size_t index, size_t total, size_t cap);
+    void _sendSigningStatus(AsyncWebServerRequest* req, int code);
     void _handlePrinterAmsMappingPost(AsyncWebServerRequest* req, uint8_t* data, size_t len);
     // POST /api/printers/<serial>/import-ams-spool — copies AMS-reported
     // tray fields (material, color, slicer_filament, nozzle temps, brand)

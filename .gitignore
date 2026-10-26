@@ -50,3 +50,7 @@ Thumbs.db
 # Cached source TTFs for console/scripts/build_fonts.sh — downloaded on demand,
 # never distributed (the generated .c files under firmware/src/fonts/ are).
 /console/fonts/
+
+# Private Secrets for testing signing
+/secrets
+

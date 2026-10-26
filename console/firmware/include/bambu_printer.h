@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
+#include <esp_random.h>
 #include <freertos/stream_buffer.h>
 #include <memory>
 #include <vector>
@@ -211,6 +212,15 @@ struct PrinterState {
     int32_t  last_cmd_err      = 0;
     uint32_t last_cmd_ms       = 0; // millis() of the ack, 0 = none seen
     bool     commands_rejected_auth = false;  // cleared by a later successful ack
+    // Whether the last control command we published carried a signed
+    // `header` (BambuSigner). A verify failure on a signed command means
+    // the certificate was refused, not that Developer Mode is off.
+    bool     last_cmd_signed   = false;
+    // Signing certificate registration on this printer (app_cert_install /
+    // app_cert_list; printers forget it on power cycle): 0 n/a (signing
+    // off), 1 checking, 2 installing, 3 trusted, 4 failed.
+    uint8_t  cert_trust = 0;
+    String   cert_detail;           // reason on failure
     // Developer Mode (LAN control authorised): 0 unknown, 1 off, 2 on.
     // Derived from command acks (see _recordCommandAck) and, once
     // kFunBitDevMode is known, passively from print.fun. Seeded from the
@@ -284,6 +294,23 @@ public:
     // (edge-triggered) spool->printer sync. Thread-safe; applied in loop().
     // Used by the "Retry sync" action after the user enabled Developer Mode.
     void requestResync() { _resyncReq.store(true); }
+
+    // "Test with printer" for command signing: re-sends one loaded slot's
+    // CURRENT filament setting (as last reported, so nothing changes) as a
+    // signed ams_filament_setting and records the printer's ack for it.
+    // requestSignTest() is thread-safe (AsyncTCP); the publish happens in
+    // loop() on loopTask. signTest() returns a copy, safe from any task.
+    enum class SignTestState : uint8_t { Idle, Queued, Registering, Sent, Accepted,
+                                         Refused, Failed, Timeout };
+    struct SignTestResult {
+        SignTestState state = SignTestState::Idle;
+        int32_t  err        = 0;
+        char     reason[96] = "";   // printer reason, or why it could not run
+        char     slot[24]   = "";   // e.g. "AMS 1 slot 2", "External"
+        uint32_t elapsed_ms = 0;    // send -> ack (or -> now while Sent)
+    };
+    bool requestSignTest();         // false while a test is queued/in flight
+    SignTestResult signTest() const;
 
     // Fetch `path` from the printer over FTPS, stream-extract the first .gcode
     // entry from the 3MF, and run it through GCodeAnalyzer. Blocks the caller.
@@ -394,10 +421,46 @@ private:
     // Packed (ams_unit << 8 | slot_id) explicit claim request, -1 = none.
     std::atomic<int> _claimReq{-1};
     std::atomic<bool> _resyncReq{false};
-    // Monotonic MQTT sequence_id source (unique per published command).
-    std::atomic<uint32_t> _seq{100};
-    String _nextSeq() { return String((unsigned long)(_seq.fetch_add(1) + 1)); }
+    // Sign test (see requestSignTest). _signTest is guarded by _signTestMux;
+    // _signTestSeq/_signTestStartMs are loopTask-only.
+    std::atomic<bool> _signTestReq{false};
+    mutable portMUX_TYPE _signTestMux = portMUX_INITIALIZER_UNLOCKED;
+    SignTestResult _signTest;
+    String   _signTestSeq;
+    uint32_t _signTestStartMs = 0;
+    bool     _signTestAwaitTrust = false;   // test waits for cert registration
+    void _runSignTest();
+    void _sendSignTest();
+    // Cert registration state machine (loopTask). See cert_trust.
+    enum class CertPhase : uint8_t { Idle, Listing, Polling };
+    CertPhase _certPhase = CertPhase::Idle;
+    String    _certSeq;               // sequence_id of the outstanding list query
+    uint32_t  _certDeadline = 0;      // millis: reply timeout / next poll
+    uint8_t   _certPolls    = 0;
+    bool      _certInstalled = false; // app_cert_install sent this round
+    uint32_t  _certLastStart = 0;
+    uint32_t  _signerGen     = 0;
+    bool      _resyncAfterTrust = false;  // a signed push was refused: re-push once trusted
+    void _certStart(const char* why);
+    void _certLoop();
+    void _certOnList(JsonObjectConst sec);
+    void _certQueryList();
+    // Developer Mode probe: an unsigned command with a random name. The
+    // printer checks signatures before command lookup, so 84033543 means
+    // signing is required (Developer Mode off) and success means it is not.
+    String    _devProbeSeq;
+    void _sendDevModeProbe();
+    void _setSignTest(SignTestState st, const char* reason, int32_t err = 0);
+    // MQTT sequence_id source, kept in Bambu Studio's 20000-29999 window:
+    // the H2S refuses SIGNED commands below 10000 (84033545), ids above
+    // 2^31-1 hang the AMS (open-bamboo-networking research/06.02-mqtt.md),
+    // and some firmware is reported to reject ids reused across a client
+    // restart -- so the counter starts at a random point each boot and wraps
+    // inside the window. (The H2S tested accepted reused ids.)
+    std::atomic<uint32_t> _seq{esp_random() % 10000};
+    String _nextSeq() { return String((unsigned long)(20000 + (_seq.fetch_add(1) + 1) % 10000)); }
     void _recordCommandAck(JsonObjectConst print);
+    void _onSecurityReport(JsonObjectConst sec);
     // Update dev_mode; persists to PrinterConfig/NVS only when it changes.
     void _setDevMode(uint8_t v, const char* why);
 
@@ -456,6 +519,10 @@ private:
     void _persistTrayInfoIdx();
     void _autoRestoreKValues();
     void _pushKRestore(int ams_id, int slot_id, const AmsTray& tr, float nozzle, float k);
+    // Publish {"print": ...} to /request, signed when BambuSigner is enabled.
+    // Records last_cmd_signed. Returns the PubSubClient result; `len` gets
+    // the payload size for logging.
+    bool _publishPrint(const JsonDocument& doc, size_t* len = nullptr);
     // If PendingAms has an armed spool, claim it and push ams_filament_setting
     // to this printer for (ams_id, slot_id). Called from _parseAms after an
     // empty/populated transition on the slot signature. Also sets a manual

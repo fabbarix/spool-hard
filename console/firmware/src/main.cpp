@@ -23,6 +23,7 @@
 #include <lvgl.h>
 #include <freertos/semphr.h>
 #include "bambu_manager.h"
+#include "bambu_signer.h"
 #include "bambu_cloud.h"
 #include "bambu_discovery.h"
 #include "mbedtls_psram_alloc.h"
@@ -245,6 +246,7 @@ void setup() {
     if (!LittleFS.begin(true, USERFS_MOUNT, 10, USERFS_LABEL)) {
         Serial.println("[Main] LittleFS (userfs) mount failed");
     }
+    BambuSigner::begin();   // reads /bambu_sign on userfs
     g_sd.begin();
     // Crash-log persistence depends on SD being mounted; if a card is
     // present and the previous boot ended in a panic / watchdog reset,

@@ -48,7 +48,13 @@ export interface PrinterState {
   // Developer Mode (LAN control authorised): detected from command acks,
   // persisted by the firmware across reboots. 'unknown' until first evidence.
   developer_mode?: 'on' | 'off' | 'unknown';
-  last_command?: { command: string; result: string; reason: string; err_code: number; ms_ago: number };
+  // Command-signing certificate registration on this printer (it forgets
+  // it on every power cycle; the console re-registers automatically).
+  signing_cert?: 'off' | 'checking' | 'installing' | 'trusted' | 'failed';
+  signing_cert_detail?: string;
+  // `signed`: the command carried a header signed with the certificate from
+  // Config -> Printers -> Command signing.
+  last_command?: { command: string; result: string; reason: string; err_code: number; ms_ago: number; signed?: boolean };
   ams?: AmsUnit[];
   // External spool holder (single-extruder printers). Bambu calls this
   // `vt_tray`; id is typically 254. Absent on printers that don't report one.

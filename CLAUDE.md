@@ -449,16 +449,60 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   dashboard card. No retry loop; `POST /api/printers/<serial>/resync` clears the
   per-slot "last synced" cache so the next report re-pushes.
 - Developer Mode reminder: `PrinterState::dev_mode` (0 unknown / 1 off / 2 on)
-  is derived in `_recordCommandAck` (auth failure -> off; successful
-  ams_filament_setting / extrusion_cali_* ack -> on; pushall never counts),
-  persisted as `PrinterConfig::dev_mode` (JSON `developer_mode`) via
-  `_setDevMode`, and exposed as `state.developer_mode` in `/api/printers`.
-  Passive hook `kFunBitDevMode` (bambu_printer.cpp) is -1 = DISABLED: the bit
-  of `print.fun` is not yet known, do not guess. Web: `DevModeBanner` (App
-  level, non-dismissible) while any printer is "on"; the per-card
-  "refused commands" notice covers the off/rejected case. LCD: no Dev Mode
-  indicator (removed; the header warning triangle now means printer
-  offline / none configured, see LCD design rules).
+  is probed on every MQTT connect (`_sendDevModeProbe`): an UNSIGNED
+  `print.command` with a random name; the printer checks signatures before
+  command lookup, so err 84033543 -> off, success -> on (safe mid-print). Also
+  derived in `_recordCommandAck` from unsigned control acks (pushall and signed
+  commands never count), persisted as `PrinterConfig::dev_mode` (JSON
+  `developer_mode`) via `_setDevMode`, exposed as `state.developer_mode`.
+  Passive hook `kFunBitDevMode` is -1 = DISABLED (bit of `print.fun` unknown, do
+  not guess). Web: `DevModeBanner` (content-width, non-dismissible) while any
+  printer is "on". LCD: no Dev Mode indicator (the header warning triangle
+  means printer offline / none configured, see LCD design rules).
+- Command signing (`console/firmware/{include,src}/bambu_signer.*`), verified
+  working on the H2S. User supplies slicer cert CHAIN (slicer_cert.pem = leaf +
+  2 CAs) + key + CRL; every `print.*` publish goes through
+  `BambuPrinter::_publishPrint` -> `BambuSigner::wrap`:
+  `{"header":{cert_id,payload_len,sign_alg RSA_SHA256,sign_string,sign_ver
+  v1.0},"print":<canonical>}` (header first, keys sorted, as Bambu Studio;
+  header-last also verified accepted). canonical = keys sorted at every depth,
+  no whitespace; signed bytes = `{"print":` + canonical + `}`; cert_id = leaf
+  serial lowercase hex (32) + `CN=<issuer CN>`. Hard-won rules:
+  * **sequence_id must be >= 10000** for signed commands, else 84033545 (looks
+    like an unregistered cert). `_nextSeq` stays in Studio's 20000-29999
+    window (random start per boot, wraps): ids > 2^31-1 hang the AMS, and
+    some firmware reportedly rejects ids reused across a client restart
+    (ClusterM open-bamboo-networking `research/06.02-mqtt.md`); the H2S tested
+    accepted reused ids.
+  * The printer must have the cert registered: `security.app_cert_install`
+    `{app_cert:<chain>,command,crl,sequence_id}` (unsigned, never acked) then
+    poll `security.app_cert_list` (`cert_ids[]`). Registration is global (any
+    MQTT client) and lost on printer power cycle. The console installs on every
+    connect (like Studio), polls the list (`_certLoop`, `PrinterState::
+    cert_trust`, `/api/printers` `state.signing_cert`), re-registers on a
+    signed 84033545 and then `requestResync()`s so the refused push re-runs.
+  * Error codes: 84033543 no envelope; 84033545 cert not registered OR
+    sequence_id < 10000; 84033546 malformed (e.g. whitespace in the signed
+    object on the wire); 84033547 bad chain/CRL; 84033548 bad signature.
+  * No TLS client cert is needed.
+  One identity per console. Files on userfs `/bambu_sign/{cert,key,crl}.pem`
+  (+ `disabled` flag file); survive OTA, excluded from backups (secret).
+  `BambuSigner::generation()` bumps on install/enable/remove (printers
+  re-register). API (auth): `GET/DELETE /api/bambu-signing` (status has
+  `chain_certs`), `POST` `{cert_pem,key_pem,crl_pem?}` or `{enabled}`; `POST
+  /api/bambu-signing/test` signs a FIXED payload (no signing oracle) for
+  off-device verification. `POST /api/bambu-signing/printer-test[?serial=]`
+  (202; 409 signing off / offline / busy) queues `requestSignTest`: registers
+  the cert if needed, then re-sends the first loaded tray's CURRENT values as a
+  signed ams_filament_setting (no-op) and matches the ack by sequence_id; `GET`
+  polls `{state: idle|queued|registering|sent|accepted|refused|failed|timeout,
+  slot, reason, err, elapsed_ms}`. The web form requires all three files,
+  keeps every CERTIFICATE block of a pasted/dropped chain, and parses the leaf
+  + CRL client-side (`config/pemInfo.ts`) for expiry; paste falls back to a
+  textarea (console is plain http, no async clipboard). RSA-2048 sign ~160-380
+  ms on loopTask, only per pushed command. Local probing without the console:
+  paho-mqtt to `<printer>:8883` user `bblp` / access code, TLS unverified.
+  Test certs live in repo-root `/secrets/` (gitignored, never commit).
 - `POST /api/printers` MERGES onto the stored record by serial
   (`PrinterConfig::fromJson` only overwrites fields present in the body), so the
   Config page's partial save (name/serial/ip/access_code) keeps ams_overrides,

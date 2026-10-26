@@ -9,6 +9,7 @@ import { OtaSection } from '../components/config/OtaSection';
 import { SecurityKeySection } from '../components/config/SecurityKeySection';
 import { ScaleSection } from '../components/config/ScaleSection';
 import { PrintersSection } from '../components/config/PrintersSection';
+import { BambuSigningSection } from '../components/config/BambuSigningSection';
 import { DirectUploadSection } from '../components/config/DirectUploadSection';
 import { DeviceControlSection } from '@spoolhard/ui/components/DeviceControlSection';
 import { DisplaySection } from '../components/config/DisplaySection';
@@ -77,7 +78,12 @@ export function ConfigPage() {
           </div>
         )}
 
-        {activeTab === 'printers' && <PrintersSection />}
+        {activeTab === 'printers' && (
+          <div className="space-y-4">
+            <PrintersSection />
+            <BambuSigningSection />
+          </div>
+        )}
 
         {activeTab === 'cloud' && (
           <div className="space-y-4">
