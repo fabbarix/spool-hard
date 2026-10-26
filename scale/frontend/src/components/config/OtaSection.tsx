@@ -47,7 +47,10 @@ export function OtaSection() {
   const [checkEnabled, setCheckEnabled] = useState(true);
   const [intervalH, setIntervalH]     = useState(24);
 
-  useEffect(() => {
+  // Re-seed the form whenever the server copy changes.
+  const [seeded, setSeeded] = useState(cfg.data);
+  if (cfg.data !== seeded) {
+    setSeeded(cfg.data);
     if (cfg.data) {
       setUrl(cfg.data.url);
       setUseSsl(cfg.data.use_ssl);
@@ -55,7 +58,7 @@ export function OtaSection() {
       setCheckEnabled(cfg.data.check_enabled);
       setIntervalH(cfg.data.check_interval_h);
     }
-  }, [cfg.data]);
+  }
 
   // Auto-save helper. Toggles + select call this synchronously with their
   // new value (don't trust setState being applied yet); the URL input fires
@@ -94,7 +97,7 @@ export function OtaSection() {
       poll_age_ms: pollAge,
     });
   }, [status.dataUpdatedAt, status.errorUpdatedAt, status.isError,
-      sc?.in_progress?.percent, sc?.firmware_current, updater]);
+      sc?.in_progress, sc?.firmware_current, updater]);
 
   const triggerUpdate = () => {
     updater.trigger(fwLatest ?? '', fwCurrent ?? '');

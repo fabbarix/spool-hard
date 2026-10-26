@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Wifi } from 'lucide-react';
 import { useWifiStatus } from '../../hooks/useWifiStatus';
 import { useWifiScan } from '../../hooks/useWifiScan';
@@ -19,12 +19,14 @@ export function WifiSection() {
   const [pinnedBssid, setPinnedBssid] = useState('');
 
   // Hydrate pin state from current snapshot once it arrives.
-  useEffect(() => {
+  const [seenPin, setSeenPin] = useState(wifi?.pinned_bssid);
+  if (wifi?.pinned_bssid !== seenPin) {
+    setSeenPin(wifi?.pinned_bssid);
     if (wifi?.pinned_bssid) {
       setPinEnabled(true);
       setPinnedBssid(wifi.pinned_bssid);
     }
-  }, [wifi?.pinned_bssid]);
+  }
 
   const wifiStatus: 'connected' | 'connecting' | 'disconnected' = wifi?.connected
     ? 'connected'

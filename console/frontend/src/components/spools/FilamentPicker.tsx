@@ -33,28 +33,30 @@ export function FilamentPicker({ onPick, onClose, stockOnly, title, description 
 
   // Tag stock entries with source=stock so the renderer + applyFilament
   // can tell them apart from user entries (which carry a setting_id).
-  const stockEntries = (data?.entries ?? []).map<FilamentEntry>((e) => ({
-    ...e, source: 'stock',
-  }));
-  // Map user filaments into the same FilamentEntry shape — slots into
-  // the existing search / filter / row UI without forking it.
-  const userEntries: FilamentEntry[] = stockOnly
-    ? []
-    : (userQ.data?.rows ?? []).map((u) => ({
-        name:        u.name || '(unnamed)',
-        filament_id: u.filament_id || '',
-        brand:       u.filament_vendor || '',
-        material:    u.filament_type   || '',
-        subtype:     u.filament_subtype || '',
-        nozzle_temp_min: u.nozzle_temp_min > 0 ? u.nozzle_temp_min : undefined,
-        nozzle_temp_max: u.nozzle_temp_max > 0 ? u.nozzle_temp_max : undefined,
-        density:     u.density > 0 ? u.density : undefined,
-        setting_id:  u.setting_id,
-        source:      'user',
-      }));
-  // User filaments first — they're typically more relevant to the user
-  // who took the time to create them.
-  const entries = [...userEntries, ...stockEntries];
+  const entries = useMemo(() => {
+    const stockEntries = (data?.entries ?? []).map<FilamentEntry>((e) => ({
+      ...e, source: 'stock',
+    }));
+    // Map user filaments into the same FilamentEntry shape — slots into
+    // the existing search / filter / row UI without forking it.
+    const userEntries: FilamentEntry[] = stockOnly
+      ? []
+      : (userQ.data?.rows ?? []).map((u) => ({
+          name:        u.name || '(unnamed)',
+          filament_id: u.filament_id || '',
+          brand:       u.filament_vendor || '',
+          material:    u.filament_type   || '',
+          subtype:     u.filament_subtype || '',
+          nozzle_temp_min: u.nozzle_temp_min > 0 ? u.nozzle_temp_min : undefined,
+          nozzle_temp_max: u.nozzle_temp_max > 0 ? u.nozzle_temp_max : undefined,
+          density:     u.density > 0 ? u.density : undefined,
+          setting_id:  u.setting_id,
+          source:      'user',
+        }));
+    // User filaments first — they're typically more relevant to the user
+    // who took the time to create them.
+    return [...userEntries, ...stockEntries];
+  }, [data, userQ.data, stockOnly]);
   const present = entries.length > 0;
 
   const rows = useMemo(() => {

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { Monitor } from 'lucide-react';
 import { useDisplayConfig, useSaveDisplayConfig } from '../../hooks/useDisplayConfig';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
@@ -20,9 +20,11 @@ export function DisplaySection() {
   const save = useSaveDisplayConfig();
   const [seconds, setSeconds] = useState<number>(120);
 
-  useEffect(() => {
+  const [seeded, setSeeded] = useState(data);
+  if (data !== seeded) {
+    setSeeded(data);
     if (typeof data?.sleep_timeout_s === 'number') setSeconds(data.sleep_timeout_s);
-  }, [data]);
+  }
 
   const dirty = data && data.sleep_timeout_s !== seconds;
 

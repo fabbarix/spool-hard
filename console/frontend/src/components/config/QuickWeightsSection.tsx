@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { Zap, X, Plus, Save } from 'lucide-react';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { Button } from '@spoolhard/ui/components/Button';
@@ -16,9 +16,12 @@ export function QuickWeightsSection() {
   const [grams, setGrams] = useState<number[]>([]);
   const [input, setInput] = useState('');
 
-  useEffect(() => {
+  // Re-seed the editable list whenever the server copy changes.
+  const [seeded, setSeeded] = useState(data);
+  if (data !== seeded) {
+    setSeeded(data);
     if (data?.grams) setGrams(data.grams);
-  }, [data]);
+  }
 
   const dirty = JSON.stringify(grams) !== JSON.stringify(data?.grams ?? []);
   const canAdd = grams.length < MAX_ENTRIES && parseInt(input, 10) > 0;

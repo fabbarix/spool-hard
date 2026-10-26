@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { Scale, RotateCcw, Plus, Trash2, Check, AlertTriangle, Crosshair, Activity } from 'lucide-react';
 import {
   useScaleConfig, useSetScaleConfig, useTare,
@@ -93,7 +93,10 @@ export function ScaleSection() {
   const [newWeight, setNewWeight] = useState('');
   const [confirmClear, setConfirmClear] = useState(false);
 
-  useEffect(() => {
+  // Re-seed the form whenever the server copy changes.
+  const [seeded, setSeeded] = useState(data);
+  if (data !== seeded) {
+    setSeeded(data);
     if (data) {
       setSamples(String(data.samples));
       setStableThreshold(String(data.stable_threshold));
@@ -102,9 +105,9 @@ export function ScaleSection() {
       setPrecision(String(data.precision));
       setRounding(data.rounding);
     }
-  }, [data]);
+  }
 
-  const points = data?.points || [];
+  const points = useMemo(() => data?.points || [], [data?.points]);
   const isBusy = tare.isPending || addPoint.isPending || clearCal.isPending;
   // Best-fit line through origin; null when there aren't enough points.
   // Used to surface how linear the captured points actually are — the

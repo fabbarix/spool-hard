@@ -41,7 +41,7 @@ export function DebugSection() {
   const [entries, setEntries] = useState<DebugEntry[]>([]);
   const [paused, setPaused]   = useState(false);
   const pausedRef             = useRef(paused);
-  pausedRef.current           = paused;
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
 
   // Subscribe once — the WebSocketProvider pushes every ams_raw message
   // through here. We gate via pausedRef so toggling Pause doesn't have to
@@ -496,11 +496,20 @@ function SpoolStorageBackend() {
       const r = await fetch('/api/storage/spools');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       setStatus(await r.json());
-    } catch (e) {
+    } catch {
       setStatus(null);
     }
   }, []);
-  useEffect(() => { refresh(); }, [refresh]);
+  // Initial load: the state updates happen after the await, not in the
+  // effect body.
+  useEffect(() => {
+    let live = true;
+    fetch('/api/storage/spools')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((j: SpoolStorageStatus) => { if (live) setStatus(j); })
+      .catch(() => { if (live) setStatus(null); });
+    return () => { live = false; };
+  }, []);
 
   const set = async (target: 'sd' | 'internal', migrate: boolean) => {
     setBusy(true); setMsg(null);

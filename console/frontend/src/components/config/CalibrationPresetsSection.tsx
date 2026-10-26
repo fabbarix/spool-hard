@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { Weight, X, Plus, Save } from 'lucide-react';
 import { SectionCard } from '@spoolhard/ui/components/SectionCard';
 import { Button } from '@spoolhard/ui/components/Button';
@@ -17,9 +17,12 @@ export function CalibrationPresetsSection() {
   const [presets, setPresets] = useState<number[]>([]);
   const [input, setInput]     = useState('');
 
-  useEffect(() => {
+  // Re-seed the editable list whenever the server copy changes.
+  const [seeded, setSeeded] = useState(data);
+  if (data !== seeded) {
+    setSeeded(data);
     if (data?.presets) setPresets(data.presets);
-  }, [data]);
+  }
 
   const dirty = JSON.stringify(presets) !== JSON.stringify(data?.presets ?? []);
 

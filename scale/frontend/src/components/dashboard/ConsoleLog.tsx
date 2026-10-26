@@ -19,12 +19,16 @@ export function ConsoleLog() {
   const [paused, setPaused] = useState(false);
   const bufferRef = useRef<LogEntry[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
+  // Count of entries held back while paused; state (not the ref) so the
+  // badge re-renders as they arrive.
+  const [buffered, setBuffered] = useState(0);
   const pausedRef = useRef(paused);
-  pausedRef.current = paused;
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
 
   const addEntry = useCallback((entry: LogEntry) => {
     if (pausedRef.current) {
       bufferRef.current.push(entry);
+      setBuffered(bufferRef.current.length);
     } else {
       setEntries((prev) => {
         const next = [...prev, entry];
@@ -48,6 +52,7 @@ export function ConsoleLog() {
       bufferRef.current = [];
       return merged.length > 500 ? merged.slice(-500) : merged;
     });
+    setBuffered(0);
     setPaused(false);
   }
 
@@ -60,9 +65,9 @@ export function ConsoleLog() {
           {paused ? (
             <Button variant="secondary" onClick={handleResume} className="px-2 py-1 flex items-center gap-1">
               <Play size={14} />
-              {bufferRef.current.length > 0 && (
+              {buffered > 0 && (
                 <span className="bg-brand-500/20 text-brand-400 text-[10px] px-1.5 rounded-full">
-                  {bufferRef.current.length}
+                  {buffered}
                 </span>
               )}
             </Button>
@@ -77,6 +82,7 @@ export function ConsoleLog() {
             onClick={() => {
               setEntries([]);
               bufferRef.current = [];
+              setBuffered(0);
             }}
           >
             <X size={14} />
