@@ -8,6 +8,18 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.14.4] - 2026-10-26
+
+**Changes**
+- Console LCD: when the printer is offline, the home screen keeps showing
+  its name with an "Offline - reconnecting..." card and a Retry button,
+  and the empty filament area reads "Looking for your printer...".
+- Console LCD: the yellow warning triangle in the header now means "printer
+  offline or not set up" (tap it to retry). It no longer shows for
+  Developer Mode and never appears next to the print percentage; it also
+  no longer sticks out past the card edge. The web dashboard's Developer
+  Mode banner is unchanged.
+
 ## [0.14.3] - 2026-10-25
 
 **Fixes**
