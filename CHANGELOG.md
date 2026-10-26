@@ -8,6 +8,28 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.15.0] - 2026-10-26
+
+**New**
+- Console: command signing. Under Config -> Printers -> Command signing,
+  add the certificate, private key and CRL from your own Bambu Studio
+  install (choose the files, drop them, or paste the text; the expiry
+  dates show before you install). SpoolHard then signs its commands, so
+  setting filament and K values works with Developer Mode off. The
+  console registers the certificate with the printer automatically
+  (printers forget it when switched off) and keeps the key out of
+  backups.
+- Console: "Test with printer" on the same card re-sends one loaded
+  slot's current settings, signed, and shows whether the printer
+  accepted them. Nothing on the printer changes.
+
+**Fixes**
+- Console: the Developer Mode banner no longer sticks after the mode is
+  turned off; the console checks the printer each time it connects. The
+  banner now lines up with the page instead of spanning the full window.
+- Scale dashboard: the paused console log's count of held-back lines now
+  updates as lines arrive.
+
 ## [0.14.4] - 2026-10-26
 
 **Changes**
