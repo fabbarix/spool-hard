@@ -8,6 +8,34 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.16.0] - 2026-10-30
+
+**New**
+- Console: the new-tag wizard has a color step. After picking a filament,
+  choose from 15 common filament colors (or Skip to keep the tag's color).
+  The Review & save screen shows the spool color as a button; tap it to
+  change the color on either path.
+- Console: picking a filament now goes Type -> Brand -> list. Type adds
+  "Other" for everything beyond PLA/PETG/ABS/TPU; the Brand step lists
+  only brands that have that type, with counts, and is skipped when
+  there is just one.
+
+**Changes**
+- Console: tapping a filament in the list only highlights it; Next
+  confirms. Taps while the list is scrolling, or right after, are
+  ignored, and slow drags now scroll instead of selecting.
+- Console: lists that continue below the screen show a visible
+  scrollbar and an "N more" shortcut that scrolls a page.
+
+**Fixes**
+- Console: if the screen left the new-tag wizard on its own (for example
+  an earlier spool's AMS wait timing out), every later tag scan, from the
+  console or the scale, was ignored until a reboot. The wizard now
+  recovers, and the earlier spool's timers no longer close it.
+- Console: the screen now goes to sleep after its timeout while a browser
+  dashboard is open. It stays on only while a print is running or paused,
+  or a spool is on the scale.
+
 ## [0.15.0] - 2026-10-26
 
 **New**
