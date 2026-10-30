@@ -21,11 +21,13 @@
 // "new from scratch" defaults so the user starts with sensible hints when
 // the tag URL exposed them.
 //
-// Re-entry is gated: if a wizard is already active, the new scan is
-// logged and dropped.
-void ui_wizard_start(const SpoolTag& tag);
+// Re-entry is gated: if a wizard is already active (and its screen is
+// showing), the new scan is logged and dropped -> returns false. A wizard
+// whose screen was replaced from outside is treated as stale and restarted.
+bool ui_wizard_start(const SpoolTag& tag);
 
-// True while the wizard owns the LCD. Used by main.cpp to decide whether
+// True while the wizard owns the LCD (flag set AND a wizard screen is the
+// active screen). Used by main.cpp to decide whether
 // to route incoming tag scans to the wizard or to the spool-detail path.
 bool ui_wizard_active();
 

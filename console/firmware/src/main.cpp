@@ -617,7 +617,14 @@ void setup() {
         bool is_new = !g_store.findByTagId(tag.uid_hex, rec);
 
         if (is_new) {
-            ui_wizard_start(tag);
+            // The wizard takes the screen: drop the previous spool's
+            // AMS-wait / auto-close timers, else their ui_show_home()
+            // yanks the wizard away mid-flow.
+            if (ui_wizard_start(tag)) {
+                g_activeSpoolId = "";
+                g_activeSpoolExpiresAt = 0;
+                g_spoolAutoCloseAt = 0;
+            }
         } else {
             showSpoolDetail(rec);
             g_scale.requestCurrentWeight();
@@ -1743,7 +1750,7 @@ void loop() {
         g_spoolAutoCloseAt = 0;
         g_activeSpoolId = "";
         g_activeSpoolExpiresAt = 0;
-        ui_show_home();
+        if (!ui_wizard_active()) ui_show_home();
     }
 
     // AMS-load timeout: if we armed PendingAms for a scanned spool but the

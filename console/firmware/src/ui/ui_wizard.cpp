@@ -1013,10 +1013,28 @@ static void build_all_once() {
     lv_unlock();
 }
 
-void ui_wizard_start(const SpoolTag& tag) {
+// True when one of the wizard's own screens is on the LCD. Something
+// outside the wizard (spool auto-close, OTA completion, ...) can load
+// another screen without going through close_wizard(); the flag alone
+// would then stay set forever and drop every later scan.
+static bool wizard_screen_showing() {
+    lv_lock();
+    lv_obj_t* a = lv_screen_active();
+    lv_unlock();
+    return a && (a == s_scr_prompt   || a == s_scr_template || a == s_scr_pick  ||
+                 a == s_scr_filapick || a == s_scr_state    || a == s_scr_full  ||
+                 a == s_scr_used     || a == s_scr_empty    || a == s_scr_usedlist ||
+                 a == s_scr_done);
+}
+
+bool ui_wizard_start(const SpoolTag& tag) {
     if (s_wiz.active) {
-        Serial.printf("[Wiz] drop tag %s — wizard already active\n", tag.uid_hex.c_str());
-        return;
+        if (wizard_screen_showing()) {
+            Serial.printf("[Wiz] drop tag %s — wizard already active\n", tag.uid_hex.c_str());
+            return false;
+        }
+        Serial.printf("[Wiz] stale wizard (%s) lost its screen — restarting for %s\n",
+                      s_wiz.tag_uid.c_str(), tag.uid_hex.c_str());
     }
     build_all_once();
     s_wiz            = WizardCtx{};
@@ -1030,9 +1048,10 @@ void ui_wizard_start(const SpoolTag& tag) {
     s_wiz.hint_color_hex = tag.parsed_color_hex;
     s_pick_material_filter = "";
     show_prompt();
+    return true;
 }
 
-bool ui_wizard_active() { return s_wiz.active; }
+bool ui_wizard_active() { return s_wiz.active && wizard_screen_showing(); }
 
 void ui_wizard_on_weight(float grams, const char* state) {
     if (!s_wiz.active) return;
