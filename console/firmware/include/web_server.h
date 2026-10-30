@@ -92,6 +92,9 @@ public:
     void onUploadProgress(std::function<void(int percent, const char* type, const char* label)> cb)
                                                               { _onUploadProgress = std::move(cb); }
     void onOtaRequested(std::function<void()> cb)             { _onOtaRequested = std::move(cb); }
+    // POST /api/debug/lcd/tag: queue a fake tag scan (uid hex). Returns
+    // false while a previous injection is still unconsumed.
+    void onInjectTag(std::function<bool(const char* uid)> cb) { _onInjectTag = std::move(cb); }
 
 private:
     AsyncWebServer _server{80};
@@ -103,6 +106,7 @@ private:
     std::function<void(const char*)> _onUploadStarted;
     std::function<void(int, const char*, const char*)> _onUploadProgress;
     std::function<void()>            _onOtaRequested;
+    std::function<bool(const char*)> _onInjectTag;
 
     // Per-upload signature check state. Arduino's Update lib is a singleton,
     // so one matcher is enough. Invariant: `_uploadAccepted` defaults to false

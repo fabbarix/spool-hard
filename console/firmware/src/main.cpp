@@ -22,6 +22,7 @@
 #include "housekeeping.h"
 #include <lvgl.h>
 #include <freertos/semphr.h>
+#include <atomic>
 #include "bambu_manager.h"
 #include "bambu_signer.h"
 #include "bambu_cloud.h"
@@ -78,6 +79,10 @@ static String   g_activeSpoolId;
 static uint32_t g_activeSpoolOpenedMs  = 0;
 static uint32_t g_activeSpoolExpiresAt = 0;  // millis: AMS-load timeout deadline
 static void _homeUiBegin();   // defined with the home-UI snapshot below
+// Debug tag injection state (see onInjectTag in setup()).
+static void (*s_handleTagRead)(const SpoolTag&, const char*) = nullptr;
+static char              s_injTagUid[24];
+static std::atomic<bool> s_injTagPending{false};
 static uint32_t g_spoolAutoCloseAt     = 0;  // millis: loop() should ui_show_home() when crossed
 static constexpr uint32_t SPOOL_AUTOCLOSE_MS = 2500;  // confirmation dwell after AMS assign
 
@@ -658,6 +663,16 @@ void setup() {
         d["new"]    = is_new;
         g_web.broadcastDebug("nfc", d);
     };
+    // Debug tag injection (POST /api/debug/lcd/tag, AsyncTCP): copy the uid,
+    // publish the flag; loop() runs handleTagRead on loopTask.
+    s_handleTagRead = handleTagRead;
+    g_web.onInjectTag([](const char* uid) {
+        bool expected = false;
+        if (s_injTagPending.load()) return false;
+        strlcpy(s_injTagUid, uid, sizeof(s_injTagUid));
+        for (char* c = s_injTagUid; *c; ++c) *c = toupper((unsigned char)*c);
+        return s_injTagPending.compare_exchange_strong(expected, true);
+    });
     // Capture the helper into both callback lambdas via [=] — it holds no
     // non-capturable state and is cheap to copy.
     g_scale.onTag([handleTagRead](const char* uid, const char* url, bool bambu) {
@@ -1637,6 +1652,13 @@ void loop() {
     LAT_STEP(S_WIFI, "wifi",            g_wifi.update());
     LAT_STEP(S_SCALE, "scale",           g_scale.update());
     LAT_STEP(S_NFC, "nfc",             g_nfc.update());
+    if (s_injTagPending.load()) {
+        SpoolTag t;
+        t.uid_hex = s_injTagUid;
+        t.format  = "Unknown";
+        s_injTagPending.store(false);
+        if (s_handleTagRead) s_handleTagRead(t, "Debug");
+    }
     if (!housekeepingActive()) {   // fallback only; normally the housekeeping task owns these
         LAT_STEP(S_SD, "sd",              g_sd.update());
         LAT_STEP(S_CRASH_LOG, "crash_log",       CrashLogger::update());

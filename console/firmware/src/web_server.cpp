@@ -1640,6 +1640,34 @@ void ConsoleWebServer::_setupRoutes() {
             req->send(200, "application/json", "{\"ok\":true}");
         }
     );
+    // Fake tag scan for remote UI testing (wizard without a physical tag).
+    // Same gate as touch injection. Queued; loopTask runs the normal
+    // tag-read path with source "Debug".
+    _server.on(AsyncURIMatcher::exact("/api/debug/lcd/tag"), HTTP_POST, [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+            if (!_requireAuth(req)) return;
+            if (!_lcdDebug) { req->send(403, "application/json", "{\"error\":\"lcd_debug off\"}"); return; }
+            if (index != 0 || len != total) {
+                req->send(400, "application/json", "{\"error\":\"body too fragmented\"}");
+                return;
+            }
+            JsonDocument body;
+            if (deserializeJson(body, data, len) || !body["uid"].is<const char*>()) {
+                req->send(400, "application/json", "{\"error\":\"need uid\"}");
+                return;
+            }
+            const char* uid = body["uid"].as<const char*>();
+            size_t n = strlen(uid);
+            bool ok = n >= 8 && n <= 20 && n % 2 == 0;
+            for (size_t i = 0; ok && i < n; ++i) ok = isxdigit((unsigned char)uid[i]);
+            if (!ok) { req->send(400, "application/json", "{\"error\":\"uid: 8..20 hex chars\"}"); return; }
+            if (!_onInjectTag || !_onInjectTag(uid)) {
+                req->send(409, "application/json", "{\"error\":\"tag busy\"}");
+                return;
+            }
+            req->send(200, "application/json", "{\"ok\":true}");
+        }
+    );
     // Inflate-placement timings of each printer's last analysis run. Needs
     // the session-only analysis_debug toggle. Read-only.
     _server.on(AsyncURIMatcher::exact("/api/debug/analysis"), HTTP_GET, [this](AsyncWebServerRequest* req) {

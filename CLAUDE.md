@@ -273,6 +273,10 @@ runs. Both need auth (`?key=` / Bearer).
   400 bad input, 409 if the previous injection is still unconsumed. Real
   touch takes precedence; injected touches wake a sleeping screen without
   the wake-swallow.
+- `POST /api/debug/lcd/tag {"uid":"04AABBCCDDEEFF"}` (8..20 hex chars) — fake
+  tag scan: queued (409 while one is pending) and run on loopTask through the
+  same `handleTagRead` path as the PN532/scale (source `Debug`, format
+  `Unknown`). An unknown uid opens the new-tag wizard. Same gate as touch.
 
 ## Scale firmware task model (0.8.0+)
 
