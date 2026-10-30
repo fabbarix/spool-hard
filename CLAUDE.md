@@ -534,7 +534,10 @@ from the type's rows; skipped when <= 1 brand) -> list. A row tap only
 highlights it (LV_STATE_CHECKED, amber); the Next button commits. Row taps
 while the list scrolls or < 300 ms after a scroll ends (the tap that stops a
 fling) are ignored. The touch indev uses `lv_indev_set_scroll_limit(6)` (LVGL
-default 10) so slow drags start scrolling instead of landing as taps.
+default 10) so slow drags start scrolling instead of landing as taps. Brand
+grid + list overflow cue: always-on 6 px scrollbar in its own gutter
+(`style_scroll_cont`) + a bottom-bar "more" button (`make_more_btn`: "v N
+more" scrolls a page, "^ Top" at the end, hidden when it all fits).
 
 ## Console LCD design rules (480x320, `console/firmware/src/ui/`)
 

@@ -453,12 +453,79 @@ static void show_pick() {
 // setting_id and moves on to the colour step.
 
 static constexpr uint32_t kTapAfterScrollMs = 300;
+
+// Overflow affordance for the brand grid + filament list: an always-on
+// 6 px vertical scrollbar in its own right-hand gutter, plus a small amber
+// "more" label on the right of the title row ("v N more" scrolls a page,
+// "^ Top" once at the end, hidden when everything fits). The thin
+// auto-hiding default bar sat on top of the buttons and rows lined up with
+// the edge, so nothing hinted at more.
+static void style_scroll_cont(lv_obj_t* c) {
+    lv_obj_set_scroll_dir(c, LV_DIR_VER);          // MODE_ON would draw a horizontal bar too
+    lv_obj_set_scrollbar_mode(c, LV_SCROLLBAR_MODE_ON);
+    lv_obj_set_style_width(c, 6, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(c, 3, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_color(c, COL_TEXT_MUTED, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(c, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_right(c, 2, LV_PART_SCROLLBAR);
+}
+
+static void update_more(lv_obj_t* cont, lv_obj_t* btn) {
+    if (!cont || !btn) return;
+    int32_t below = lv_obj_get_scroll_bottom(cont);
+    int32_t above = lv_obj_get_scroll_top(cont);
+    if (below <= 0 && above <= 0) { lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN); return; }
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_HIDDEN);
+    char buf[32];
+    if (below > 0) {
+        // Items not fully visible below the viewport.
+        lv_area_t pa; lv_obj_get_coords(cont, &pa);
+        int n = 0;
+        for (uint32_t i = 0; i < lv_obj_get_child_count(cont); ++i) {
+            lv_area_t ca; lv_obj_get_coords(lv_obj_get_child(cont, i), &ca);
+            if (ca.y2 > pa.y2) ++n;
+        }
+        snprintf(buf, sizeof(buf), LV_SYMBOL_DOWN "  %d more", n);
+    } else {
+        snprintf(buf, sizeof(buf), LV_SYMBOL_UP "  Top");
+    }
+    lv_label_set_text(btn, buf);
+}
+
+static void on_more_click(lv_event_t* e) {
+    lv_obj_t* cont = (lv_obj_t*)lv_event_get_user_data(e);
+    if (lv_obj_get_scroll_bottom(cont) > 0)
+        lv_obj_scroll_by_bounded(cont, 0, -(lv_obj_get_content_height(cont) - 24), LV_ANIM_ON);
+    else
+        lv_obj_scroll_to_y(cont, 0, LV_ANIM_ON);
+}
+
+static void on_more_scroll(lv_event_t* e) {
+    update_more((lv_obj_t*)lv_event_get_target(e), (lv_obj_t*)lv_event_get_user_data(e));
+}
+
+// Title-row "more" label, right-aligned. Clickable with an extended hit
+// area so the target is >= 44 px tall without taking layout space.
+static lv_obj_t* make_more_btn(lv_obj_t* scr, lv_obj_t* cont) {
+    lv_obj_t* b = make_label(scr, "", COL_BRAND, &spoolhard_mont_18);
+    lv_obj_set_width(b, 160);
+    lv_obj_set_style_text_align(b, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -16, 14);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(b, 14);
+    lv_obj_add_event_cb(b, on_more_click, LV_EVENT_CLICKED, cont);
+    lv_obj_add_event_cb(cont, on_more_scroll, LV_EVENT_SCROLL, b);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
+    return b;
+}
 static const char* kTypeNames[] = { "PLA", "PETG", "ABS", "TPU" };
 
 static lv_obj_t*               s_scr_ftype        = nullptr;
 static lv_obj_t*               s_scr_brand        = nullptr;
 static lv_obj_t*               s_brand_grid       = nullptr;
 static lv_obj_t*               s_brand_title      = nullptr;
+static lv_obj_t*               s_brand_more       = nullptr;
+static lv_obj_t*               s_filapick_more    = nullptr;
 static lv_obj_t*               s_scr_filapick     = nullptr;
 static lv_obj_t*               s_filapick_list    = nullptr;
 static lv_obj_t*               s_filapick_title   = nullptr;
@@ -556,10 +623,13 @@ static void build_brand() {
     lv_obj_set_style_bg_opa(s_brand_grid, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_brand_grid, 0, 0);
     lv_obj_set_style_pad_all(s_brand_grid, 0, 0);
+    lv_obj_set_style_pad_right(s_brand_grid, 14, 0);   // scrollbar gutter
     lv_obj_set_style_pad_row(s_brand_grid, 8, 0);
     lv_obj_set_style_pad_column(s_brand_grid, 8, 0);
     lv_obj_set_flex_flow(s_brand_grid, LV_FLEX_FLOW_ROW_WRAP);
+    style_scroll_cont(s_brand_grid);
     make_btn(s_scr_brand, "Back", false, OP_BACK, on_brand, 16, 236, 100);
+    s_brand_more = make_more_btn(s_scr_brand, s_brand_grid);
 }
 
 static void show_brand() {
@@ -597,7 +667,8 @@ static void show_brand() {
         t += "  " LV_SYMBOL_BULLET "  " + (s_filapick_filter == "*other" ? String("Other") : s_filapick_filter);
     lv_label_set_text(s_brand_title, t.c_str());
     auto add_btn = [&](const String& name, const String& label) {
-        lv_obj_t* b = make_btn(s_brand_grid, label.c_str(), false, OP_BRAND_ROW, on_brand, 0, 0, 220, 56);
+        // (448 - 14 gutter - 8 gap) / 2 = 213
+        lv_obj_t* b = make_btn(s_brand_grid, label.c_str(), false, OP_BRAND_ROW, on_brand, 0, 0, 213, 56);
         String* n = new String(name);
         s_brand_names.push_back(n);
         lv_obj_set_user_data(b, (void*)n->c_str());
@@ -606,6 +677,8 @@ static void show_brand() {
     for (const auto& b : brands)
         add_btn(b.first, (b.first.length() ? b.first : String("(no brand)")) + " (" + b.second + ")");
     lv_obj_scroll_to_y(s_brand_grid, 0, LV_ANIM_OFF);
+    lv_obj_update_layout(s_brand_grid);
+    update_more(s_brand_grid, s_brand_more);
     lv_screen_load(s_scr_brand);
     lv_unlock();
 }
@@ -677,7 +750,7 @@ static void build_filament_pick() {
 
     s_filapick_title = make_label(s_scr_filapick, "", COL_TEXT, &spoolhard_mont_22);
     lv_obj_set_pos(s_filapick_title, 16, 10);
-    lv_obj_set_width(s_filapick_title, 448);
+    lv_obj_set_width(s_filapick_title, 284);       // leaves room for the "more" label
     lv_label_set_long_mode(s_filapick_title, LV_LABEL_LONG_DOT);
 
     s_filapick_list = lv_list_create(s_scr_filapick);
@@ -689,9 +762,11 @@ static void build_filament_pick() {
     lv_obj_set_style_radius(s_filapick_list, 10, 0);
     lv_obj_add_event_cb(s_filapick_list, on_filapick_scroll, LV_EVENT_SCROLL_BEGIN, nullptr);
     lv_obj_add_event_cb(s_filapick_list, on_filapick_scroll, LV_EVENT_SCROLL_END, nullptr);
+    style_scroll_cont(s_filapick_list);
 
     make_btn(s_scr_filapick, "Back", false, OP_BACK, on_filament_pick, 16, 236, 100);
     s_filapick_next = make_btn(s_scr_filapick, "Next", true, OP_FILA_NEXT, on_filament_pick, 324, 236, 140);
+    s_filapick_more = make_more_btn(s_scr_filapick, s_filapick_list);
 }
 
 static void show_filament_pick() {
@@ -749,6 +824,8 @@ static void show_filament_pick() {
     filapick_highlight(sel_btn);
     if (sel_btn) lv_obj_scroll_to_view(sel_btn, LV_ANIM_OFF);
     else         lv_obj_scroll_to_y(s_filapick_list, 0, LV_ANIM_OFF);
+    lv_obj_update_layout(s_filapick_list);
+    update_more(s_filapick_list, s_filapick_more);
     lv_screen_load(s_scr_filapick);
     lv_unlock();
 }
