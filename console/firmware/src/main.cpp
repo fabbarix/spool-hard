@@ -563,12 +563,13 @@ void setup() {
     ui_set_scale_state(mapScaleState(g_scale.handshake(), g_scale.scaleName()),
                        g_scale.scaleName().c_str());
     g_scale.onWeight([](float grams, const char* state) {
-        // If the display is asleep, wake it so the user sees the reading.
-        // DON'T reset the idle timer if it's already on — the scale pushes
-        // unstable/stable transitions on its own cadence and was pinning
-        // the display on regardless of sleep_timeout_s. Touch still resets
-        // the timer the normal way for any real user interaction.
-        ConsoleDisplay::wakeIfAsleep();
+        // Only a freshly placed load wakes the screen. Every other weight
+        // frame is skipped: the 1 Hz GetCurrentWeight poll (any open
+        // dashboard tab) replies through here too, and waking on those
+        // turned the backlight back on within a second of every sleep.
+        // A load that stays on the scale keeps the screen on via
+        // _keepScreenAwake() in loop().
+        if (!strcmp(state, "new")) ConsoleDisplay::wakeIfAsleep();
         int precision = g_scale.scalePrecision();
         ui_set_weight(grams, state, precision);
         // Also drive the spool screen's live readout when it's the active
@@ -1173,6 +1174,24 @@ void setup() {
 // stored — the onboarding → home transition block in loop() below never
 // fires, so the footer labels would otherwise stay on their "—"
 // placeholders forever.
+// Screen-sleep exceptions, checked from the 1 Hz block: the idle timer is
+// held (and a sleeping screen woken) while any printer is printing or
+// paused, or a spool sits on the scale. Otherwise sleep_timeout_s applies.
+static constexpr float kScaleSpoolMinG = 50.f;  // above empty-platform drift
+static bool _keepScreenAwake() {
+    for (const auto& p : g_bambu.printers()) {
+        const auto& st = p->state();
+        if (st.link == BambuLinkState::Connected &&
+            (st.gcode_state == "RUNNING" || st.gcode_state == "PAUSE")) return true;
+    }
+    if (g_scale.isConnected()) {
+        const String& ws = g_scale.lastWeightState();
+        if ((ws == "new" || ws == "stable" || ws == "unstable") &&
+            g_scale.lastWeightG() >= kScaleSpoolMinG) return true;
+    }
+    return false;
+}
+
 // ── Change-detection helpers for the 1 Hz LCD refresh (loopTask only) ──
 // FNV-1a over the displayed values. Hashing happens on loopTask, which is
 // also the only writer of PrinterState (g_bambu.update()), so no cross-task
@@ -1635,6 +1654,7 @@ void loop() {
     static uint32_t _lastAmsRefresh = 0;
     if (millis() - _lastAmsRefresh > 1000) {
         _lastAmsRefresh = millis();
+        if (_keepScreenAwake()) ConsoleDisplay::wake();
         LAT_STEP(S_AMS_PANEL, "ams_panel", _refreshHomeAmsPanel());
         LAT_STEP(S_HOME_FOOT, "home_foot", _refreshHomeFooter());
         LAT_STEP(S_OTA_BANNER, "ota_banner", _refreshOtaBanner());

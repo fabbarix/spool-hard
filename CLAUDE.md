@@ -543,6 +543,13 @@ children don't shift; set a label's width BEFORE `lv_obj_align` on
 right/mid alignments. Debug: `GET /api/debug/lcd.bmp`, `POST
 /api/debug/lcd/touch` (see lcd_debug toggle).
 
+**Screen sleep**: backlight off after `sleep_timeout_s` (NVS, `/api/display-config`)
+without touch, EXCEPT while any connected printer is RUNNING/PAUSE or a load
+>= 50 g sits on the scale (`_keepScreenAwake()` in main.cpp, checked in the
+1 Hz block; also wakes a sleeping screen). Weight frames wake the screen only
+on `NewLoad`: the 1 Hz `GetCurrentWeight` poll (runs while any dashboard tab
+is open) must never call wake, or the screen never stays off.
+
 ## Console loop instrumentation (`[LoopStat]`)
 
 `console/firmware/src/loop_stat.{h,cpp}` times the WHOLE `loop()` (body +
