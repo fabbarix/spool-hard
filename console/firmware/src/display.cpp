@@ -403,6 +403,9 @@ void ConsoleDisplay::begin() {
     s_indev = lv_indev_create();
     lv_indev_set_type(s_indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(s_indev, touch_cb);
+    // Start scrolling after 6 px instead of LVGL's 10: on the resistive
+    // panel a slow drag used to stay under the limit and land as a tap.
+    lv_indev_set_scroll_limit(s_indev, 6);
 
     s_last_interaction_ms = millis();
     xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8192, nullptr, 1, nullptr, 1);

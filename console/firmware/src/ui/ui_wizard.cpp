@@ -10,6 +10,8 @@
 #include "fonts/spoolhard_fonts.h"
 #include <Arduino.h>
 #include <lvgl.h>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include "spoolhard/serial_mirror.h"
@@ -69,6 +71,7 @@ struct WizardCtx {
     String     final_color_name;
     String     final_color_hex;
     String     final_setting_id;          // Filament preset ref (PFUL/PFUS), "" = none
+    bool       via_color        = false;  // color step shown after filament pick (Back target)
     int        final_advertised = -1;
     int        final_core       = -1;
     int        final_current    = -1;
@@ -97,6 +100,7 @@ static lv_obj_t* s_pick_list         = nullptr;
 static lv_obj_t* s_full_quicks       = nullptr;
 static lv_obj_t* s_usedlist_list     = nullptr;
 static lv_obj_t* s_done_summary      = nullptr;
+static lv_obj_t* s_done_color        = nullptr;   // colour chip button
 
 // Retained button pointers we need to toggle enabled/disabled (capture
 // buttons are only live when we have a stable weight).
@@ -186,7 +190,9 @@ static void close_wizard(const String& saved_id = String()) {
 static void show_prompt();
 static void show_template();
 static void show_pick();
+static void show_filament_type();
 static void show_filament_pick();
+static void show_color(bool from_done);
 static void show_state();
 static void show_full();
 static void show_used();
@@ -207,6 +213,7 @@ enum Op {
     OP_PICK_ROW=20, OP_BACK=21,
     OP_FILA_ROW=22,
     OP_CHIP_ALL=30, OP_CHIP_PLA=31, OP_CHIP_PETG=32, OP_CHIP_ABS=33, OP_CHIP_TPU=34,
+    OP_CHIP_OTHER=35, OP_BRAND_ROW=36, OP_FILA_NEXT=37,
     OP_STATE_FULL=40, OP_STATE_USED=41, OP_STATE_EMPTY=42,
     OP_FULL_QUICK0=50, OP_FULL_QUICK1=51, OP_FULL_QUICK2=52,
     OP_FULL_QUICK3=53, OP_FULL_QUICK4=54, OP_FULL_QUICK5=55,
@@ -214,7 +221,9 @@ enum Op {
     OP_USED_PICKDB=60, OP_USED_MEASURE=61,
     OP_USED_ROW=62, OP_USED_TEMPLATE=63,
     OP_EMPTY_CAPTURE=70,
-    OP_DONE_SAVE=80, OP_DONE_CANCEL=81,
+    OP_DONE_SAVE=80, OP_DONE_CANCEL=81, OP_DONE_COLOR=82,
+    OP_COLOR_SW0=90,              // 90..(90+kColorCount-1): swatches
+    OP_COLOR_SKIP=120,
 };
 
 // Utility to get the op from an lv_event user_data pointer.
@@ -293,7 +302,7 @@ static void on_template(lv_event_t* e) {
             s_wiz.final_color_hex = s_wiz.hint_color_hex.length()
                                     ? s_wiz.hint_color_hex
                                     : String("cccccc");
-            show_filament_pick();
+            show_filament_type();
             return;
         case OP_DUPLICATE:
             s_wiz.use_template = true;
@@ -430,58 +439,234 @@ static void show_pick() {
     lv_unlock();
 }
 
-// ── Step 3b: filament picker (New Filament branch) ─────────
+// ── Step 3a: filament picker (New Filament branch) ─────────
 //
-// Lists user-managed filament presets (g_user_filaments). Same
-// material-chip filter + scrollable list shape as the spool template
-// picker so the UX stays consistent. Stock filaments are deferred
-// until the build pipeline emits a JSONL sidecar the firmware can
-// read (filaments.db is SQLite which we don't have a client for).
-// On selection the wizard seeds material/brand/subtype + setting_id
-// from the chosen filament and falls through to the existing weight-
-// capture flow — no new state-machine nodes downstream.
+// Three screens: Type -> Brand -> list. Rows come from the user filament
+// store (badged with a pencil) then the stock library. Type "Other" is
+// every filament_type outside the four named ones. The Brand step is
+// skipped when the chosen type has at most one brand.
+//
+// Scroll-tap safety: a row tap only highlights; the fixed Next button
+// commits. Taps landing while the list scrolls or within
+// kTapAfterScrollMs of a scroll ending (the tap that stops a fling) are
+// ignored. On selection the wizard seeds material/brand/subtype +
+// setting_id and moves on to the colour step.
 
+static constexpr uint32_t kTapAfterScrollMs = 300;
+static const char* kTypeNames[] = { "PLA", "PETG", "ABS", "TPU" };
+
+static lv_obj_t*               s_scr_ftype        = nullptr;
+static lv_obj_t*               s_scr_brand        = nullptr;
+static lv_obj_t*               s_brand_grid       = nullptr;
+static lv_obj_t*               s_brand_title      = nullptr;
 static lv_obj_t*               s_scr_filapick     = nullptr;
 static lv_obj_t*               s_filapick_list    = nullptr;
-static String                  s_filapick_filter  = "";
-// Owned heap-Strings for setting_ids attached as user_data on the row
-// buttons. Cleared on every show_filament_pick() to avoid leaks across
-// successive opens.
+static lv_obj_t*               s_filapick_title   = nullptr;
+static lv_obj_t*               s_filapick_next    = nullptr;
+static String                  s_filapick_filter  = "";   // "", PLA.., "*other"
+static String                  s_filapick_brand   = "";   // "" = all brands
+static bool                    s_brand_skipped    = false;
+static String                  s_filapick_sel;            // highlighted setting_id
+static lv_obj_t*               s_filapick_sel_btn = nullptr;
+static bool                    s_filapick_scrolling = false;
+static uint32_t                s_filapick_scroll_end_ms = 0;
+// Owned heap-Strings for setting_ids / brand names attached as user_data
+// on dynamic buttons. Freed on every rebuild of their container.
 static std::vector<String*>    s_filapick_row_ids;
+static std::vector<String*>    s_brand_names;
+
+static void show_filament_type();
+static void show_brand();
+
+static bool type_matches(const FilamentRecord& r) {
+    if (s_filapick_filter.isEmpty()) return true;
+    if (s_filapick_filter != "*other") return r.filament_type == s_filapick_filter;
+    for (const char* t : kTypeNames) if (r.filament_type == t) return false;
+    return true;
+}
+
+// User rows first (more relevant), then stock; type-filtered only.
+static void collect_filaments(std::vector<FilamentRecord>& user,
+                              std::vector<FilamentRecord>& stock) {
+    String f = (s_filapick_filter == "*other") ? String("") : s_filapick_filter;
+    user  = g_user_filaments.list(0, 200, f);
+    stock = g_stock_filaments.list(0, 200, f);
+    auto drop = [](std::vector<FilamentRecord>& v) {
+        v.erase(std::remove_if(v.begin(), v.end(),
+                [](const FilamentRecord& r) { return !type_matches(r); }), v.end());
+    };
+    drop(user); drop(stock);
+}
+
+// ── Type ──
+
+static void on_ftype(lv_event_t* e) {
+    int op = event_op(e);
+    if (op == OP_BACK) { show_template(); return; }
+    if (op == OP_CHIP_ALL)        s_filapick_filter = "";
+    else if (op == OP_CHIP_OTHER) s_filapick_filter = "*other";
+    else if (op >= OP_CHIP_PLA && op <= OP_CHIP_TPU) s_filapick_filter = kTypeNames[op - OP_CHIP_PLA];
+    else return;
+    show_brand();
+}
+
+static void build_filament_type() {
+    s_scr_ftype = lv_obj_create(nullptr);
+    style_screen(s_scr_ftype);
+    lv_obj_t* title = make_label(s_scr_ftype, "Filament type", COL_TEXT, &spoolhard_mont_22);
+    lv_obj_set_pos(title, 16, 10);
+    const char* labels[] = { "PLA", "PETG", "ABS", "TPU", "Other", "All" };
+    int ops[] = { OP_CHIP_PLA, OP_CHIP_PETG, OP_CHIP_ABS, OP_CHIP_TPU, OP_CHIP_OTHER, OP_CHIP_ALL };
+    // 3 x 2 grid of 144x80 buttons (>= 64 px targets).
+    for (int i = 0; i < 6; ++i)
+        make_btn(s_scr_ftype, labels[i], false, ops[i], on_ftype,
+                 16 + (i % 3) * 152, 50 + (i / 3) * 90, 144, 80);
+    make_btn(s_scr_ftype, "Back", false, OP_BACK, on_ftype, 16, 236, 100);
+}
+
+static void show_filament_type() {
+    lv_lock();
+    if (!s_scr_ftype) build_filament_type();
+    lv_screen_load(s_scr_ftype);
+    lv_unlock();
+}
+
+// ── Brand ──
+
+static void on_brand(lv_event_t* e) {
+    int op = event_op(e);
+    if (op == OP_BACK) { show_filament_type(); return; }
+    if (op == OP_BRAND_ROW) {
+        const char* b = (const char*)lv_obj_get_user_data(lv_event_get_target_obj(e));
+        s_filapick_brand = b ? b : "";
+        s_filapick_sel = "";
+        show_filament_pick();
+    }
+}
+
+static void build_brand() {
+    s_scr_brand = lv_obj_create(nullptr);
+    style_screen(s_scr_brand);
+    s_brand_title = make_label(s_scr_brand, "", COL_TEXT, &spoolhard_mont_22);
+    lv_obj_set_pos(s_brand_title, 16, 10);
+    // Scrollable 2-column grid; only scrolls past 6 brands.
+    s_brand_grid = lv_obj_create(s_scr_brand);
+    lv_obj_set_pos(s_brand_grid, 16, 46);
+    lv_obj_set_size(s_brand_grid, 448, 184);   // 3 rows x 56 + 2 x 8 gaps
+    lv_obj_set_style_bg_opa(s_brand_grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_brand_grid, 0, 0);
+    lv_obj_set_style_pad_all(s_brand_grid, 0, 0);
+    lv_obj_set_style_pad_row(s_brand_grid, 8, 0);
+    lv_obj_set_style_pad_column(s_brand_grid, 8, 0);
+    lv_obj_set_flex_flow(s_brand_grid, LV_FLEX_FLOW_ROW_WRAP);
+    make_btn(s_scr_brand, "Back", false, OP_BACK, on_brand, 16, 236, 100);
+}
+
+static void show_brand() {
+    std::vector<FilamentRecord> user, stock;
+    collect_filaments(user, stock);
+    // Brand -> count, most filaments first (stable: ties keep first-seen).
+    std::vector<std::pair<String, int>> brands;
+    auto add = [&](const FilamentRecord& r) {
+        for (auto& b : brands) if (b.first == r.filament_vendor) { ++b.second; return; }
+        brands.push_back({ r.filament_vendor, 1 });
+    };
+    for (const auto& r : user)  add(r);
+    for (const auto& r : stock) add(r);
+    std::stable_sort(brands.begin(), brands.end(),
+                     [](const std::pair<String, int>& a, const std::pair<String, int>& b) {
+                         return a.second > b.second;
+                     });
+
+    s_filapick_sel = "";
+    if (brands.size() <= 1) {
+        s_brand_skipped  = true;
+        s_filapick_brand = "";
+        show_filament_pick();
+        return;
+    }
+    s_brand_skipped = false;
+
+    lv_lock();
+    if (!s_scr_brand) build_brand();
+    for (auto* s : s_brand_names) delete s;
+    s_brand_names.clear();
+    lv_obj_clean(s_brand_grid);
+    String t = "Brand";
+    if (s_filapick_filter.length())
+        t += "  " LV_SYMBOL_BULLET "  " + (s_filapick_filter == "*other" ? String("Other") : s_filapick_filter);
+    lv_label_set_text(s_brand_title, t.c_str());
+    auto add_btn = [&](const String& name, const String& label) {
+        lv_obj_t* b = make_btn(s_brand_grid, label.c_str(), false, OP_BRAND_ROW, on_brand, 0, 0, 220, 56);
+        String* n = new String(name);
+        s_brand_names.push_back(n);
+        lv_obj_set_user_data(b, (void*)n->c_str());
+    };
+    add_btn("", "All brands");
+    for (const auto& b : brands)
+        add_btn(b.first, (b.first.length() ? b.first : String("(no brand)")) + " (" + b.second + ")");
+    lv_obj_scroll_to_y(s_brand_grid, 0, LV_ANIM_OFF);
+    lv_screen_load(s_scr_brand);
+    lv_unlock();
+}
+
+// ── List ──
 
 static void clear_filapick_rows() {
     for (auto* s : s_filapick_row_ids) delete s;
     s_filapick_row_ids.clear();
+    s_filapick_sel_btn = nullptr;
     if (s_filapick_list) lv_obj_clean(s_filapick_list);
+}
+
+static void filapick_highlight(lv_obj_t* btn) {
+    if (s_filapick_sel_btn) lv_obj_remove_state(s_filapick_sel_btn, LV_STATE_CHECKED);
+    s_filapick_sel_btn = btn;
+    if (btn) lv_obj_add_state(btn, LV_STATE_CHECKED);
+    set_btn_enabled(s_filapick_next, btn != nullptr);
+}
+
+static void on_filapick_scroll(lv_event_t* e) {
+    if (lv_event_get_code(e) == LV_EVENT_SCROLL_BEGIN) {
+        s_filapick_scrolling = true;
+    } else {
+        s_filapick_scrolling = false;
+        s_filapick_scroll_end_ms = millis();
+    }
 }
 
 static void on_filament_pick(lv_event_t* e) {
     int op = event_op(e);
-    if (op == OP_BACK)       { show_template(); return; }
-    if (op == OP_CHIP_ALL)   { s_filapick_filter = "";     show_filament_pick(); return; }
-    if (op == OP_CHIP_PLA)   { s_filapick_filter = "PLA";  show_filament_pick(); return; }
-    if (op == OP_CHIP_PETG)  { s_filapick_filter = "PETG"; show_filament_pick(); return; }
-    if (op == OP_CHIP_ABS)   { s_filapick_filter = "ABS";  show_filament_pick(); return; }
-    if (op == OP_CHIP_TPU)   { s_filapick_filter = "TPU";  show_filament_pick(); return; }
+    if (op == OP_BACK) {
+        if (s_brand_skipped) show_filament_type(); else show_brand();
+        return;
+    }
     if (op == OP_FILA_ROW) {
+        if (s_filapick_scrolling ||
+            millis() - s_filapick_scroll_end_ms < kTapAfterScrollMs) return;
         lv_obj_t* t = lv_event_get_target_obj(e);
         const char* sid = (const char*)lv_obj_get_user_data(t);
         if (!sid) return;
+        s_filapick_sel = sid;
+        filapick_highlight(t);
+        return;
+    }
+    if (op == OP_FILA_NEXT) {
+        if (s_filapick_sel.isEmpty()) return;
         FilamentRecord rec;
         // User store first — locally-edited presets win over their
         // stock parents if the same id ever appears in both.
-        bool found = g_user_filaments.findById(String(sid), rec) ||
-                     g_stock_filaments.findById(String(sid), rec);
+        bool found = g_user_filaments.findById(s_filapick_sel, rec) ||
+                     g_stock_filaments.findById(s_filapick_sel, rec);
         if (found) {
             s_wiz.final_setting_id  = rec.setting_id;
             if (rec.filament_type.length())   s_wiz.final_material = rec.filament_type;
             if (rec.filament_subtype.length())s_wiz.final_subtype  = rec.filament_subtype;
             if (rec.filament_vendor.length()) s_wiz.final_brand    = rec.filament_vendor;
-            // Color stays the wizard's default (light grey from the
-            // OP_NEW_FILAMENT branch above) — filaments don't carry a
-            // single canonical colour, the user picks per-spool later.
+            // Filaments don't carry a single canonical colour, so the
+            // colour step comes next (Skip keeps the tag hint / grey).
         }
-        show_state();
+        show_color(false);
         return;
     }
 }
@@ -490,61 +675,64 @@ static void build_filament_pick() {
     s_scr_filapick = lv_obj_create(nullptr);
     style_screen(s_scr_filapick);
 
-    lv_obj_t* title = make_label(s_scr_filapick, "Pick a filament", COL_TEXT, &spoolhard_mont_22);
-    lv_obj_set_pos(title, 16, 10);
-
-    // Same chip set as the spool picker for muscle-memory consistency.
-    const char* chip_labels[] = { "All", "PLA", "PETG", "ABS", "TPU" };
-    int chip_ops[]            = { OP_CHIP_ALL, OP_CHIP_PLA, OP_CHIP_PETG, OP_CHIP_ABS, OP_CHIP_TPU };
-    int cx = 16;
-    for (int i = 0; i < 5; ++i) {
-        make_btn(s_scr_filapick, chip_labels[i], false,
-                 chip_ops[i], on_filament_pick, cx, 42, 72, 44);
-        cx += 80;
-    }
+    s_filapick_title = make_label(s_scr_filapick, "", COL_TEXT, &spoolhard_mont_22);
+    lv_obj_set_pos(s_filapick_title, 16, 10);
+    lv_obj_set_width(s_filapick_title, 448);
+    lv_label_set_long_mode(s_filapick_title, LV_LABEL_LONG_DOT);
 
     s_filapick_list = lv_list_create(s_scr_filapick);
-    lv_obj_set_pos(s_filapick_list, 16, 92);
-    lv_obj_set_size(s_filapick_list, 448, 136);
+    lv_obj_set_pos(s_filapick_list, 16, 46);
+    lv_obj_set_size(s_filapick_list, 448, 182);
     lv_obj_set_style_bg_color(s_filapick_list, COL_CARD, 0);
     lv_obj_set_style_border_color(s_filapick_list, COL_BORDER, 0);
     lv_obj_set_style_border_width(s_filapick_list, 1, 0);
     lv_obj_set_style_radius(s_filapick_list, 10, 0);
+    lv_obj_add_event_cb(s_filapick_list, on_filapick_scroll, LV_EVENT_SCROLL_BEGIN, nullptr);
+    lv_obj_add_event_cb(s_filapick_list, on_filapick_scroll, LV_EVENT_SCROLL_END, nullptr);
 
     make_btn(s_scr_filapick, "Back", false, OP_BACK, on_filament_pick, 16, 236, 100);
+    s_filapick_next = make_btn(s_scr_filapick, "Next", true, OP_FILA_NEXT, on_filament_pick, 324, 236, 140);
 }
 
 static void show_filament_pick() {
+    std::vector<FilamentRecord> user_rows, stock_rows;
+    collect_filaments(user_rows, stock_rows);
     lv_lock();
     if (!s_scr_filapick) build_filament_pick();
     clear_filapick_rows();
+    s_filapick_scrolling = false;
 
-    // Merge user filaments + stock filaments. User entries are typically
-    // more relevant (the user took the time to create them), so they
-    // come first; stock follows.
-    auto user_rows  = g_user_filaments.list(0, 200, s_filapick_filter);
-    auto stock_rows = g_stock_filaments.list(0, 200, s_filapick_filter);
+    String t = s_filapick_brand.length() ? s_filapick_brand : String("All brands");
+    if (s_filapick_filter.length())
+        t += "  " LV_SYMBOL_BULLET "  " + (s_filapick_filter == "*other" ? String("Other") : s_filapick_filter);
+    lv_label_set_text(s_filapick_title, t.c_str());
 
+    lv_obj_t* sel_btn = nullptr;
     auto append_row = [&](const FilamentRecord& rec, const char* badge) {
+        if (s_filapick_brand.length() && rec.filament_vendor != s_filapick_brand) return;
         String line = rec.name.length() ? rec.name : String("(unnamed)");
-        if (badge && *badge) {
-            line = String(badge) + "  " + line;
-        }
-        if (rec.filament_type.length())   line += "  " LV_SYMBOL_BULLET "  " + rec.filament_type;
-        if (rec.filament_vendor.length()) line += "  " LV_SYMBOL_BULLET "  " + rec.filament_vendor;
-        lv_obj_t* btn = lv_list_add_btn(s_filapick_list, LV_SYMBOL_RIGHT, line.c_str());
+        if (badge && *badge) line = String(badge) + "  " + line;
+        if (s_filapick_filter.isEmpty() || s_filapick_filter == "*other")
+            if (rec.filament_type.length()) line += "  " LV_SYMBOL_BULLET "  " + rec.filament_type;
+        if (s_filapick_brand.isEmpty() && rec.filament_vendor.length())
+            line += "  " LV_SYMBOL_BULLET "  " + rec.filament_vendor;
+        lv_obj_t* btn = lv_list_add_btn(s_filapick_list, nullptr, line.c_str());
+        lv_obj_set_style_min_height(btn, 48, 0);
+        // Highlighted row: amber fill, dark text.
+        lv_obj_set_style_bg_color(btn, COL_BRAND, LV_STATE_CHECKED);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(btn, COL_BODY, LV_STATE_CHECKED);
         String* idCopy = new String(rec.setting_id);
         s_filapick_row_ids.push_back(idCopy);
         lv_obj_set_user_data(btn, (void*)idCopy->c_str());
         lv_obj_add_event_cb(btn, on_filament_pick, LV_EVENT_CLICKED,
                             (void*)(intptr_t)OP_FILA_ROW);
+        if (s_filapick_sel.length() && rec.setting_id == s_filapick_sel) sel_btn = btn;
     };
 
     if (user_rows.empty() && stock_rows.empty()) {
         // True empty state — no stock library uploaded AND no user
-        // filaments created. The "upload via web UI" hint covers both
-        // failure modes since users typically hit either when first
-        // setting up the device.
+        // filaments created (or none of this type).
         lv_obj_t* empty = make_label(s_filapick_list,
             "No filaments available.\n\n"
             "Upload the stock filament library or create a custom one\n"
@@ -556,7 +744,111 @@ static void show_filament_pick() {
         for (const auto& rec : user_rows)  append_row(rec, LV_SYMBOL_EDIT);    // pencil
         for (const auto& rec : stock_rows) append_row(rec, "");
     }
+    // Coming back (from colour) keeps the previous pick highlighted.
+    if (!sel_btn) s_filapick_sel = "";
+    filapick_highlight(sel_btn);
+    if (sel_btn) lv_obj_scroll_to_view(sel_btn, LV_ANIM_OFF);
+    else         lv_obj_scroll_to_y(s_filapick_list, 0, LV_ANIM_OFF);
     lv_screen_load(s_scr_filapick);
+    lv_unlock();
+}
+
+// ── Step 3b: spool colour (swatch grid) ────────────────────
+//
+// Fixed palette of common filament colours, 3 x 5 swatches. One tap sets
+// colour hex + name. Shown after the filament pick (New filament path) and
+// from the Done screen's colour chip (both paths); Duplicate already copied
+// the source spool's colour so it skips the step.
+
+struct ColorSwatch { const char* name; const char* hex; };
+static const ColorSwatch kColors[] = {
+    { "White",      "FFFFFF" }, { "Black",  "000000" }, { "Gray",   "8E9089" },
+    { "Silver",     "A6A9AA" }, { "Beige",  "F7E6DE" },
+    { "Red",        "C12E1F" }, { "Orange", "FF6A13" }, { "Yellow", "F4EE2A" },
+    { "Green",      "00AE42" }, { "Dark Green", "1F5E3A" },
+    { "Blue",       "0A2989" }, { "Light Blue", "56B7E6" }, { "Purple", "5E43B7" },
+    { "Pink",       "F55A74" }, { "Brown",  "7D5236" },
+};
+static constexpr int kColorCount = sizeof(kColors) / sizeof(kColors[0]);
+
+static lv_obj_t* s_scr_color = nullptr;
+static lv_obj_t* s_color_sw[kColorCount] = {};
+static lv_obj_t* s_color_skip = nullptr;
+static bool      s_color_from_done = false;
+
+// Black or white text, whichever has the higher WCAG contrast on the
+// swatch. Black wins when relative luminance > ~0.179 (a plain luma
+// cutoff put white on orange/green/pink at ~3:1).
+static float srgb_lin(uint32_t c8) {
+    float c = c8 / 255.f;
+    return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+static lv_color_t text_on(uint32_t rgb) {
+    float L = 0.2126f * srgb_lin((rgb >> 16) & 0xff) +
+              0.7152f * srgb_lin((rgb >> 8) & 0xff) +
+              0.0722f * srgb_lin(rgb & 0xff);
+    return (L + 0.05f) / 0.05f >= 1.05f / (L + 0.05f) ? lv_color_hex(0x000000)
+                                                      : lv_color_hex(0xffffff);
+}
+
+static void on_color(lv_event_t* e) {
+    int op = event_op(e);
+    if (op >= OP_COLOR_SW0 && op < OP_COLOR_SW0 + kColorCount) {
+        const ColorSwatch& c = kColors[op - OP_COLOR_SW0];
+        s_wiz.final_color_name = c.name;
+        s_wiz.final_color_hex  = c.hex;
+    } else if (op == OP_BACK && !s_color_from_done) {
+        show_filament_pick();
+        return;
+    }
+    // Swatch, Skip, or Back from the Done chip.
+    if (s_color_from_done) show_done();
+    else                   show_state();
+}
+
+static void build_color() {
+    s_scr_color = lv_obj_create(nullptr);
+    style_screen(s_scr_color);
+
+    lv_obj_t* title = make_label(s_scr_color, "Spool color", COL_TEXT, &spoolhard_mont_22);
+    lv_obj_set_pos(title, 16, 10);
+
+    // 5 x 84 px + 4 x 7 px gaps = 448; rows 52 px tall (>= 44 px targets).
+    for (int i = 0; i < kColorCount; ++i) {
+        int col = i % 5, row = i / 5;
+        lv_obj_t* b = make_btn(s_scr_color, kColors[i].name, false, OP_COLOR_SW0 + i,
+                               on_color, 16 + col * 91, 46 + row * 60, 84, 52);
+        uint32_t rgb = strtoul(kColors[i].hex, nullptr, 16);
+        lv_obj_set_style_bg_color(b, lv_color_hex(rgb), 0);
+        // Constant 3 px border; only its colour marks the selection.
+        lv_obj_set_style_border_width(b, 3, 0);
+        lv_obj_set_style_border_color(b, COL_BORDER, 0);
+        lv_obj_set_style_pad_all(b, 0, 0);
+        lv_obj_t* l = lv_obj_get_child(b, 0);
+        lv_obj_set_style_text_color(l, text_on(rgb), 0);
+        lv_obj_set_width(l, 76);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(l);
+        s_color_sw[i] = b;
+    }
+
+    make_btn(s_scr_color, "Back", false, OP_BACK, on_color, 16, 236, 100);
+    s_color_skip = make_btn(s_scr_color, "Skip", false, OP_COLOR_SKIP, on_color, 364, 236, 100);
+}
+
+static void show_color(bool from_done) {
+    s_color_from_done = from_done;
+    if (!from_done) s_wiz.via_color = true;
+    lv_lock();
+    for (int i = 0; i < kColorCount; ++i) {
+        bool sel = s_wiz.final_color_hex.equalsIgnoreCase(kColors[i].hex);
+        lv_obj_set_style_border_color(s_color_sw[i], sel ? COL_BRAND : COL_BORDER, 0);
+    }
+    // From Done, Back already means "keep the current colour".
+    if (from_done) lv_obj_add_flag(s_color_skip, LV_OBJ_FLAG_HIDDEN);
+    else           lv_obj_clear_flag(s_color_skip, LV_OBJ_FLAG_HIDDEN);
+    lv_screen_load(s_scr_color);
     lv_unlock();
 }
 
@@ -568,8 +860,9 @@ static void on_state(lv_event_t* e) {
         case OP_STATE_USED:  s_wiz.spool_state = SS_USED;  show_used();  return;
         case OP_STATE_EMPTY: s_wiz.spool_state = SS_EMPTY; show_empty(); return;
         case OP_BACK:
-            if (s_wiz.use_template) show_pick();
-            else                    show_template();
+            if (s_wiz.use_template)   show_pick();
+            else if (s_wiz.via_color) show_color(false);
+            else                      show_template();
             return;
     }
 }
@@ -920,6 +1213,9 @@ static void on_done(lv_event_t* e) {
             Serial.println("[Wiz] cancelled on summary");
             close_wizard();
             return;
+        case OP_DONE_COLOR:
+            show_color(true);
+            return;
         case OP_DONE_SAVE: {
             SpoolRecord rec;
             // id / tag_id always come from the newly-scanned tag.
@@ -963,6 +1259,9 @@ static void build_done() {
 
     make_btn(s_scr_done, "Save",   true,  OP_DONE_SAVE,   on_done, 16,  236, 200);
     make_btn(s_scr_done, "Cancel", false, OP_DONE_CANCEL, on_done, 240, 236, 100);
+    // Colour chip: filled with the spool colour, tap to change.
+    s_done_color = make_btn(s_scr_done, "Color", false, OP_DONE_COLOR, on_done, 352, 236, 112);
+    lv_obj_set_style_border_width(s_done_color, 3, 0);
 }
 
 static void show_done() {
@@ -982,6 +1281,13 @@ static void show_done() {
         s_wiz.final_current    >= 0 ? (String(s_wiz.final_current)   + " g").c_str() : "—");
     lv_lock();
     lv_label_set_text(s_done_summary, buf);
+    uint32_t rgb = s_wiz.final_color_hex.length() == 6
+                   ? strtoul(s_wiz.final_color_hex.c_str(), nullptr, 16) : 0xcccccc;
+    lv_obj_set_style_bg_color(s_done_color, lv_color_hex(rgb), 0);
+    lv_obj_t* cl = lv_obj_get_child(s_done_color, 0);
+    lv_label_set_text(cl, s_wiz.final_color_name.length() ? s_wiz.final_color_name.c_str()
+                                                          : "Color");
+    lv_obj_set_style_text_color(cl, text_on(rgb), 0);
     lv_screen_load(s_scr_done);
     lv_unlock();
 }
@@ -1009,6 +1315,7 @@ static void build_all_once() {
     build_used();
     build_usedlist();
     build_empty();
+    build_color();
     build_done();
     lv_unlock();
 }
@@ -1024,7 +1331,8 @@ static bool wizard_screen_showing() {
     return a && (a == s_scr_prompt   || a == s_scr_template || a == s_scr_pick  ||
                  a == s_scr_filapick || a == s_scr_state    || a == s_scr_full  ||
                  a == s_scr_used     || a == s_scr_empty    || a == s_scr_usedlist ||
-                 a == s_scr_done);
+                 a == s_scr_done     || a == s_scr_color    ||
+                 a == s_scr_ftype    || a == s_scr_brand);
 }
 
 bool ui_wizard_start(const SpoolTag& tag) {

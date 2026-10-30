@@ -521,6 +521,21 @@ function behind `POST /api/printers/<serial>/claim-pending`; the MQTT publish
 still happens on loopTask via `_maybeAssignPendingSpool`. LVGL callbacks run
 on the `lvgl` task, so they must only validate/queue, never publish or block.
 
+**New-tag wizard colour step** (`ui_wizard.cpp`, `kColors`): fixed 15-swatch
+palette (3 x 5, 84x52 px, name inside, black/white text by higher WCAG contrast), sets
+`color_name` + `color_code` (uppercase RRGGBB). Shown after the filament pick
+on the New-filament path (Skip keeps the tag hint / grey `cccccc`); Duplicate
+skips it. The Done screen's colour chip (filled with the current colour)
+reopens it on both paths and returns to Done.
+
+**New-tag wizard filament picker**: Type (PLA/PETG/ABS/TPU/Other/All; Other =
+any filament_type outside those four) -> Brand (2-col grid with counts, built
+from the type's rows; skipped when <= 1 brand) -> list. A row tap only
+highlights it (LV_STATE_CHECKED, amber); the Next button commits. Row taps
+while the list scrolls or < 300 ms after a scroll ends (the tap that stops a
+fling) are ignored. The touch indev uses `lv_indev_set_scroll_limit(6)` (LVGL
+default 10) so slow drags start scrolling instead of landing as taps.
+
 ## Console LCD design rules (480x320, `console/firmware/src/ui/`)
 
 Printer-first home: header (LED + printer name 22pt + big 36pt percent),
