@@ -541,6 +541,17 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   printer/nozzle (or no variants) target the current printer (`model_code` +
   `nozzle_diameters[0]`, connected printers first); none -> rejected with a
   "no printer" stage. Print temp without a variant value = range midpoint.
+- Parent presets: the web form's "Base on a filament" picker offers stock AND
+  the user's own presets (`findLocalParent` in `useUserFilaments.ts`; the
+  record being edited is excluded). Picking a parent does NOT copy its
+  filament_id. At push time the handler fills the pushed copy's unset temps /
+  density / type / subtype / vendor / variants from the `parent_setting_id`
+  chain (user store, then stock; max 4 levels; the stored record keeps
+  inheriting), and replaces a filament_id that is empty or equal to the
+  direct parent's (older picks copied it) with a fresh `P` id.
+- New variants start with an empty extruder list (= the per-printer list at
+  push); per-extruder max-volumetric-speed / PA values <= 0 fall back to the
+  material default.
 - `modelFromSerial`: `093` = H2S (real H2S serial 0938..., SSDP model O1S).
 
 ## Console LCD: scan -> choose destination

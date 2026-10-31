@@ -7,6 +7,8 @@ import {
   useCloudFilamentByName, useCloudFilamentById,
   cloudBodyToFilamentEntry,
   resolveUserFilament,
+  useUserFilaments,
+  findLocalParent,
   type UserFilament,
   type UserFilamentVariant,
 } from '../../hooks/useUserFilaments';
@@ -52,11 +54,11 @@ export function UserFilamentForm({
   const set = <K extends keyof UserFilament>(k: K, v: UserFilament[K] | undefined) =>
     setForm((f) => ({ ...f, [k]: v }));
 
-  const stockParent: FilamentEntry | null = useMemo(() => {
-    const id = form.parent_setting_id;
-    if (!id || !stockDb.data?.entries) return null;
-    return stockDb.data.entries.find((e) => e.setting_id === id) ?? null;
-  }, [form.parent_setting_id, stockDb.data]);
+  const userQ = useUserFilaments();
+  const stockParent: FilamentEntry | null = useMemo(
+    () => findLocalParent(form.parent_setting_id, stockDb.data?.entries, userQ.data?.rows),
+    [form.parent_setting_id, stockDb.data, userQ.data],
+  );
 
   const cloudInherits = form.cloud_inherits ?? '';
   const cloudByName = useCloudFilamentByName(
@@ -86,7 +88,9 @@ export function UserFilamentForm({
       filament_type:     e.material       || f.filament_type,
       filament_subtype:  e.subtype        || f.filament_subtype,
       filament_vendor:   e.brand          || f.filament_vendor,
-      filament_id:       e.filament_id    || f.filament_id,
+      // filament_id is deliberately NOT copied: it is the AMS
+      // tray_info_idx, so sharing the parent's would make the printer and
+      // Studio show the parent. The cloud push assigns a fresh P-id.
     }));
   };
 
@@ -123,9 +127,11 @@ export function UserFilamentForm({
     nozzle_diameter:  0.4,
     nozzle_temp_print:         resolved.nozzle_temp_max > 0 ? resolved.nozzle_temp_max : undefined,
     nozzle_temp_initial_layer: resolved.nozzle_temp_min > 0 ? resolved.nozzle_temp_min : undefined,
-    extruder_variants:    ['Direct Drive Standard'],
-    max_volumetric_speed: [0],
-    pressure_advance:     [0],
+    // Empty = the cloud push uses the printer's own extruder list
+    // (e.g. Standard + High Flow on the H2S).
+    extruder_variants:    [],
+    max_volumetric_speed: [],
+    pressure_advance:     [],
   }]);
   const delVariant = (idx: number) => set('variants', variants.filter((_, i) => i !== idx));
 
@@ -167,7 +173,7 @@ export function UserFilamentForm({
             className="!py-1 !px-2"
           >
             <BookOpen size={12} className="mr-1.5 inline" />
-            <span className="text-xs">Base on a stock filament</span>
+            <span className="text-xs">Base on a filament</span>
           </Button>
         </div>
       </div>
@@ -262,9 +268,9 @@ export function UserFilamentForm({
 
       {pickerOpen && (
         <FilamentPicker
-          stockOnly
-          title="Base on a stock filament"
-          description="Pick a stock preset as the parent. Values the custom doesn't set will be inherited — you only need to override what you want to change."
+          excludeSettingId={initial?.setting_id}
+          title="Base on a filament"
+          description="Pick a stock or your own preset as the parent. Values the custom doesn't set will be inherited — you only need to override what you want to change."
           onPick={(e) => applyStockBase(e)}
           onClose={() => setPickerOpen(false)}
         />
@@ -421,9 +427,9 @@ function VariantSection({
           {slotCount === 0 ? (
             <div className="rounded-md border border-dashed border-surface-border bg-surface-input/50 p-3 space-y-2">
               <div className="text-[11px] text-text-muted">
-                No extruder values yet. Bambu's cloud preset may have left them implicit (inherited from
-                the parent profile). Add the extruder type(s) below — common patterns are
-                Direct Drive Standard alone, or Standard plus High Flow on H2S/H2D.
+                No extruder values. Leave it empty and the cloud push uses the printer's own extruder
+                list (Standard + High Flow on the H2S, plus E3D High Flow on its 0.6 nozzle). Add them
+                only to set per-extruder max speed / PA.
               </div>
               <div className="flex flex-wrap gap-2">
                 <button

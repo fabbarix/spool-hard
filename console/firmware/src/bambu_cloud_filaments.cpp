@@ -753,10 +753,11 @@ static Result createOneVariant(const String& token, BambuCloudAuth::Region regio
     };
     auto fanOutFloats = [&](const std::vector<float>& src, float fallback, int dp) {
         // Short stored arrays repeat their last value: Bambu rejects
-        // mismatched widths.
+        // mismatched widths. Unset (<= 0) entries take the fallback.
         String out;
         for (size_t i = 0; i < nExt; ++i) {
             float v = i < src.size() ? src[i] : (src.empty() ? fallback : src.back());
+            if (v <= 0.f) v = fallback;
             if (i) out += ",";
             out += String(v, dp);
         }

@@ -157,6 +157,37 @@ const isUnsetStr   = (v: string | undefined) => !v || v.length === 0;
 // Resolve identity + operational range fields against a stock parent.
 // Variant-level fields (PA, max-vol-speed, print setpoint) are not
 // inherited here — they live on each UserFilamentVariant.
+// A user filament in the picker / parent-entry shape.
+export function userFilamentToEntry(u: UserFilament): FilamentEntry {
+  return {
+    name:        u.name || '(unnamed)',
+    filament_id: u.filament_id || '',
+    brand:       u.filament_vendor || '',
+    material:    u.filament_type   || '',
+    subtype:     u.filament_subtype || '',
+    nozzle_temp_min: u.nozzle_temp_min > 0 ? u.nozzle_temp_min : undefined,
+    nozzle_temp_max: u.nozzle_temp_max > 0 ? u.nozzle_temp_max : undefined,
+    density:     u.density > 0 ? u.density : undefined,
+    base_id:     u.base_id || undefined,
+    setting_id:  u.setting_id,
+    source:      'user',
+  };
+}
+
+// Local parent by `parent_setting_id`: the stock library first, then the
+// user's own presets (the parent picker offers both).
+export function findLocalParent(
+  id: string | undefined,
+  stock: FilamentEntry[] | undefined,
+  user: UserFilament[] | undefined,
+): FilamentEntry | null {
+  if (!id) return null;
+  const s = stock?.find((e) => e.setting_id === id);
+  if (s) return s;
+  const u = user?.find((r) => r.setting_id === id);
+  return u ? userFilamentToEntry(u) : null;
+}
+
 export function resolveUserFilament(
   custom: UserFilament,
   parent: FilamentEntry | null,

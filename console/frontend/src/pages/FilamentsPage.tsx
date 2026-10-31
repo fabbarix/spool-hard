@@ -8,7 +8,7 @@ import { Card } from '@spoolhard/ui/components/Card';
 import { Button } from '@spoolhard/ui/components/Button';
 import { SubTabBar, type SubTab } from '@spoolhard/ui/components/SubTabBar';
 import {
-  useUserFilaments, useDeleteUserFilament,
+  useUserFilaments, useDeleteUserFilament, findLocalParent,
   useCloudSyncFilaments, useCloudPushFilament, useCloudFilamentDetail,
   useCloudFilamentByName, useCloudFilamentById,
   cloudBodyToFilamentEntry,
@@ -311,7 +311,7 @@ function UserFilamentRow({
 
   // Resolve unset fields against a parent — same priority order as the
   // edit form:
-  //   1. Local stock parent (parent_setting_id from the picker)
+  //   1. Local parent (parent_setting_id from the picker: stock or user)
   //   2. Cloud parent by name (cloud_inherits from sync)
   //   3. Cloud parent by id  (base_id, used when sync didn't capture
   //      an inherits chain — common for "Flow Rate Calibrated" customs
@@ -320,8 +320,9 @@ function UserFilamentRow({
   // any cloud calls. React Query dedupes per-key, so adjacent rows
   // sharing the same parent only fire one cloud call.
   const stockDb = useFilamentsDb();
-  const stockParent = open && r.parent_setting_id
-    ? stockDb.data?.entries.find((e) => e.setting_id === r.parent_setting_id) ?? null
+  const userQ = useUserFilaments();
+  const stockParent = open
+    ? findLocalParent(r.parent_setting_id, stockDb.data?.entries, userQ.data?.rows)
     : null;
   const cloudInherits = r.cloud_inherits ?? '';
   const cloudByNameQ = useCloudFilamentByName(

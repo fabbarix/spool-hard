@@ -3,20 +3,20 @@ import { createPortal } from 'react-dom';
 import { X, Thermometer, Search, BookOpen, User as UserIcon } from 'lucide-react';
 import { Button } from '@spoolhard/ui/components/Button';
 import { useFilamentsDb, type FilamentEntry } from '../../hooks/useFilamentsDb';
-import { useUserFilaments } from '../../hooks/useUserFilaments';
+import { useUserFilaments, userFilamentToEntry } from '../../hooks/useUserFilaments';
 
 interface Props {
   onPick: (entry: FilamentEntry) => void;
   onClose: () => void;
-  // When true, hide user filaments and show stock only. Used by the
-  // "Base on a stock filament" picker in the custom-filament form so the
-  // user doesn't end up basing one custom on another by accident.
+  // When true, hide user filaments and show stock only.
   stockOnly?: boolean;
   // Optional copy override — the default is geared at spool editing
   // ("Pre-fill material, subtype, temps…"), but reuse contexts may want
   // to phrase it differently.
   title?: string;
   description?: string;
+  // Hide this user filament (the one being edited can't be its own parent).
+  excludeSettingId?: string;
 }
 
 // Pill filter for material families. "Other" is a catch-all that also
@@ -25,7 +25,7 @@ interface Props {
 const FAMILIES = ['All', 'PLA', 'PETG', 'ABS', 'ASA', 'TPU', 'PA', 'PC', 'Other'] as const;
 type Family = typeof FAMILIES[number];
 
-export function FilamentPicker({ onPick, onClose, stockOnly, title, description }: Props) {
+export function FilamentPicker({ onPick, onClose, stockOnly, title, description, excludeSettingId }: Props) {
   const { data, isLoading, error } = useFilamentsDb();
   const userQ = useUserFilaments();
   const [q, setQ]         = useState('');
@@ -41,22 +41,13 @@ export function FilamentPicker({ onPick, onClose, stockOnly, title, description 
     // the existing search / filter / row UI without forking it.
     const userEntries: FilamentEntry[] = stockOnly
       ? []
-      : (userQ.data?.rows ?? []).map((u) => ({
-          name:        u.name || '(unnamed)',
-          filament_id: u.filament_id || '',
-          brand:       u.filament_vendor || '',
-          material:    u.filament_type   || '',
-          subtype:     u.filament_subtype || '',
-          nozzle_temp_min: u.nozzle_temp_min > 0 ? u.nozzle_temp_min : undefined,
-          nozzle_temp_max: u.nozzle_temp_max > 0 ? u.nozzle_temp_max : undefined,
-          density:     u.density > 0 ? u.density : undefined,
-          setting_id:  u.setting_id,
-          source:      'user',
-        }));
+      : (userQ.data?.rows ?? [])
+          .filter((u) => u.setting_id !== excludeSettingId)
+          .map(userFilamentToEntry);
     // User filaments first — they're typically more relevant to the user
     // who took the time to create them.
     return [...userEntries, ...stockEntries];
-  }, [data, userQ.data, stockOnly]);
+  }, [data, userQ.data, stockOnly, excludeSettingId]);
   const present = entries.length > 0;
 
   const rows = useMemo(() => {

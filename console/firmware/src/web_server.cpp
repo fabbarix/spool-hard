@@ -2908,13 +2908,36 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
     // cycle so we don't try to delete dead ids on a retry.
     rec.cloud_setting_id        = "";
     rec.cloud_variant_ids_json  = "";
-    // Locally created presets have no filament_id; Bambu Studio assigns
-    // user presets "P" + 7 hex chars, so do the same before the first push.
-    if (rec.filament_id.isEmpty()) {
+    // The pushed preset is standalone, so values this record inherits
+    // (unset temps / density / identity) are filled from its local parent
+    // chain (user or stock). Only the pushed copy gets them; the record
+    // keeps inheriting.
+    FilamentRecord pushRec = rec;
+    String parentFid;
+    String pid = rec.parent_setting_id;
+    for (int depth = 0; depth < 4 && pid.length() && pid != rec.setting_id; ++depth) {
+        FilamentRecord par;
+        if (!g_user_filaments.findById(pid, par) && !g_stock_filaments.findById(pid, par)) break;
+        if (depth == 0) parentFid = par.filament_id;
+        if (pushRec.nozzle_temp_min <= 0 && par.nozzle_temp_min > 0) pushRec.nozzle_temp_min = par.nozzle_temp_min;
+        if (pushRec.nozzle_temp_max <= 0 && par.nozzle_temp_max > 0) pushRec.nozzle_temp_max = par.nozzle_temp_max;
+        if (pushRec.density <= 0.f && par.density > 0.f)              pushRec.density = par.density;
+        if (pushRec.filament_type.isEmpty())    pushRec.filament_type    = par.filament_type;
+        if (pushRec.filament_subtype.isEmpty()) pushRec.filament_subtype = par.filament_subtype;
+        if (pushRec.filament_vendor.isEmpty())  pushRec.filament_vendor  = par.filament_vendor;
+        if (pushRec.variants_json.isEmpty())    pushRec.variants_json    = par.variants_json;
+        pid = par.parent_setting_id;
+    }
+    // The filament_id is the AMS tray_info_idx: one copied from the parent
+    // (older "Base on" picks did that) would make the printer and Studio
+    // show the parent. Locally created presets have none. Either way assign
+    // one like Studio does for user presets: "P" + 7 hex chars.
+    if (rec.filament_id.isEmpty() || rec.filament_id == parentFid) {
         char fid[9];
         snprintf(fid, sizeof(fid), "P%07lx", (unsigned long)(esp_random() & 0x0fffffff));
         rec.filament_id = fid;
     }
+    pushRec.filament_id = rec.filament_id;
     g_user_filaments.upsert(rec);
 
     // Default printer/nozzle for variants that don't name one: the first
@@ -2933,7 +2956,7 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
     String newCloudId;
     auto cr = BambuCloudFilaments::createOne(g_bambu_cloud.token(),
                                               g_bambu_cloud.region(),
-                                              rec, newCloudId, &diag,
+                                              pushRec, newCloudId, &diag,
                                               defModel, defNozzle);
     resp["status"] = _cloudResultStr(cr);
     if (cr != BambuCloudFilaments::Result::Ok) {
