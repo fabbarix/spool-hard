@@ -412,6 +412,18 @@ private:
     // occupancy change.
     String _lastSyncedSpoolId[4][4];
     String _lastSyncedSpoolIdVt;   // vt_tray (external) sibling
+    // Push-relevant fields (filament id/preset, colour, material, temps) of
+    // the spool record last synced into each slot. Editing a mapped spool
+    // changes this and re-runs the sync, so a new filament preset reaches the
+    // printer without unloading the slot. Set by _pushAmsFilamentSetting.
+    uint32_t _lastSyncedSig[4][4] = {};
+    uint32_t _lastSyncedSigVt     = 0;
+    // tray_info_idx each slot reported in the previous report. A spool only
+    // adopts the printer's idx when it CHANGED there (picked on the printer
+    // panel / Studio), never just because it differs: a stale idx would
+    // otherwise overwrite a filament the user just chose on the console.
+    String _seenTrayIdx[4][4];
+    String _seenTrayIdxVt;
 
     // External-tray signature tracker — mirror of _lastSlotSignature for
     // the vt_tray. Used to detect physical-unload on the external spool

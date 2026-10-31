@@ -2908,12 +2908,33 @@ void ConsoleWebServer::_handleUserFilamentCloudPush(AsyncWebServerRequest* req) 
     // cycle so we don't try to delete dead ids on a retry.
     rec.cloud_setting_id        = "";
     rec.cloud_variant_ids_json  = "";
+    // Locally created presets have no filament_id; Bambu Studio assigns
+    // user presets "P" + 7 hex chars, so do the same before the first push.
+    if (rec.filament_id.isEmpty()) {
+        char fid[9];
+        snprintf(fid, sizeof(fid), "P%07lx", (unsigned long)(esp_random() & 0x0fffffff));
+        rec.filament_id = fid;
+    }
     g_user_filaments.upsert(rec);
 
+    // Default printer/nozzle for variants that don't name one: the first
+    // printer that has reported its model + nozzle, connected ones first.
+    String defModel; float defNozzle = 0.f;
+    for (int pass = 0; pass < 2 && defModel.isEmpty(); ++pass) {
+        for (const auto& p : g_bambu.printers()) {
+            const auto& st = p->state();
+            if (pass == 0 && st.link != BambuLinkState::Connected) continue;
+            if (st.model_code.isEmpty() || st.nozzle_count <= 0) continue;
+            defModel  = st.model_code;
+            defNozzle = st.nozzle_diameters[0];
+            break;
+        }
+    }
     String newCloudId;
     auto cr = BambuCloudFilaments::createOne(g_bambu_cloud.token(),
                                               g_bambu_cloud.region(),
-                                              rec, newCloudId, &diag);
+                                              rec, newCloudId, &diag,
+                                              defModel, defNozzle);
     resp["status"] = _cloudResultStr(cr);
     if (cr != BambuCloudFilaments::Result::Ok) {
         JsonObject d = resp["diagnostics"].to<JsonObject>();

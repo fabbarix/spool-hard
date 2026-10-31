@@ -1,3 +1,4 @@
+#include <utility>
 #include "bambu_printer.h"
 #include "bambu_report_filter.h"
 #include "user_filaments_store.h"
@@ -215,6 +216,9 @@ void resolveTemps(const String& material, int32_t user_min, int32_t user_max,
     }
     tmin = (user_min > 0) ? (uint32_t)user_min : d_min;
     tmax = (user_max > 0) ? (uint32_t)user_max : d_max;
+    // Never hand the AMS an inverted range (older stock presets carried
+    // 250/245 from the print / initial-layer fallback).
+    if (tmin > tmax) std::swap(tmin, tmax);
 }
 
 // Bambu serial → canonical short model code. The serial's first three
@@ -231,6 +235,7 @@ String modelFromSerial(const String& serial) {
     if (p == "030") return "A1mini";
     if (p == "039") return "A1";
     if (p == "094") return "H2D";
+    if (p == "093") return "H2S";   // seen on a real H2S (SSDP model "O1S")
     if (p == "09C") return "H2S";
     return "";
 }
@@ -973,7 +978,13 @@ void BambuPrinter::_persistTrayInfoIdx() {
     //
     // Only writes when the value actually changes — store.upsert is a
     // full-line rewrite on JSONL, no point churning the SD card.
-    auto syncTray = [&](const AmsTray& tr) {
+    auto syncTray = [&](const AmsTray& tr, String& seen) {
+        const String prev = seen;
+        seen = tr.tray_info_idx;
+        // Adopt only a printer-side CHANGE. A first sighting or an unchanged
+        // stale idx must not overwrite what the user set on the console:
+        // _syncSpoolToPrinter pushes the spool's value instead.
+        if (prev.isEmpty() || prev == tr.tray_info_idx) return;
         if (tr.mapped_spool_id.isEmpty() || tr.tray_info_idx.isEmpty()) return;
         SpoolRecord rec;
         if (!g_store.findById(tr.mapped_spool_id, rec)) return;
@@ -985,12 +996,12 @@ void BambuPrinter::_persistTrayInfoIdx() {
         g_store.upsert(rec);
     };
 
-    for (int u = 0; u < _state.ams_count; ++u) {
+    for (int u = 0; u < _state.ams_count && u < 4; ++u) {
         for (int t = 0; t < 4; ++t) {
-            syncTray(_state.ams[u].trays[t]);
+            syncTray(_state.ams[u].trays[t], _seenTrayIdx[u][t]);
         }
     }
-    syncTray(_state.vt_tray);
+    syncTray(_state.vt_tray, _seenTrayIdxVt);
 }
 
 void BambuPrinter::_persistKValues() {
@@ -1340,6 +1351,19 @@ bool BambuPrinter::_maybeAssignPendingSpool(int ams_unit, int slot_id) {
     return true;
 }
 
+// FNV-1a over the spool fields _pushAmsFilamentSetting sends.
+static uint32_t _spoolPushSig(const SpoolRecord& rec) {
+    uint32_t h = 2166136261u;
+    auto mix = [&](const String& v) {
+        for (size_t i = 0; i < v.length(); ++i) { h ^= (uint8_t)v[i]; h *= 16777619u; }
+        h ^= 0x1f; h *= 16777619u;
+    };
+    mix(rec.slicer_filament); mix(rec.setting_id);
+    mix(rec.color_code);      mix(rec.material_type);
+    mix(String(rec.nozzle_temp_min)); mix(String(rec.nozzle_temp_max));
+    return h ? h : 1;   // 0 = "never synced"
+}
+
 void BambuPrinter::_syncSpoolToPrinter(int ams_unit, int slot_id, const AmsTray& tr) {
     // Edge-triggered: fire only when the resolved mapping changes. Two cases:
     //   * non-empty → non-empty (incl. empty → loaded): push ams_filament_setting
@@ -1351,7 +1375,16 @@ void BambuPrinter::_syncSpoolToPrinter(int ams_unit, int slot_id, const AmsTray&
     String& last = (ams_unit == 254)
                  ? _lastSyncedSpoolIdVt
                  : _lastSyncedSpoolId[ams_unit][slot_id];
-    if (tr.mapped_spool_id == last) return;
+    uint32_t& lastSig = (ams_unit == 254) ? _lastSyncedSigVt
+                                          : _lastSyncedSig[ams_unit][slot_id];
+    SpoolRecord rec;
+    bool haveRec = tr.mapped_spool_id.length() &&
+                   g_store.findById(tr.mapped_spool_id, rec);
+    // Same spool AND its push-relevant fields unchanged -> nothing to do.
+    // A spool edited while mapped (new filament preset, colour, temps)
+    // falls through and is re-pushed.
+    if (tr.mapped_spool_id == last &&
+        (!haveRec || _spoolPushSig(rec) == lastSig)) return;
     const String prev = last;
     last = tr.mapped_spool_id;
 
@@ -1373,10 +1406,10 @@ void BambuPrinter::_syncSpoolToPrinter(int ams_unit, int slot_id, const AmsTray&
         return;
     }
 
-    SpoolRecord rec;
-    if (!g_store.findById(tr.mapped_spool_id, rec)) return;
+    if (!haveRec) return;
+    lastSig = _spoolPushSig(rec);
     // If the printer already reports exactly the same colour (RGB, ignoring
-    // alpha) AND material, skip the push. Saves a round-trip on every boot
+    // alpha), material, filament id and temps, skip the push. Saves a round-trip on every boot
     // when the printer already remembers what the last session set.
     bool color_matches = false;
     if (rec.color_code.length() >= 6 && tr.tray_color.length() >= 6) {
@@ -1385,7 +1418,16 @@ void BambuPrinter::_syncSpoolToPrinter(int ams_unit, int slot_id, const AmsTray&
     }
     bool material_matches = rec.material_type.length() == 0 ||
                             rec.material_type.equalsIgnoreCase(tr.tray_type);
-    if (color_matches && material_matches) {
+    String idx = rec.slicer_filament;
+    if (idx.isEmpty() && rec.setting_id.length()) {
+        FilamentRecord fr;
+        if (g_user_filaments.findById(rec.setting_id, fr)) idx = fr.filament_id;
+    }
+    bool idx_matches = idx.isEmpty() || idx == tr.tray_info_idx;
+    uint32_t tmin = 0, tmax = 0;
+    resolveTemps(rec.material_type, rec.nozzle_temp_min, rec.nozzle_temp_max, tmin, tmax);
+    bool temps_match = (int)tmin == tr.nozzle_min_c && (int)tmax == tr.nozzle_max_c;
+    if (color_matches && material_matches && idx_matches && temps_match) {
         Serial.printf("[Bambu %s] slot %d/%d already in sync with spool %s\n",
                       _cfg.serial.c_str(), ams_unit, slot_id, rec.id.c_str());
         return;
@@ -1398,6 +1440,9 @@ void BambuPrinter::_syncSpoolToPrinter(int ams_unit, int slot_id, const AmsTray&
 }
 
 void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const SpoolRecord& rec) {
+    if (ams_unit == 254) _lastSyncedSigVt = _spoolPushSig(rec);
+    else if (ams_unit >= 0 && ams_unit < 4 && slot_id >= 0 && slot_id < 4)
+        _lastSyncedSig[ams_unit][slot_id] = _spoolPushSig(rec);
     if (!_mqtt || !_mqtt->connected()) {
         Serial.printf("[Bambu %s] ams push skipped — not connected\n", _cfg.serial.c_str());
         return;

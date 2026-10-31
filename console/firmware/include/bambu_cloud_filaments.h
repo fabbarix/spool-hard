@@ -57,12 +57,15 @@ namespace BambuCloudFilaments {
                     const String& preset_id, FilamentRecord& out,
                     Diag* diagOut = nullptr);
 
-    // Push a new preset to the cloud. On Ok, `newCloudIdOut` is filled
-    // with the server-issued PFUS<hash> id. The caller stores that on
-    // the local record's cloud_setting_id field.
+    // Push a filament to the cloud as Studio-shaped standalone presets,
+    // one per (printer, nozzle) variant. Variants without a printer or
+    // nozzle (or a record with no variants) use `defaultModel` (model
+    // code, e.g. "H2S") / `defaultNozzle` — the current printer. On Ok,
+    // `newCloudIdOut` is the first server-issued PFUS<hash> id.
     Result createOne(const String& token, BambuCloudAuth::Region region,
                      const FilamentRecord& in, String& newCloudIdOut,
-                     Diag* diagOut = nullptr);
+                     Diag* diagOut = nullptr,
+                     const String& defaultModel = String(), float defaultNozzle = 0.f);
 
     // Delete a cloud preset by id. Used by the "update" emulation
     // (delete-old-then-create-new) per the cloud's no-PUT contract.

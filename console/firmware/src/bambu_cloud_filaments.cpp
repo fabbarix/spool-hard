@@ -2,6 +2,9 @@
 #include "spoolhard/ring_log.h"
 #include <ArduinoJson.h>
 #include <map>
+#include <math.h>
+#include <utility>
+#include "spoolhard/psram_json_alloc.h"
 
 namespace BambuCloudFilaments {
 
@@ -492,10 +495,207 @@ Result fetchOne(const String& token, BambuCloudAuth::Region region,
     return Result::Ok;
 }
 
-// Build the cloud-side `setting` blob for one variant of a logical
-// filament, then POST it. Used by createOne to emit one cloud preset
-// per variant. Group identity (vendor, density, range_low/high) is
-// repeated across every sibling preset so each is self-contained.
+// ---- Cloud push: Studio-shaped standalone presets ----------------------
+//
+// Bambu Studio only resolves a user preset's filament_id (the AMS
+// tray_info_idx) when the cloud copy looks like one Studio itself made:
+// standalone (`inherits` ""), ~145 flattened keys, vendor/type unquoted,
+// settings_id / compatible_printers quoted, per-extruder values
+// comma-joined to the printer's `filament_extruder_variant` count. A thin
+// preset that leans on `inherits` is shown as "unknown filament, generic
+// preset used". The template below is a Studio-made "Jayo PETG Matte @Bambu
+// Lab H2S" preset; record fields are overlaid on it per variant.
+
+namespace {
+
+enum : uint8_t {
+    kPerExt     = 1,   // one value per extruder variant, comma-joined
+    kPerExtSemi = 2,   // one quoted value per extruder variant, ';'-joined
+    kPetgOnly   = 4,   // material-specific: only sent for the PETG family
+};
+
+struct TemplateKey { const char* key; const char* val; uint8_t flags; };
+
+// Keys the overlay always computes (identity, temps, speeds, PA,
+// compatibility, extruder variants) are not in this table.
+const TemplateKey kTemplate[] = {
+    {"activate_air_filtration",                 "0",   kPetgOnly},
+    {"additional_cooling_fan_speed",            "0",   kPetgOnly},
+    {"additional_fan_full_speed_layer",         "0",   0},
+    {"chamber_temperatures",                    "0",   kPetgOnly},
+    {"circle_compensation_speed",               "200", 0},
+    {"close_additional_fan_first_x_layers",     "3",   0},
+    {"close_fan_the_first_x_layers",            "3",   kPetgOnly},
+    {"compatible_printers_condition",           "",    0},
+    {"compatible_prints",                       "",    0},
+    {"compatible_prints_condition",             "",    0},
+    {"complete_print_exhaust_fan_speed",        "70",  kPetgOnly},
+    {"cool_plate_temp",                         "0",   kPetgOnly},
+    {"cool_plate_temp_initial_layer",           "0",   kPetgOnly},
+    {"cooling_perimeter_transition_distance",   "10",  0},
+    {"cooling_slowdown_logic",                  "uniform_cooling", 0},
+    {"counter_coef_1",                          "0",      kPetgOnly},
+    {"counter_coef_2",                          "0.0058", kPetgOnly},
+    {"counter_coef_3",                          "0.0107", kPetgOnly},
+    {"counter_limit_max",                       "0.15",   kPetgOnly},
+    {"counter_limit_min",                       "0.01",   kPetgOnly},
+    {"default_filament_colour",                 "\"\"", 0},
+    {"diameter_limit",                          "50",  0},
+    {"during_print_exhaust_fan_speed",          "70",  kPetgOnly},
+    {"enable_overhang_bridge_fan",              "1",   0},
+    {"eng_plate_temp",                          "70",  kPetgOnly},
+    {"eng_plate_temp_initial_layer",            "70",  kPetgOnly},
+    {"fan_cooling_layer_time",                  "20",  kPetgOnly},
+    {"fan_max_speed",                           "50",  kPetgOnly},
+    {"fan_min_speed",                           "20",  kPetgOnly},
+    {"filament_adaptive_volumetric_speed",      "0",   kPerExt},
+    {"filament_adhesiveness_category",          "300", kPetgOnly},
+    {"filament_bridge_speed",                   "25",  kPerExt},
+    {"filament_change_length",                  "4",   0},
+    {"filament_change_length_nc",               "10",  0},
+    {"filament_cooling_before_tower",           "10",  kPerExt},
+    {"filament_cost",                           "0",   0},
+    {"filament_deretraction_speed",             "nil", kPerExt},
+    {"filament_dev_ams_drying_ams_limitations", "1;0", kPetgOnly},
+    {"filament_dev_ams_drying_heat_distortion_temperature", "75", kPetgOnly},
+    {"filament_dev_ams_drying_temperature",     "65,65,55,55", kPetgOnly},
+    {"filament_dev_ams_drying_time",            "12,12,12,12", kPetgOnly},
+    {"filament_dev_chamber_drying_bed_temperature", "80", kPetgOnly},
+    {"filament_dev_chamber_drying_time",        "12",  kPetgOnly},
+    {"filament_dev_drying_cooling_temperature", "55",  kPetgOnly},
+    {"filament_dev_drying_softening_temperature", "60", kPetgOnly},
+    {"filament_diameter",                       "1.75", 0},
+    {"filament_enable_overhang_speed",          "1",   kPerExt},
+    {"filament_end_gcode",                      "\"; filament end gcode \\n\"", 0},
+    {"filament_extruder_compatibility",         "0",   0},
+    {"filament_flow_ratio",                     "0.95", kPerExt},
+    {"filament_flush_temp",                     "0",   kPerExt},
+    {"filament_flush_temp_fast",                "0",   kPerExt},
+    {"filament_flush_volumetric_speed",         "0",   kPerExt},
+    {"filament_is_support",                     "0",   0},
+    {"filament_long_retractions_when_cut",      "nil", kPerExt},
+    {"filament_metal_stickiness",               "High", kPetgOnly},
+    {"filament_minimal_purge_on_wipe_tower",    "15",  0},
+    {"filament_notes",                          "",    0},
+    {"filament_overhang_1_4_speed",             "0",   kPerExt},
+    {"filament_overhang_2_4_speed",             "50",  kPerExt},
+    {"filament_overhang_3_4_speed",             "30",  kPerExt},
+    {"filament_overhang_4_4_speed",             "10",  kPerExt},
+    {"filament_overhang_totally_speed",         "10",  kPerExt},
+    {"filament_pre_cooling_temperature",        "0",   kPerExt},
+    {"filament_pre_cooling_temperature_nc",     "0",   kPerExt},
+    {"filament_preheat_temperature_delta",      "10",  kPerExt},
+    {"filament_prime_volume",                   "30",  0},
+    {"filament_prime_volume_nc",                "60",  0},
+    {"filament_printable",                      "3",   0},
+    {"filament_ramming_travel_time",            "0",   kPerExt},
+    {"filament_ramming_travel_time_nc",         "0",   kPerExt},
+    {"filament_ramming_volumetric_speed",       "-1",  kPerExt},
+    {"filament_ramming_volumetric_speed_nc",    "-1",  kPerExt},
+    {"filament_retract_before_wipe",            "nil", kPerExt},
+    {"filament_retract_length_nc",              "14",  kPerExt},
+    {"filament_retract_restart_extra",          "nil", kPerExt},
+    {"filament_retract_when_changing_layer",    "nil", kPerExt},
+    {"filament_retraction_distances_when_cut",  "nil", kPerExt},
+    {"filament_retraction_length",              "nil", kPerExt},
+    {"filament_retraction_minimum_travel",      "nil", kPerExt},
+    {"filament_retraction_speed",               "nil", kPerExt},
+    {"filament_scarf_gap",                      "0%",  0},
+    {"filament_scarf_height",                   "10%", 0},
+    {"filament_scarf_length",                   "10",  0},
+    {"filament_scarf_seam_type",                "none", 0},
+    {"filament_shrink",                         "100%", 0},
+    {"filament_soluble",                        "0",   0},
+    {"filament_start_gcode",                    "\"; filament start gcode\\n\"", 0},
+    {"filament_tower_interface_pre_extrusion_dist",   "10", 0},
+    {"filament_tower_interface_pre_extrusion_length", "0",  0},
+    {"filament_tower_interface_print_temp",     "-1",  0},
+    {"filament_tower_interface_purge_volume",   "20",  0},
+    {"filament_tower_ironing_area",             "8",   0},
+    {"filament_velocity_adaptation_factor",     "1",   0},
+    {"filament_wipe",                           "nil", kPerExt},
+    {"filament_wipe_distance",                  "nil", kPerExt},
+    {"filament_z_hop",                          "nil", kPerExt},
+    {"filament_z_hop_types",                    "nil", kPerExt},
+    {"first_x_layer_fan_speed",                 "0",   0},
+    {"first_x_layer_part_fan_speed",            "0",   0},
+    {"full_fan_speed_layer",                    "0",   0},
+    {"hole_coef_1",                             "0",       kPetgOnly},
+    {"hole_coef_2",                             "-0.0042", kPetgOnly},
+    {"hole_coef_3",                             "0.2006",  kPetgOnly},
+    {"hole_limit_max",                          "0.2",     kPetgOnly},
+    {"hole_limit_min",                          "0.09",    kPetgOnly},
+    {"hot_plate_temp",                          "70",  kPetgOnly},
+    {"hot_plate_temp_initial_layer",            "70",  kPetgOnly},
+    {"impact_strength_z",                       "10.6", kPetgOnly},
+    {"inherits",                                "",    0},
+    {"ironing_fan_speed",                       "-1",  0},
+    {"long_retractions_when_ec",                "0",   kPerExt},
+    {"no_slow_down_for_cooling_on_outwalls",    "0",   0},
+    {"overhang_fan_speed",                      "100", 0},
+    {"overhang_fan_threshold",                  "10%", 0},
+    {"overhang_threshold_participating_cooling", "95%", 0},
+    {"override_process_overhang_speed",         "0",   kPerExt},
+    {"pre_start_fan_time",                      "2",   0},
+    {"reduce_fan_stop_start_freq",              "1",   0},
+    {"required_nozzle_HRC",                     "3",   0},
+    {"retraction_distances_when_ec",            "0",   kPerExt},
+    {"slow_down_for_layer_cooling",             "1",   0},
+    {"slow_down_layer_time",                    "10",  kPetgOnly},
+    {"slow_down_min_speed",                     "20",  kPerExt},
+    {"supertack_plate_temp",                    "60",  kPetgOnly},
+    {"supertack_plate_temp_initial_layer",      "60",  kPetgOnly},
+    {"temperature_vitrification",               "70",  kPetgOnly},
+    {"textured_plate_temp",                     "70",  kPetgOnly},
+    {"textured_plate_temp_initial_layer",       "70",  kPetgOnly},
+    {"volumetric_speed_coefficients",           "0 0 0 0 0 0", kPerExtSemi},
+};
+
+// Non-PETG materials: the PETG-only keys above are left out (Studio fills
+// a standalone preset's missing keys from its defaults) and these
+// Bambu-generic plate temps / fan speeds go in instead. -1 = leave out.
+struct MaterialDefaults {
+    const char* prefix;     // matched against the upper-cased filament_type
+    int cool, eng, hot, textured;
+    int fanMin, fanMax;
+    float maxVolSpeed;      // mm3/s at >= 0.4 mm nozzles
+};
+const MaterialDefaults kMaterials[] = {
+    {"PETG", -1,  -1,  -1,  -1,  -1, -1, 12.f},  // PETG/PET/PCTG: template values
+    {"PET",  -1,  -1,  -1,  -1,  -1, -1, 12.f},
+    {"PCTG", -1,  -1,  -1,  -1,  -1, -1, 12.f},
+    {"PLA",  35,  55,  55,  55, 100, 100, 21.f},
+    {"ABS",   0,  90,  90,  90,  10, 80, 16.f},
+    {"ASA",   0,  90,  90,  90,  10, 80, 16.f},
+    {"TPU",  30,  30,  35,  35, 100, 100, 3.6f},
+    {"PC",    0, 110, 110, 110,  -1, -1, 12.f},
+    {"PA",    0, 100, 100, 100,  -1, -1, 8.f},
+};
+
+const MaterialDefaults* _materialFor(const String& type) {
+    String t = type; t.toUpperCase();
+    for (const auto& m : kMaterials)
+        if (t.startsWith(m.prefix)) return &m;
+    return nullptr;
+}
+
+bool _isPetgFamily(const MaterialDefaults* m) {
+    return m && m->cool < 0;   // the template-backed rows
+}
+
+// `filament_extruder_variant` per printer/nozzle. Verified on Studio-made
+// H2S presets: 0.2/0.4/0.8 list Standard + High Flow, 0.6 adds E3D High
+// Flow. Other printers get Standard + High Flow (Studio 2.x's common
+// filament base). A variant that carries its own list wins.
+std::vector<String> _extruderVariantsFor(const String& model, float nozzle) {
+    std::vector<String> v = {"Direct Drive Standard", "Direct Drive High Flow"};
+    if (model == "H2S" && fabsf(nozzle - 0.6f) < 0.01f)
+        v.push_back("Direct Drive E3D High Flow");
+    return v;
+}
+
+} // namespace
+
 // Parse "<base> @BBL <printer> [<nozzle> nozzle]" out of an `inherits`
 // string so we can fill name suffix / compatible_printers when the
 // variant didn't carry printer_model + nozzle_diameter (current cloud
@@ -527,127 +727,110 @@ static String _humanizePrinterModel(const String& code) {
     return code;   // X1, P1S, P1P, H2S, H2D, A1 — all match Bambu's "Bambu Lab <code>" naming verbatim
 }
 
+// Build the Studio-shaped preset for one (printer, nozzle) variant and
+// POST it. `printerModel` / `nozzleDiam` are already resolved by createOne.
 static Result createOneVariant(const String& token, BambuCloudAuth::Region region,
                                const FilamentRecord& in, const FilamentVariant& fv,
+                               const String& printerModel, float nozzleDiam,
                                String& newCloudIdOut, Diag* diagOut) {
-    JsonDocument body;
-    body["type"]    = "filament";
-    // Bambu's cloud preset names follow "<filament> @Bambu Lab <printer>
-    // <nozzle> nozzle". If the variant didn't capture printer_model /
-    // nozzle_diameter (current cloud sync drops them — see the
-    // user-filaments hook docs), fall back to parsing them out of
-    // `cloud_inherits`. That's the parent preset's name and always
-    // includes the @BBL <printer> suffix.
-    String printerModel = fv.printer_model;
-    float  nozzleDiam   = fv.nozzle_diameter;
-    if (printerModel.isEmpty() || nozzleDiam <= 0.f) {
-        String pm; float pn;
-        if (_parseInheritsPrinter(in.cloud_inherits, pm, pn)) {
-            if (printerModel.isEmpty()) printerModel = pm;
-            if (nozzleDiam <= 0.f)      nozzleDiam   = pn;
-        }
-    }
-    String printerHuman = _humanizePrinterModel(printerModel);
+    char nz[16];
+    snprintf(nz, sizeof(nz), "%.1f", nozzleDiam);
+    const String compatPrinter = "Bambu Lab " + _humanizePrinterModel(printerModel)
+                               + " " + nz + " nozzle";
+    const String presetName = in.name + " @" + compatPrinter;
+    auto quote = [](const String& s) { return "\"" + s + "\""; };
 
-    String suffix, compatPrinter;
-    if (printerHuman.length() && nozzleDiam > 0.f) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f", nozzleDiam);
-        suffix        = " @Bambu Lab " + printerHuman + " " + String(buf) + " nozzle";
-        compatPrinter = "Bambu Lab "   + printerHuman + " " + String(buf) + " nozzle";
-    }
-
-    body["name"]    = in.name + suffix;
-    body["version"] = "2.0.0.0";   // envelope version
-    body["base_id"] = in.base_id;
-    JsonObject setting = body["setting"].to<JsonObject>();
-
-    // Bambu's stored format uses *string-encoded* values throughout —
-    // single scalars as plain strings ("1.24"), multi-extruder numerics
-    // as comma-joined strings ("42,48"), multi-extruder string lists as
-    // semicolon-joined with each segment wrapped in escaped quotes
-    // (`"a";"b"`), and identity-ish strings (vendor, type, settings_id,
-    // compatible_printers) as single escape-quoted strings. Arrays-of-
-    // strings (what we had been sending) are rejected with 422. Helpers
-    // below produce each shape so the call sites stay readable.
-    const size_t nExtruders = fv.extruder_variants.empty() ? 1 : fv.extruder_variants.size();
-    auto joinCommaRepeat = [&](const String& v) {
+    const std::vector<String> extVariants = fv.extruder_variants.empty()
+        ? _extruderVariantsFor(printerModel, nozzleDiam) : fv.extruder_variants;
+    const size_t nExt = extVariants.size();
+    auto fanOut = [&](const String& v, char sep, bool quoted) {
         String out;
-        for (size_t i = 0; i < nExtruders; ++i) { if (i) out += ","; out += v; }
+        for (size_t i = 0; i < nExt; ++i) {
+            if (i) out += sep;
+            out += quoted ? quote(v) : v;
+        }
         return out;
     };
-    auto joinCommaFloats = [&](const std::vector<float>& src, int dp) {
-        // Pad short stored arrays by repeating the last value — Bambu
-        // rejects mismatched widths and silent NaN/0 fills.
+    auto fanOutFloats = [&](const std::vector<float>& src, float fallback, int dp) {
+        // Short stored arrays repeat their last value: Bambu rejects
+        // mismatched widths.
         String out;
-        for (size_t i = 0; i < nExtruders; ++i) {
-            float v = i < src.size() ? src[i] : (src.empty() ? 0.f : src.back());
+        for (size_t i = 0; i < nExt; ++i) {
+            float v = i < src.size() ? src[i] : (src.empty() ? fallback : src.back());
             if (i) out += ",";
             out += String(v, dp);
         }
         return out;
     };
-    auto quote = [](const String& s) { return "\"" + s + "\""; };
 
-    // Provenance / inheritance markers — Bambu Studio sends all three.
-    if (in.cloud_inherits.length())
-        setting["inherits"] = in.cloud_inherits;
-    setting["from"]    = "User";
-    setting["version"] = "2.6.0.2";   // slicer-profile schema version (in-setting)
+    const MaterialDefaults* mat = _materialFor(in.filament_type);
+    const bool petg = _isPetgFamily(mat);
 
-    // Identity strings — escape-quoted in Bambu's stored format.
-    setting["filament_settings_id"] = quote(in.name + suffix);
-    if (in.filament_vendor.length())
-        setting["filament_vendor"] = quote(in.filament_vendor);
-    if (in.filament_type.length())
-        setting["filament_type"]   = quote(in.filament_type);
+    JsonDocument body(&g_psramJsonAlloc);
+    body["type"]    = "filament";
+    body["name"]    = presetName;
+    body["version"] = "2.8.0.9";   // what Studio 2.x writes
+    body["base_id"] = nullptr;     // standalone, like Studio's own presets
+    if (in.filament_id.length()) body["filament_id"] = in.filament_id;
+    JsonObject setting = body["setting"].to<JsonObject>();
 
-    // Operational range — single scalars, plain strings (not quoted).
-    // Bambu stores these per-extruder too, even though the value is
-    // the same on every extruder — comma-fanned out to N copies.
-    if (in.nozzle_temp_min > 0)
-        setting["nozzle_temperature_range_low"]  = joinCommaRepeat(String(in.nozzle_temp_min));
-    if (in.nozzle_temp_max > 0)
-        setting["nozzle_temperature_range_high"] = joinCommaRepeat(String(in.nozzle_temp_max));
-    if (fv.nozzle_temp_print > 0 || in.nozzle_temp_max > 0) {
-        int nt = fv.nozzle_temp_print > 0 ? fv.nozzle_temp_print : in.nozzle_temp_max;
+    for (const auto& k : kTemplate) {
+        if ((k.flags & kPetgOnly) && !petg) continue;
+        if (k.flags & kPerExt)          setting[k.key] = fanOut(k.val, ',', false);
+        else if (k.flags & kPerExtSemi) setting[k.key] = fanOut(k.val, ';', true);
+        else                            setting[k.key] = k.val;
+    }
+    if (mat && !petg) {
+        auto put = [&](const char* a, const char* b, int v) {
+            if (v < 0) return;
+            setting[a] = String(v);
+            if (b) setting[b] = String(v);
+        };
+        put("cool_plate_temp",     "cool_plate_temp_initial_layer",     mat->cool);
+        put("eng_plate_temp",      "eng_plate_temp_initial_layer",      mat->eng);
+        put("hot_plate_temp",      "hot_plate_temp_initial_layer",      mat->hot);
+        put("textured_plate_temp", "textured_plate_temp_initial_layer", mat->textured);
+        put("fan_min_speed", nullptr, mat->fanMin);
+        put("fan_max_speed", nullptr, mat->fanMax);
+    }
+
+    // Identity: settings_id / compatible_printers quoted, vendor / type /
+    // filament_id plain (Studio's stored shapes).
+    setting["filament_settings_id"] = quote(presetName);
+    setting["compatible_printers"]  = quote(compatPrinter);
+    if (in.filament_id.length())     setting["filament_id"]     = in.filament_id;
+    if (in.filament_vendor.length()) setting["filament_vendor"] = in.filament_vendor;
+    if (in.filament_type.length())   setting["filament_type"]   = in.filament_type;
+    String ev;
+    for (size_t i = 0; i < nExt; ++i) { if (i) ev += ";"; ev += quote(extVariants[i]); }
+    setting["filament_extruder_variant"] = ev;
+
+    // Temperatures: range is a scalar pair; the print temps are
+    // per-extruder. Without a variant print temp use the range midpoint
+    // (rounded to 5 C).
+    int lo = in.nozzle_temp_min, hi = in.nozzle_temp_max;
+    if (lo > 0 && hi > 0 && lo > hi) std::swap(lo, hi);
+    if (lo > 0) setting["nozzle_temperature_range_low"]  = String(lo);
+    if (hi > 0) setting["nozzle_temperature_range_high"] = String(hi);
+    int nt = fv.nozzle_temp_print;
+    if (nt <= 0 && lo > 0 && hi > 0) nt = ((lo + hi) / 2 + 2) / 5 * 5;
+    if (nt <= 0) nt = hi > 0 ? hi : lo;
+    if (nt > 0) {
         int ni = fv.nozzle_temp_initial_layer > 0 ? fv.nozzle_temp_initial_layer : nt;
-        setting["nozzle_temperature"]               = joinCommaRepeat(String(nt));
-        setting["nozzle_temperature_initial_layer"] = joinCommaRepeat(String(ni));
+        setting["nozzle_temperature"]               = fanOut(String(nt), ',', false);
+        setting["nozzle_temperature_initial_layer"] = fanOut(String(ni), ',', false);
     }
-    if (in.density > 0.f)
-        setting["filament_density"] = String(in.density, 3);
+    if (in.density > 0.f) setting["filament_density"] = String(in.density, 2);
 
-    // Per-extruder numeric arrays.
-    if (!fv.max_volumetric_speed.empty())
-        setting["filament_max_volumetric_speed"] = joinCommaFloats(fv.max_volumetric_speed, 2);
+    float mvs = mat ? mat->maxVolSpeed : 12.f;
+    if (nozzleDiam < 0.3f && mvs > 2.f) mvs = 2.f;   // 0.2 mm nozzle
+    setting["filament_max_volumetric_speed"] = fanOutFloats(fv.max_volumetric_speed, mvs, 1);
 
-    // PA: only emit `enable_pressure_advance: "1"` when at least one
-    // stored value is non-zero — sending the enable flag together with
-    // all-zero values is internally inconsistent and Bambu has been
-    // observed rejecting it. When PA isn't enabled we skip both fields
-    // and let the cloud apply the parent preset's defaults.
-    bool paEnabled = false;
-    for (float v : fv.pressure_advance) if (v > 0.f) { paEnabled = true; break; }
-    if (paEnabled) {
-        setting["pressure_advance"]        = joinCommaFloats(fv.pressure_advance, 3);
-        setting["enable_pressure_advance"] = "1";
-    }
-
-    // Per-extruder string lists — semicolon-joined, each segment quoted.
-    if (!fv.extruder_variants.empty()) {
-        String joined;
-        for (size_t i = 0; i < fv.extruder_variants.size(); ++i) {
-            if (i) joined += ";";
-            joined += quote(fv.extruder_variants[i]);
-        }
-        setting["filament_extruder_variant"] = joined;
-    }
-
-    // Compatible printers — single quoted string. Required for
-    // printer-specific filaments; without it the cloud 422s.
-    if (compatPrinter.length())
-        setting["compatible_printers"] = quote(compatPrinter);
+    // Studio stores PA as one scalar; only enable it for a real value.
+    float pa = 0.f;
+    for (float v : fv.pressure_advance) if (v > 0.f) { pa = v; break; }
+    setting["pressure_advance"]        = pa > 0.f ? String(pa, 3) : String("0.02");
+    setting["enable_pressure_advance"] = pa > 0.f ? "1" : "0";
 
     setting["updated_time"] = String((uint32_t)time(nullptr));
 
@@ -658,6 +841,9 @@ static Result createOneVariant(const String& token, BambuCloudAuth::Region regio
                  + "/v1/iot-service/api/slicer/setting";
     auto r = g_bambu_cloud.apiPost(region, "/v1/iot-service/api/slicer/setting",
                                    token, bodyStr);
+    dlog("CloudFil", "create '%s' (%u keys, %u B) -> HTTP %d",
+         presetName.c_str(), (unsigned)setting.size(), (unsigned)bodyStr.length(),
+         r.httpStatus);
     _absorbDiag(diagOut, "create", url, r);
     if (r.cfBlocked || r.httpStatus <= 0) return Result::Unreachable;
     if (r.httpStatus >= 400)              return Result::Rejected;
@@ -677,33 +863,49 @@ static Result createOneVariant(const String& token, BambuCloudAuth::Region regio
 
 Result createOne(const String& token, BambuCloudAuth::Region region,
                  const FilamentRecord& in, String& newCloudIdOut,
-                 Diag* diagOut) {
+                 Diag* diagOut, const String& defaultModel, float defaultNozzle) {
+    // One cloud preset per (printer, nozzle). A variant without its own
+    // printer/nozzle takes it from `cloud_inherits`, else from the
+    // default (the current printer and its installed nozzle). No
+    // variants at all = one preset for the default.
+    struct Target { FilamentVariant fv; String model; float nozzle; };
+    std::vector<Target> targets;
+    auto addTarget = [&](const FilamentVariant& fv) {
+        String model = fv.printer_model;
+        float  nozzle = fv.nozzle_diameter;
+        if (model.isEmpty() || nozzle <= 0.f) {
+            String pm; float pn = 0.f;
+            if (_parseInheritsPrinter(in.cloud_inherits, pm, pn)) {
+                if (model.isEmpty()) model  = pm;
+                if (nozzle <= 0.f)   nozzle = pn;
+            }
+        }
+        if (model.isEmpty())  model  = defaultModel;
+        if (nozzle <= 0.f)    nozzle = defaultNozzle;
+        if (model.isEmpty() || nozzle <= 0.f) return;
+        // Same name twice = HTTP 409 "setting name conflict".
+        for (const auto& t : targets)
+            if (t.model == model && fabsf(t.nozzle - nozzle) < 0.01f) return;
+        targets.push_back({fv, model, nozzle});
+    };
     auto vs = in.variants();
-    if (vs.empty()) {
-        // Degenerate: no variants — fabricate a wildcard one so the
-        // record still round-trips.
-        FilamentVariant fv;
-        fv.nozzle_temp_print         = in.nozzle_temp_max;
-        fv.nozzle_temp_initial_layer = in.nozzle_temp_min;
-        return createOneVariant(token, region, in, fv, newCloudIdOut, diagOut);
+    for (const auto& fv : vs) addTarget(fv);
+    if (targets.empty()) addTarget(FilamentVariant{});
+    if (targets.empty()) {
+        if (diagOut) diagOut->stage = "create (no printer: connect a printer or add a printer/nozzle variant)";
+        return Result::Rejected;
     }
-    // Push every variant as a separate cloud preset. The first id wins
-    // the `cloud_setting_id` slot; the caller persists `cloud_variant_ids`
-    // to track all of them.
+
+    // The first id wins the `cloud_setting_id` slot; the caller persists
+    // `cloud_variant_ids` to track all of them.
     JsonDocument idDoc;
     JsonArray arr = idDoc.to<JsonArray>();
     String firstId;
-    for (size_t i = 0; i < vs.size(); ++i) {
+    for (const auto& t : targets) {
         String thisId;
-        Result rr = createOneVariant(token, region, in, vs[i], thisId, diagOut);
-        if (rr != Result::Ok) {
-            // Roll forward — record what we have so far, but surface failure.
-            String idsJson; serializeJson(idDoc, idsJson);
-            // Caller writes cloud_variant_ids based on newCloudIdOut state;
-            // we emit the empty-on-failure form here and let the caller
-            // surface the diagnostic message.
-            return rr;
-        }
+        Result rr = createOneVariant(token, region, in, t.fv, t.model, t.nozzle,
+                                     thisId, diagOut);
+        if (rr != Result::Ok) return rr;
         arr.add(thisId);
         if (firstId.isEmpty()) firstId = thisId;
     }
@@ -713,7 +915,7 @@ Result createOne(const String& token, BambuCloudAuth::Region region,
     // for diagnostics — that way it can persist them on the local record
     // without us needing to widen this signature.
     if (diagOut) {
-        diagOut->stage = String("create (variants=") + (int)vs.size() + ")";
+        diagOut->stage = String("create (presets=") + (int)targets.size() + ")";
         diagOut->body  = idsJson;
         diagOut->httpStatus = 200;
     }

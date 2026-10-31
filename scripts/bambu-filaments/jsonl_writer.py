@@ -117,6 +117,10 @@ def _identity_from_resolved(name: str, resolved: Dict[str, Any]) -> Dict[str, An
         nt_lo = nt_hi
     if nt_hi < 0:
         nt_hi = nt_lo
+    # The print / initial-layer fallbacks aren't a range: e.g. Bambu PETG
+    # Translucent resolves to 250/245, and the AMS gets min > max.
+    if nt_lo > nt_hi:
+        nt_lo, nt_hi = nt_hi, nt_lo
 
     vendor = _unquote(resolved.get("filament_vendor", ""))
     material_type = _unquote(resolved.get("filament_type", ""))

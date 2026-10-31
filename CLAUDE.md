@@ -513,6 +513,36 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   dev_mode, auto_restore_k, track_print_consume. `?dry=1` returns the would-be
   merged record (secret masked) without saving or reloading.
 
+## Console AMS sync + user-preset cloud push
+
+- AMS identifies a filament ONLY by `tray_info_idx` (= preset `filament_id`;
+  user presets are `P` + 7 hex, shared by every nozzle variant). Studio
+  resolves a P-id only if a matching preset is in the user's cloud AND
+  compatible with the printer+nozzle.
+- `_syncSpoolToPrinter` re-pushes when the mapped spool OR its push signature
+  (`_spoolPushSig`: slicer_filament, setting_id, colour, type, temp range)
+  changes, and the "already in sync" check also compares idx + temps.
+  `_persistTrayInfoIdx` adopts the printer's idx into the spool only when the
+  printer-side value CHANGED since last seen (`_seenTrayIdx`), so a stale
+  report can't revert a fresh console edit.
+- `POST /api/user-filaments/<id>/cloud-push` assigns a `P%07x` filament_id if
+  missing, then `BambuCloudFilaments::createOne` emits one Studio-shaped
+  STANDALONE preset per (printer, nozzle): `inherits` "", template `kTemplate`
+  in `bambu_cloud_filaments.cpp` (copied from a Studio-made "Jayo PETG Matte
+  @Bambu Lab H2S" preset), vendor/type/filament_id unquoted,
+  settings_id/compatible_printers quoted, per-extruder values fanned out to
+  the `filament_extruder_variant` count (H2S 0.6 = 3 incl. E3D High Flow,
+  else Standard + High Flow), envelope version 2.8.0.9, base_id null. The
+  thin `inherits`-based preset the console used to push showed in Studio as
+  "unknown filament, generic preset used". PETG-family types get the full
+  template; other types drop the PETG-only keys (plate temps, fans, drying,
+  calibration coefs; Studio fills them from defaults) and get
+  `kMaterials` plate/fan/max-volumetric-speed values. Variants without a
+  printer/nozzle (or no variants) target the current printer (`model_code` +
+  `nozzle_diameters[0]`, connected printers first); none -> rejected with a
+  "no printer" stage. Print temp without a variant value = range midpoint.
+- `modelFromSerial`: `093` = H2S (real H2S serial 0938..., SSDP model O1S).
+
 ## Console LCD: scan -> choose destination
 
 After a spool tag scan the spool screen arms `PendingAms` (auto-claim on a
