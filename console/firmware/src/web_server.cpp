@@ -2679,11 +2679,11 @@ static void _cloudSyncTask(void* /*arg*/) {
         // sync. We need the FULL sibling-id set (not just the anchor
         // cloud_setting_id) — a single local record now maps to many
         // cloud presets via cloud_variant_ids.
-        std::map<String, String> existingByCloud;          // anchor id → local setting_id
+        std::map<String, size_t> existingByCloud;          // anchor id → index in locals
         std::vector<FilamentRecord> locals = g_user_filaments.list(0, 1000, "");
-        for (auto& local : locals) {
-            if (local.cloud_setting_id.length()) {
-                existingByCloud[local.cloud_setting_id] = local.setting_id;
+        for (size_t i = 0; i < locals.size(); ++i) {
+            if (locals[i].cloud_setting_id.length()) {
+                existingByCloud[locals[i].cloud_setting_id] = i;
             }
         }
         std::set<String> cloudIdSet;
@@ -2702,8 +2702,16 @@ static void _cloudSyncTask(void* /*arg*/) {
         for (auto& cf : cloudList) {
             auto it = existingByCloud.find(cf.cloud_setting_id);
             bool found = (it != existingByCloud.end());
-            if (found)  cf.setting_id = it->second;
-            else        cf.setting_id = cf.cloud_setting_id;
+            if (found) {
+                const FilamentRecord& local = locals[it->second];
+                cf.setting_id = local.setting_id;
+                // The pushed preset is standalone (inherits ""), so the
+                // cloud copy never carries the local parent: keep it.
+                if (cf.parent_setting_id.isEmpty()) cf.parent_setting_id = local.parent_setting_id;
+                if (cf.base_id.isEmpty())           cf.base_id           = local.base_id;
+            } else {
+                cf.setting_id = cf.cloud_setting_id;
+            }
             cf.updated_at = (uint32_t)time(nullptr);
             bool ok = g_user_filaments.upsert(cf);
             if (!ok) {

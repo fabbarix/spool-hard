@@ -532,7 +532,7 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   @Bambu Lab H2S" preset), vendor/type/filament_id unquoted,
   settings_id/compatible_printers quoted, per-extruder values fanned out to
   the `filament_extruder_variant` count (H2S 0.6 = 3 incl. E3D High Flow,
-  else Standard + High Flow), envelope version 2.8.0.9, base_id null. The
+  else Standard + High Flow; H2S 0.4/0.6 add E3D High Flow), envelope version 2.8.0.9, base_id null. The
   thin `inherits`-based preset the console used to push showed in Studio as
   "unknown filament, generic preset used". PETG-family types get the full
   template; other types drop the PETG-only keys (plate temps, fans, drying,
@@ -549,6 +549,14 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   chain (user store, then stock; max 4 levels; the stored record keeps
   inheriting), and replaces a filament_id that is empty or equal to the
   direct parent's (older picks copied it) with a fresh `P` id.
+- Cloud sync (`_cloudSyncTask`) overwrites a matched local record with the
+  cloud copy but KEEPS the local `parent_setting_id` / `base_id` when the
+  cloud copy has none (pushed presets are standalone, so the cloud never
+  carries the parent).
+- Studio AMS matching (`PresetBundle::sync_ams_list`): first preset with
+  `is_compatible && get_preset_base(f) == &f && filament_id == tray idx`;
+  extra/missing setting keys and `filament_extruder_variant` play no part.
+  A tray whose `filament_changed` is false keeps Studio's previous pick.
 - New variants start with an empty extruder list (= the per-printer list at
   push); per-extruder max-volumetric-speed / PA values <= 0 fall back to the
   material default.

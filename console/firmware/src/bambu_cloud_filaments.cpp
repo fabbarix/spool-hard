@@ -683,13 +683,13 @@ bool _isPetgFamily(const MaterialDefaults* m) {
     return m && m->cool < 0;   // the template-backed rows
 }
 
-// `filament_extruder_variant` per printer/nozzle. Verified on Studio-made
-// H2S presets: 0.2/0.4/0.8 list Standard + High Flow, 0.6 adds E3D High
-// Flow. Other printers get Standard + High Flow (Studio 2.x's common
+// `filament_extruder_variant` per printer/nozzle. Verified on Studio 2.8
+// H2S presets: 0.2/0.8 list Standard + High Flow, 0.4/0.6 add E3D High
+// Flow (older two-entry 0.4 presets still resolve). Other printers get Standard + High Flow (Studio 2.x's common
 // filament base). A variant that carries its own list wins.
 std::vector<String> _extruderVariantsFor(const String& model, float nozzle) {
     std::vector<String> v = {"Direct Drive Standard", "Direct Drive High Flow"};
-    if (model == "H2S" && fabsf(nozzle - 0.6f) < 0.01f)
+    if (model == "H2S" && (fabsf(nozzle - 0.4f) < 0.01f || fabsf(nozzle - 0.6f) < 0.01f))
         v.push_back("Direct Drive E3D High Flow");
     return v;
 }
