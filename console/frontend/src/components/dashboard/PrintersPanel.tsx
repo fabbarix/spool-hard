@@ -439,7 +439,9 @@ function AmsSlotCard({ t, active, serial, amsUnit, spool, filamentByFilamentId, 
 
   const title = [
     t.material || 'empty',
-    t.tag_uid ? `tag ${t.tag_uid}` : null,
+    // tag_uid is the Bambu RFID; third-party spools report all zeros.
+    hasRfid ? `tag ${t.tag_uid}` : null,
+    t.spool_id ? `spool ${t.spool_id}` : null,
     t.spool_override ? 'manual override' : null,
     'click to reassign',
   ].filter(Boolean).join(' · ');
