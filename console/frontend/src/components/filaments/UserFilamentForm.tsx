@@ -84,10 +84,13 @@ export function UserFilamentForm({
       ...f,
       parent_setting_id: e.setting_id ?? '',
       name:              f.name && f.name.trim() ? f.name : `${e.name} (custom)`,
-      base_id:           e.base_id        || f.base_id,
-      filament_type:     e.material       || f.filament_type,
-      filament_subtype:  e.subtype        || f.filament_subtype,
-      filament_vendor:   e.brand          || f.filament_vendor,
+      // Bambu id OF the parent: a stock row's own preset id (GFSL99), or
+      // a user preset's cloud id (empty until it has been pushed).
+      base_id:           (e.source === 'user' ? e.cloud_setting_id : e.base_id) ?? '',
+      // What the user already typed wins; the parent only fills blanks.
+      filament_type:     f.filament_type    || e.material || '',
+      filament_subtype:  f.filament_subtype || e.subtype  || '',
+      filament_vendor:   f.filament_vendor  || e.brand    || '',
       // filament_id is deliberately NOT copied: it is the AMS
       // tray_info_idx, so sharing the parent's would make the printer and
       // Studio show the parent. The cloud push assigns a fresh P-id.
@@ -207,9 +210,11 @@ export function UserFilamentForm({
         />
         <InputField label="Bambu base ID" value={form.base_id ?? ''} onChange={(e) => set('base_id', e.target.value)} />
         <InputField
-          label={fieldLabel('Bambu filament ID (tray_info_idx)', !form.filament_id && !!parent?.filament_id)}
+          // Never inherited: the AMS tells filaments apart by this id, so a
+          // custom needs its own. The cloud push assigns a fresh P-id.
+          label="Bambu filament ID (tray_info_idx)"
           value={form.filament_id ?? ''}
-          placeholder={!form.filament_id && parent?.filament_id ? `${parent.filament_id} (from parent)` : undefined}
+          placeholder="assigned on cloud push"
           onChange={(e) => set('filament_id', e.target.value)}
         />
         <NumericField label="Nozzle temp min (°C)" helper={nMin} />

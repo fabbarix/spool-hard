@@ -549,6 +549,23 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   chain (user store, then stock; max 4 levels; the stored record keeps
   inheriting), and replaces a filament_id that is empty or equal to the
   direct parent's (older picks copied it) with a fresh `P` id.
+- `base_id` = Bambu id OF the chosen parent (Studio stores the parent's
+  setting_id there): a stock parent's own preset id (family form, e.g.
+  `GFSL99`; stock rows carry it in `base_id`), a user parent's
+  `cloud_setting_id` (empty until pushed). Picking a parent fills only
+  blank type/subtype/vendor; what the user typed wins. Informational: the
+  push stays standalone.
+- Stock `filaments.jsonl` (`scripts/bambu-filaments/jsonl_writer.py`):
+  `@base` presets have no setting_id, so `base_id` is taken from a
+  per-printer sibling (`GFSA12_12` -> `GFSA12`); the
+  `filament_id`->`GFS..` pattern fails for 13 rows, never derive it.
+  Rows are keyed `"<name>"`; older builds used `"<name> @base"` and
+  `StockFilamentsStore::findById` / `findLocalParent` accept both.
+- AMS tray_info_idx for a spool = `_effectiveTrayIdx` in bambu_printer.cpp:
+  the linked user filament's CURRENT `filament_id` wins over the spool's
+  `slicer_filament` (a copy that goes stale when a push mints a new P-id);
+  it is also what `_spoolPushSig` hashes, so an id change re-pushes. The
+  web form never shows filament_id as inherited ("assigned on cloud push").
 - Cloud sync (`_cloudSyncTask`) overwrites a matched local record with the
   cloud copy but KEEPS the local `parent_setting_id` / `base_id` when the
   cloud copy has none (pushed presets are standalone, so the cloud never

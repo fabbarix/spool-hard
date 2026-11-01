@@ -26,6 +26,7 @@ export interface FilamentEntry {
   advertised?: number;     // grams
   base_id?: string;        // Bambu base preset id (e.g. "GFSA00")
   setting_id?: string;     // matches FilamentRecord::setting_id firmware-side
+  cloud_setting_id?: string; // user presets: Bambu cloud id once pushed
   source?: 'stock' | 'user';
 }
 

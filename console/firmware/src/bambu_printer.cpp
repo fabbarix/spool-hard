@@ -1351,6 +1351,18 @@ bool BambuPrinter::_maybeAssignPendingSpool(int ams_unit, int slot_id) {
     return true;
 }
 
+// tray_info_idx for a spool: its linked user filament's CURRENT
+// filament_id wins (a re-push can mint a new P-id; the spool's
+// slicer_filament is only a copy), else the spool's own value.
+static String _effectiveTrayIdx(const SpoolRecord& rec) {
+    if (rec.setting_id.length()) {
+        FilamentRecord fr;
+        if (g_user_filaments.findById(rec.setting_id, fr) && fr.filament_id.length())
+            return fr.filament_id;
+    }
+    return rec.slicer_filament;
+}
+
 // FNV-1a over the spool fields _pushAmsFilamentSetting sends.
 static uint32_t _spoolPushSig(const SpoolRecord& rec) {
     uint32_t h = 2166136261u;
@@ -1358,7 +1370,7 @@ static uint32_t _spoolPushSig(const SpoolRecord& rec) {
         for (size_t i = 0; i < v.length(); ++i) { h ^= (uint8_t)v[i]; h *= 16777619u; }
         h ^= 0x1f; h *= 16777619u;
     };
-    mix(rec.slicer_filament); mix(rec.setting_id);
+    mix(_effectiveTrayIdx(rec)); mix(rec.setting_id);
     mix(rec.color_code);      mix(rec.material_type);
     mix(String(rec.nozzle_temp_min)); mix(String(rec.nozzle_temp_max));
     return h ? h : 1;   // 0 = "never synced"
@@ -1418,11 +1430,7 @@ void BambuPrinter::_syncSpoolToPrinter(int ams_unit, int slot_id, const AmsTray&
     }
     bool material_matches = rec.material_type.length() == 0 ||
                             rec.material_type.equalsIgnoreCase(tr.tray_type);
-    String idx = rec.slicer_filament;
-    if (idx.isEmpty() && rec.setting_id.length()) {
-        FilamentRecord fr;
-        if (g_user_filaments.findById(rec.setting_id, fr)) idx = fr.filament_id;
-    }
+    String idx = _effectiveTrayIdx(rec);
     bool idx_matches = idx.isEmpty() || idx == tr.tray_info_idx;
     uint32_t tmin = 0, tmax = 0;
     resolveTemps(rec.material_type, rec.nozzle_temp_min, rec.nozzle_temp_max, tmin, tmax);
@@ -1500,8 +1508,8 @@ void BambuPrinter::_pushAmsFilamentSetting(int ams_unit, int slot_id, const Spoo
     // slot, or by a future cloud-sync that carries the field). Empty
     // string is allowed — the printer just keeps whatever idx it
     // already has bound to the slot.
-    String trayInfoIdx = rec.slicer_filament.length() ? rec.slicer_filament
-                                                      : filamentDbFilamentId;
+    String trayInfoIdx = filamentDbFilamentId.length() ? filamentDbFilamentId
+                                                       : rec.slicer_filament;
 
     // Bambu expects RGBA. Pad RRGGBB → RRGGBBFF (fully opaque) if the
     // record only stored six hex chars, which is the SpoolHard

@@ -170,6 +170,7 @@ export function userFilamentToEntry(u: UserFilament): FilamentEntry {
     density:     u.density > 0 ? u.density : undefined,
     base_id:     u.base_id || undefined,
     setting_id:  u.setting_id,
+    cloud_setting_id: u.cloud_setting_id || undefined,
     source:      'user',
   };
 }
@@ -182,7 +183,10 @@ export function findLocalParent(
   user: UserFilament[] | undefined,
 ): FilamentEntry | null {
   if (!id) return null;
-  const s = stock?.find((e) => e.setting_id === id);
+  // Older stock files keyed rows "<name> @base", current ones "<name>".
+  const alt = id.endsWith(' @base') ? id.slice(0, -' @base'.length) : `${id} @base`;
+  const s = stock?.find((e) => e.setting_id === id)
+         ?? stock?.find((e) => e.setting_id === alt);
   if (s) return s;
   const u = user?.find((r) => r.setting_id === id);
   return u ? userFilamentToEntry(u) : null;

@@ -23,7 +23,7 @@ public:
     // requiring a reboot.
     void reload();
 
-    bool findById(const String& setting_id, FilamentRecord& out) const;
+    bool findById(const String& setting_id, FilamentRecord& out) const;  // also matches "<id> @base" <-> "<id>"
 
     // Returns up to `limit` rows starting at `offset`. Optional
     // material filter (PLA / PETG / ...) compares against
@@ -35,6 +35,7 @@ public:
     bool   loaded() const { return _loaded; }
 
 private:
+    bool _findExact(const String& setting_id, FilamentRecord& out) const;
     // Memory layout: raw JSONL text in ONE PSRAM buffer + a small PSRAM
     // index (offset, len, FNV-1a of setting_id / filament_type). Rows are
     // parsed on demand by findById()/list() instead of keeping ~100

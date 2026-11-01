@@ -137,6 +137,16 @@ void StockFilamentsStore::reload() {
 }
 
 bool StockFilamentsStore::findById(const String& setting_id, FilamentRecord& out) const {
+    if (_findExact(setting_id, out)) return true;
+    // Older filaments.jsonl builds keyed rows "<name> @base"; current ones
+    // use "<name>". Parent links saved against either file keep resolving.
+    static const char kBase[] = " @base";
+    if (setting_id.endsWith(kBase))
+        return _findExact(setting_id.substring(0, setting_id.length() - (sizeof(kBase) - 1)), out);
+    return _findExact(setting_id + kBase, out);
+}
+
+bool StockFilamentsStore::_findExact(const String& setting_id, FilamentRecord& out) const {
     uint32_t h = fnv1a(setting_id);
     SemaphoreHandle_t m = lock();
     xSemaphoreTake(m, portMAX_DELAY);

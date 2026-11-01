@@ -240,6 +240,15 @@ def write_jsonl(parser, output_path: str) -> int:
     groups: Dict[str, Dict[str, Any]] = {}
     seen_variant_keys: Dict[str, set] = {}
 
+    # Bambu's preset id for each group: @base presets carry no setting_id;
+    # their per-printer siblings carry "<base>_<n>" (GFSA12_12 -> GFSA12).
+    family_ids: Dict[str, str] = {}
+    for name, raw in parser.registry.items():
+        if isinstance(raw, dict) and raw.get("type") == "filament":
+            sid = _unquote(raw.get("setting_id", ""))
+            if sid:
+                family_ids.setdefault(_group_key(name), re.sub(r"_\d+$", "", sid))
+
     for name, raw in parser.registry.items():
         if not isinstance(raw, dict):
             continue
@@ -282,6 +291,10 @@ def write_jsonl(parser, output_path: str) -> int:
                 continue
             seen_variant_keys[key].add(vkey)
             groups[key]["variants"].append(v)
+
+    for key, row in groups.items():
+        if not row["base_id"] and key in family_ids:
+            row["base_id"] = family_ids[key]
 
     rows = list(groups.values())
     rows.sort(key=lambda r: r["name"])
