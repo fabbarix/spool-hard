@@ -54,6 +54,19 @@ jobs:
           echo "base=${BASE}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${TAG} (asset URL prefix: ${BASE}/)"
 
+      # Both VERSION files must equal the tag: catches a release tagged
+      # while VERSION still says `-dev` (or the products drifted apart).
+      - name: Check VERSION matches tag
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          for p in console scale; do
+            V=$(tr -d '[:space:]' < "$p/VERSION")
+            if [[ "v$V" != "$TAG" ]]; then
+              echo "::error::$p/VERSION is '$V' but the tag is '$TAG'"
+              exit 1
+            fi
+          done
+
       # ── Toolchains ──────────────────────────────────────────
       - uses: actions/setup-node@v5
         with:

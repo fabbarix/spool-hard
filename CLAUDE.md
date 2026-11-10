@@ -241,7 +241,12 @@ product's `platformio.ini`:
 
 `FW_VERSION` / `FE_VERSION` are stamped in by
 `scripts/patch_version.py` from each product's `VERSION` file at build
-time. The library headers `#error` out if any of these macros are
+time. Between releases `VERSION` is `<next-patch>-dev` (bumped right after
+each release tag); such builds get `.<git short hash>[-dirty]` appended
+(e.g. `0.17.2-dev.07e0ace`). The OTA check orders any suffixed version
+below the bare release, so devices on a dev build take the next release.
+`update_changelog.sh` and the release workflow refuse a `-dev` VERSION /
+a VERSION that doesn't match the tag. The library headers `#error` out if any of these macros are
 missing.
 
 **NVS schema (OTA)** is owned by `spoolhard_core/src/ota.cpp` — namespace

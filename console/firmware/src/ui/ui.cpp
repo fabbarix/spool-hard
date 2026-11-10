@@ -505,6 +505,11 @@ static void build_home() {
 
     lv_obj_t* foot = make_label(s_home, LV_SYMBOL_SETTINGS "  V " FW_VERSION,
                                 COL_TEXT_MUTED, &spoolhard_mont_16);
+    // Dev builds stamp "<v>-dev.<hash>[-dirty]", too wide for the gap between
+    // hostname and IP; clip it here (device config shows the full string).
+    lv_obj_set_width(foot, 160);
+    lv_label_set_long_mode(foot, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(foot, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -12);
 
     s_lbl_ip = make_label(s_home, "—", COL_TEXT, &spoolhard_mont_16);

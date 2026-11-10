@@ -16,13 +16,19 @@ set -euo pipefail
 #
 # Typical workflow:
 #
-#   1. Bump  console/VERSION  and  scale/VERSION.
+#   1. Set  console/VERSION  and  scale/VERSION  to the release version:
+#      drop the `-dev` suffix (0.17.1-dev -> 0.17.1), or raise minor/major.
 #   2. ./scripts/update_changelog.sh
 #   3. Review the new section, edit if needed.
 #   4. git add CHANGELOG.md console/VERSION scale/VERSION
 #      git commit -m "[chore] release v$(cat console/VERSION)"
-#   5. git tag "v$(cat console/VERSION)"
+#   5. git tag -a "v$(cat console/VERSION)" -m "v$(cat console/VERSION)"
+#      (annotated: --follow-tags skips lightweight tags)
 #   6. git push --follow-tags
+#   7. Open the next cycle: set both VERSION files to the next patch with
+#      `-dev` (0.17.1 -> 0.17.2-dev), commit "[chore] start v0.17.2-dev",
+#      push. Local builds then report e.g. 0.17.2-dev.<githash>, and the
+#      next release (bare version) still counts as newer for OTA.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHANGELOG="$REPO_ROOT/CHANGELOG.md"
@@ -33,6 +39,10 @@ if [[ ! -f "$VERSION_FILE" ]]; then
   exit 1
 fi
 VERSION=$(tr -d '[:space:]' < "$VERSION_FILE")
+if [[ "$VERSION" == *-dev ]]; then
+  echo "console/VERSION is still $VERSION — set the release version first (step 1)." >&2
+  exit 1
+fi
 DATE=$(date +%Y-%m-%d)
 
 # Most recent v-prefixed tag, or empty if none.
