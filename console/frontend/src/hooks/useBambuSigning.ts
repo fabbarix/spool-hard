@@ -15,6 +15,7 @@ export interface BambuSigningStatus {
   revoked?: boolean;
   chain_certs?: number;  // certificates in the stored cert file (leaf + CAs)
   error?: string;        // stored files present but unusable
+  secret_saved?: boolean; // a cloud client secret is stored (never returned)
 }
 
 export type BambuSigningBody =
@@ -100,5 +101,44 @@ export function useStartSignTest() {
     },
     onSuccess: (res, serial) =>
       qc.setQueryData(['bambu-signing', 'printer-test', serial], res),
+  });
+}
+
+// Fetch the signing identity from the Bambu cloud with a user-supplied client
+// secret (firmware: BambuSigner::fetchStart, runs on its own task). Pass no
+// secret to re-use the one stored on the console. Resolves with the leaf serial.
+export function useFetchBambuSigning() {
+  const qc = useQueryClient();
+  return useMutation<string, Error, string | undefined>({
+    mutationFn: async (secret) => {
+      const r = await fetch('/api/bambu-signing/fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(secret ? { secret } : {}),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error ?? `request failed (${r.status})`);
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 1000));
+        const s = await fetch('/api/bambu-signing/fetch').then((x) => x.json()).catch(() => null);
+        if (!s) continue;                       // transient: device busy with TLS
+        if (s.state === 'done') return s.message as string;
+        if (s.state === 'failed') throw new Error(s.message || 'fetch failed');
+      }
+      throw new Error('timed out waiting for the console');
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ['bambu-signing'] }),
+  });
+}
+
+export function useForgetBambuSecret() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const r = await fetch('/api/bambu-signing/secret', { method: 'DELETE' });
+      if (!r.ok) throw new Error(`request failed (${r.status})`);
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bambu-signing'] }),
   });
 }

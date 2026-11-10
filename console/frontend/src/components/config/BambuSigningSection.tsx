@@ -8,7 +8,7 @@ import { Button } from '@spoolhard/ui/components/Button';
 import { ConfirmDialog } from '@spoolhard/ui/components/ConfirmDialog';
 import {
   useBambuSigning, useSaveBambuSigning, useRemoveBambuSigning,
-  useSignTest, useStartSignTest, type BambuSigningStatus,
+  useSignTest, useStartSignTest, useFetchBambuSigning, useForgetBambuSecret, type BambuSigningStatus,
 } from '../../hooks/useBambuSigning';
 import { usePrinters } from '../../hooks/usePrinters';
 import { parseCertPem, parseCrlPem, daysFromNow } from './pemInfo';
@@ -110,6 +110,7 @@ export function BambuSigningSection() {
             )}
         />
       )}
+      <CloudFetch saved={!!data?.secret_saved} onDone={() => setShowInstall(false)} />
       {remove.isError && <div className="text-xs text-status-error">{remove.error.message}</div>}
 
       <ConfirmDialog
@@ -123,6 +124,72 @@ export function BambuSigningSection() {
         onCancel={() => setConfirmRemove(false)}
       />
     </SectionCard>
+  );
+}
+
+// ------------------------------------------------------------ cloud fetch
+
+// Alternative to uploading the three files: the console asks the Bambu cloud
+// for the shared slicer identity using a client secret the user provides.
+function CloudFetch({ saved, onDone }: { saved: boolean; onDone: () => void }) {
+  const fetchIdentity = useFetchBambuSigning();
+  const forget = useForgetBambuSecret();
+  const [secret, setSecret] = useState('');
+  const [changing, setChanging] = useState(false);
+  const useStored = saved && !changing;
+
+  return (
+    <form
+      className="rounded-card border border-surface-border bg-surface-input p-3"
+      onSubmit={(e) => {
+        e.preventDefault();
+        fetchIdentity.mutate(useStored ? undefined : secret.trim(), {
+          onSuccess: () => { setSecret(''); setChanging(false); onDone(); },
+        });
+      }}
+    >
+      <div className="flex items-center gap-2 text-sm font-medium text-text-primary">
+        <KeyRound size={15} /> Fetch from Bambu cloud
+      </div>
+      <p className="mt-1 text-xs leading-relaxed text-text-muted">
+        The console downloads the certificate chain, key and CRL itself using your client secret.
+        The secret is stored on the console (never shown, never in backups) so renewing is one click.
+      </p>
+      <div className="mt-2 flex gap-2">
+        {useStored ? (
+          <div className="flex-1 self-center text-xs text-text-secondary">Client secret saved</div>
+        ) : (
+          <input
+            type="password"
+            value={secret}
+            onChange={(e) => setSecret(e.target.value)}
+            placeholder="Client secret"
+            autoComplete="off"
+            spellCheck={false}
+            disabled={fetchIdentity.isPending}
+            className="min-w-0 flex-1 rounded-md border border-surface-border bg-surface-body px-2 py-1.5 font-mono text-xs text-text-primary focus:outline-none focus:ring-1 focus:ring-brand-500"
+          />
+        )}
+        <Button type="submit" variant="secondary" className="!px-3 !py-1.5 text-xs"
+          disabled={(!useStored && !secret.trim()) || fetchIdentity.isPending}>
+          {fetchIdentity.isPending
+            ? <span className="inline-flex items-center gap-1"><Loader2 size={13} className="animate-spin" /> Fetching…</span>
+            : useStored ? 'Fetch new certificate' : 'Fetch'}
+        </Button>
+      </div>
+      {saved && (
+        <div className="mt-2 flex gap-3 text-xs">
+          <button type="button" className="text-text-muted underline-offset-2 hover:text-text-primary hover:underline"
+            onClick={() => setChanging((c) => !c)}>{changing ? 'Use saved secret' : 'Change secret'}</button>
+          <button type="button" disabled={forget.isPending}
+            className="text-text-muted underline-offset-2 hover:text-status-error hover:underline"
+            onClick={() => forget.mutate()}>Forget secret</button>
+        </div>
+      )}
+      {fetchIdentity.isError && (
+        <div className="mt-2 break-words text-xs text-status-error">{fetchIdentity.error.message}</div>
+      )}
+    </form>
   );
 }
 

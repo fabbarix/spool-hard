@@ -1,12 +1,17 @@
 #include <atomic>
 #include "bambu_signer.h"
 
+#include <bambuclient/appcert.hpp>
+
 #include <LittleFS.h>
+#include <Preferences.h>
+#include <esp_heap_caps.h>
 #include <esp_random.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/platform_util.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509_crl.h>
 #include <mbedtls/x509_crt.h>
@@ -230,6 +235,118 @@ String install(const String& certPem, const String& keyPem, const String& crlPem
     LittleFS.remove(kOffPath);   // a fresh install is enabled
     load();
     return "";
+}
+
+namespace {
+
+SemaphoreHandle_t         s_fetchMtx = nullptr;
+BambuSigner::FetchStatus  s_fetch;
+
+struct FetchLock {
+    FetchLock() {
+        if (!s_fetchMtx) {   // CAS: first user creates it, a loser deletes its copy
+            SemaphoreHandle_t m = xSemaphoreCreateMutex(), expected = nullptr;
+            if (!__atomic_compare_exchange_n(&s_fetchMtx, &expected, m, false,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                vSemaphoreDelete(m);
+        }
+        xSemaphoreTake(s_fetchMtx, portMAX_DELAY);
+    }
+    ~FetchLock() { xSemaphoreGive(s_fetchMtx); }
+};
+
+void setFetch(BambuSigner::FetchState st, const String& msg) {
+    FetchLock l;
+    s_fetch.state   = st;
+    s_fetch.message = msg;
+}
+
+constexpr const char* kSecretNs  = "bambu_sign";
+constexpr const char* kSecretKey = "secret";
+
+std::string loadSecret() {
+    Preferences p;
+    std::string out;
+    if (p.begin(kSecretNs, true)) {
+        String v = p.getString(kSecretKey, "");
+        out = v.c_str();
+        p.end();
+    }
+    return out;
+}
+
+void saveSecret(const std::string& v) {
+    Preferences p;
+    if (p.begin(kSecretNs, false)) { p.putString(kSecretKey, v.c_str()); p.end(); }
+}
+
+void fetchTask(void* arg) {
+    std::string secret(static_cast<std::string*>(arg)->c_str());
+    mbedtls_platform_zeroize(&(*static_cast<std::string*>(arg))[0],
+                             static_cast<std::string*>(arg)->size());
+    delete static_cast<std::string*>(arg);
+    dlog("Sign", "cloud fetch started");
+
+    bambuclient::AppCertCredentials creds;
+    std::string err;
+    bool ok = bambuclient::fetch_appcert(&creds, secret, &err);
+    if (!ok) {
+        dlog("Sign", "cloud fetch failed: %s", err.c_str());
+        setFetch(BambuSigner::FetchState::Failed, err.c_str());
+    } else {
+        String e = BambuSigner::install(creds.cert_pem.c_str(), creds.key_pem.c_str(),
+                                        creds.crl_pem.c_str());
+        if (e.length()) {
+            dlog("Sign", "cloud fetch install failed: %s", e.c_str());
+            setFetch(BambuSigner::FetchState::Failed, "install: " + e);
+        } else {
+            dlog("Sign", "cloud fetch installed leaf serial %s", creds.leaf_serial.c_str());
+            if (secret != loadSecret()) saveSecret(secret);   // only a working secret is kept
+            setFetch(BambuSigner::FetchState::Done, creds.leaf_serial.c_str());
+        }
+    }
+    mbedtls_platform_zeroize(&creds.key_pem[0], creds.key_pem.size());
+    mbedtls_platform_zeroize(&secret[0], secret.size());
+    vTaskDelete(nullptr);
+}
+
+}  // namespace
+
+bool secretSaved() { return !loadSecret().empty(); }
+
+void forgetSecret() {
+    Preferences p;
+    if (p.begin(kSecretNs, false)) { p.remove(kSecretKey); p.end(); }
+}
+
+String fetchStart(const String& given) {
+    String secret = given;
+    if (secret.isEmpty()) secret = loadSecret().c_str();
+    if (secret.isEmpty()) return "no secret: enter one";
+    // TLS handshake working memory comes from internal DRAM (same gate as
+    // the OTA checker): refuse rather than OOM-panic.
+    constexpr size_t kMinFreeInternal = 50 * 1024;
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < kMinFreeInternal)
+        return "not enough free memory, try again in a minute";
+    {
+        FetchLock l;
+        if (s_fetch.state == FetchState::Running) return "a fetch is already running";
+        s_fetch.state   = FetchState::Running;
+        s_fetch.message = "";
+    }
+    auto* arg = new std::string(secret.c_str());
+    if (xTaskCreatePinnedToCore(fetchTask, "sign_fetch", 12 * 1024, arg, 1, nullptr, 1) != pdPASS) {
+        mbedtls_platform_zeroize(&(*arg)[0], arg->size());
+        delete arg;
+        setFetch(FetchState::Failed, "could not start task");
+        return "could not start task";
+    }
+    return "";
+}
+
+FetchStatus fetchStatus() {
+    FetchLock l;
+    return s_fetch;
 }
 
 void setEnabled(bool on) {

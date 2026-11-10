@@ -54,6 +54,24 @@ bool enabled();
 // Bumped on every install / enable / disable / remove (cheap to poll).
 uint32_t generation();
 
+// Fetch the shared slicer identity (cert chain + key + CRL) from the Bambu
+// cloud with the user's own CLIENT SECRET (bambuclient::fetch_appcert,
+// lib/bambuclient) and install it like a manual upload. The secret is kept
+// in NVS (namespace "bambu_sign", NOT part of backups, never logged or
+// returned by any API) so a renewal is one click. Runs on its own task (TLS
+// + RSA); poll fetchStatus(). fetchStart(secret) uses and, on success,
+// stores a new secret; an empty `secret` uses the stored one. Returns ""
+// when started, else a user-facing reason.
+bool secretSaved();
+void forgetSecret();
+enum class FetchState : uint8_t { Idle, Running, Done, Failed };
+struct FetchStatus {
+    FetchState state = FetchState::Idle;
+    String     message;       // Done: leaf serial; Failed: the error
+};
+String      fetchStart(const String& secret);
+FetchStatus fetchStatus();
+
 // Build the signed MQTT payload for `{"<topKey>": inner}`. Returns false
 // (out untouched) when signing is off or fails -> caller publishes the
 // unsigned form. `toSign` (optional) receives the signed bytes.

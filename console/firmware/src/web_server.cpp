@@ -1014,6 +1014,45 @@ void ConsoleWebServer::_setupRoutes() {
             if (!p) { req->send(404, "application/json", "{\"error\":\"unknown printer\"}"); return; }
             sendSignTest(req, 200, p);
         });
+    // Fetch the signing identity from the Bambu cloud using a client secret
+    // the user supplies ({"secret":"..."}; used once, never stored). The
+    // work runs on its own task: POST answers 202, GET polls
+    // {state: idle|running|done|failed, message}.
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing/fetch"), HTTP_POST,
+        [](AsyncWebServerRequest*) {}, nullptr,
+        [this](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total) {
+            if (index == 0 && !_requireAuth(req)) return;
+            if (!_accumulateBody(req, data, len, index, total, 1024)) return;
+            // Body {"secret":"…"} uses/stores a new secret; {} (or no secret) re-uses the stored one.
+            JsonDocument body;
+            if (deserializeJson(body, (const char*)req->_tempObject, total)) {
+                req->send(400, "application/json", "{\"error\":\"invalid JSON\"}");
+                return;
+            }
+            String err = BambuSigner::fetchStart(body["secret"] | "");
+            if (err.length()) {
+                JsonDocument e; e["error"] = err;
+                String s; serializeJson(e, s);
+                req->send(409, "application/json", s);
+                return;
+            }
+            req->send(202, "application/json", "{\"state\":\"running\",\"message\":\"\"}");
+        });
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing/secret"), HTTP_DELETE, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        BambuSigner::forgetSecret();
+        _sendSigningStatus(req, 200);
+    });
+    _server.on(AsyncURIMatcher::exact("/api/bambu-signing/fetch"), HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_requireAuth(req)) return;
+        static const char* kNames[] = { "idle", "running", "done", "failed" };
+        BambuSigner::FetchStatus f = BambuSigner::fetchStatus();
+        JsonDocument doc;
+        doc["state"]   = kNames[(int)f.state];
+        doc["message"] = f.message;
+        String out; serializeJson(doc, out);
+        req->send(200, "application/json", out);
+    });
     _server.on(AsyncURIMatcher::exact("/api/bambu-signing"), HTTP_GET, [this](AsyncWebServerRequest* req) {
         if (!_requireAuth(req)) return;
         _sendSigningStatus(req, 200);
@@ -2083,6 +2122,7 @@ void ConsoleWebServer::_sendSigningStatus(AsyncWebServerRequest* req, int code) 
     JsonDocument doc;
     doc["configured"] = st.configured;
     doc["enabled"]    = st.enabled;
+    doc["secret_saved"] = BambuSigner::secretSaved();
     if (st.configured) {
         doc["cert_id"]    = st.cert_id;
         doc["subject"]    = st.subject;

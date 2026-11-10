@@ -1,0 +1,6 @@
+{
+  "name": "bambuclient",
+  "version": "1.0.0",
+  "description": "Bambu Lab cloud app-cert fetch (appcert_fetch), mbedtls port",
+  "build": { "flags": "-std=gnu++17" }
+}

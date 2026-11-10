@@ -507,6 +507,18 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   ms on loopTask, only per pushed command. Local probing without the console:
   paho-mqtt to `<printer>:8883` user `bblp` / access code, TLS unverified.
   Test certs live in repo-root `/secrets/` (gitignored, never commit).
+  **Cloud fetch**: instead of uploading the three files, `POST /api/bambu-signing/fetch
+  {"secret":"..."}` (202; 409 busy/low DRAM <50 KB) runs `BambuSigner::fetchStart` ->
+  `sign_fetch` task (12 KB, core 1) -> `bambuclient::fetch_appcert` (vendored in
+  `console/firmware/lib/bambuclient/`, port of /opt/mrwho/Projects/bambulab/bambuclient from
+  OpenSSL+curl to mbedtls+HTTPClient; see its README) -> `BambuSigner::install`. The
+  CLIENT SECRET IS ALWAYS USER-SUPPLIED (the repo embeds none; never put it in git, docs, tests or
+  .env-tracked files). After a successful fetch it is kept in NVS ns `bambu_sign` key `secret`
+  (not in `_backupSource()`, never logged or returned; `secret_saved` bool in
+  `GET /api/bambu-signing`); an empty POST body re-uses it, `DELETE /api/bambu-signing/secret`
+  forgets it. `GET` polls `{state: idle|running|done|failed, message}`. Endpoint is on
+  api.bambulab.com, so the Cloudflare TLS-fingerprint block (see memory) may reject the
+  ESP32: failure shows the HTTP status/body prefix; uploading the files stays the fallback.
 - `POST /api/printers` MERGES onto the stored record by serial
   (`PrinterConfig::fromJson` only overwrites fields present in the body), so the
   Config page's partial save (name/serial/ip/access_code) keeps ams_overrides,
