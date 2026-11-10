@@ -453,7 +453,9 @@ asleep), and `[ScaleLink][ws]` logs only anomalies + a 60 s summary.
   dashboard card. No retry loop; `POST /api/printers/<serial>/resync` clears the
   per-slot "last synced" cache so the next report re-pushes.
 - Developer Mode reminder: `PrinterState::dev_mode` (0 unknown / 1 off / 2 on)
-  is probed on every MQTT connect (`_sendDevModeProbe`): an UNSIGNED
+  is probed on every MQTT connect ONLY while signing is off
+  (`_sendDevModeProbe`; with signing on the rejected probe made Studio report
+  a badly signed command on each console restart): an UNSIGNED
   `print.command` with a random name; the printer checks signatures before
   command lookup, so err 84033543 -> off, success -> on (safe mid-print). Also
   derived in `_recordCommandAck` from unsigned control acks (pushall and signed

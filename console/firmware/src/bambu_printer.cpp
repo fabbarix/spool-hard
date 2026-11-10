@@ -332,7 +332,12 @@ void BambuPrinter::_ensureConnected() {
             String topic = "device/" + _cfg.serial + "/report";
             _mqtt->subscribe(topic.c_str());
             requestFullStatus();
-            _sendDevModeProbe();
+            // The probe is an UNSIGNED print command; with Developer Mode
+            // off the printer rejects it (84033543) and Bambu Studio shows
+            // that as a badly signed command on every console restart.
+            // With signing on our commands work either way, so skip it and
+            // keep the persisted dev_mode.
+            if (!BambuSigner::enabled()) _sendDevModeProbe();
             _certStart("connected");
         } else {
             _state.link = BambuLinkState::Failed;
