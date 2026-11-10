@@ -2847,7 +2847,7 @@ void BambuPrinter::_handleGcodeStateTransition(const String& prev, const String&
     // Print ended (terminal transition). Commit consumption once.
     if (_isActiveGcodeState(prev) && _isTerminalGcodeState(now)) {
         if (_analysisCommitted) return;
-        _commitPrintConsumption();
+        _commitPrintConsumption(now == "FINISH");
         _analysisCommitted = true;
     }
 }
@@ -2944,14 +2944,20 @@ String BambuPrinter::_jobKey() const {
     return String();
 }
 
-void BambuPrinter::_commitPrintConsumption() {
+void BambuPrinter::_commitPrintConsumption(bool finished) {
     if (!_lastAnalysis.valid) {
         Serial.printf("[Bambu %s] print ended but no valid analysis — nothing to commit\n",
                       _cfg.serial.c_str());
         return;
     }
-    _commitConsumptionTo(100, _jobKey(), "print-end");
-    _progressCommittedPct = 100;
+    // FINISH bills the whole job. A cancelled / failed print (FAILED or
+    // IDLE) only used filament up to the progress it reached: this report's
+    // mc_percent is applied after the transition, so progress_pct is still
+    // the last value seen while printing.
+    int pct = finished ? 100 : _state.progress_pct;
+    if (pct < _progressCommittedPct) pct = _progressCommittedPct;
+    _commitConsumptionTo(pct, _jobKey(), finished ? "print-end" : "print-stopped");
+    _progressCommittedPct = pct;
 }
 
 void BambuPrinter::_commitIncrementalConsumption() {

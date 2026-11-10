@@ -715,6 +715,19 @@ ftp_dl.bin write + download, /api/logs/{current,previous}, crash downloads,
 backup/restore, storage migration, boot-time first-boot migration.
 New SD code must take the lock.
 
+## Print consumption tracking (console)
+
+`GCodeAnalyzer` (`console/firmware/src/gcode_analyzer.cpp`) bills NET
+extrusion: a retraction becomes a per-tool debt (`_retractDebt`) that later
+positive E repays before anything counts. Counting only positive E (the old
+code) billed every unretract and over-counted PETG prints by 30-45%
+(Coffee Clip: 115.4 g vs slicer used_g 88.6 g; net = 88.7 g). Host test with
+real plate gcode: `console/firmware/test/host/test_gcode_analyzer.cpp` (g++
+one-liner in header; `test/host/stubs/Arduino.h` supplies String). On a
+terminal transition `_commitPrintConsumption(finished)` bills 100% only on
+FINISH; FAILED / IDLE (stopped) bill up to the last `progress_pct` seen while
+printing (the report's mc_percent is applied after the transition handler).
+
 ## Gcode-analysis inflate placement measurement (console only)
 
 `analyseRemote()` times every run (`InflateStats` in `bambu_printer.h`:

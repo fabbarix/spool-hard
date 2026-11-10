@@ -510,10 +510,11 @@ private:
     // How much of the current print's predicted per-tool grams has already
     // been pushed into each mapped spool's consumed_since_weight. Reset to 0
     // on RUNNING entry; bumped in 5% steps by _commitIncrementalConsumption
-    // as `print.mc_percent` advances. The terminal commit applies the
-    // remaining (100 - _progressCommittedPct) fraction so the total still
+    // as `print.mc_percent` advances. On FINISH the terminal commit applies
+    // the remaining (100 - _progressCommittedPct) fraction so the total still
     // matches the analysis' predicted grams regardless of how finely we
-    // stepped during the print.
+    // stepped during the print; FAILED / IDLE only bill up to the last
+    // progress reached.
     int    _progressCommittedPct = 0;
 
     static SpoolAssignedCb s_onSpoolAssigned;
@@ -560,7 +561,7 @@ private:
     // re-analyses); falls back to gcode_file when task_id is empty or
     // "0" (older firmwares, edge cases). Empty when no active print.
     String _jobKey() const;
-    void _commitPrintConsumption();
+    void _commitPrintConsumption(bool finished);   // false: bill to last progress only
     // Called once per BambuPrinter::loop() tick to spawn a retry of
     // analyseRemote when the previous attempt hit a memory-pressure
     // failure. Needs to live alongside the task trampoline at the bottom

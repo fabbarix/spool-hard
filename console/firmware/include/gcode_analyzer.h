@@ -71,6 +71,10 @@ private:
     float      _densities[MAX_TOOLS];
     float      _totalG  = 0.f;
     float      _totalMm = 0.f;
+    // Per-tool mm retracted and not yet pushed back. A retract/unretract
+    // pair moves no filament out of the nozzle, so positive E only counts
+    // once this debt is repaid (net extrusion, matches the slicer's used_g).
+    float      _retractDebt[MAX_TOOLS];
     int        _swaps   = 0;
 
     // Percent→cumulative-mm table, snapshotted on each `M73 P<n>` marker.

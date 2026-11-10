@@ -21,6 +21,7 @@ void GCodeAnalyzer::reset() {
         _tools[i] = ToolUsage{};
         _diameters[i] = DEFAULT_DIAMETER;
         _densities[i] = DEFAULT_DENSITY;
+        _retractDebt[i] = 0.f;
         _slicerSlots[i] = SlicerSlot{};
     }
     for (int p = 0; p < PCT_SLOTS; ++p) {
@@ -44,8 +45,16 @@ void GCodeAnalyzer::setDensity(int tool, float d) {
 }
 
 void GCodeAnalyzer::_addExtrusion(float delta_mm) {
-    if (delta_mm <= 0.f) return;  // retractions don't count toward usage
     if (_active < 0 || _active >= MAX_TOOLS) return;
+    // Net extrusion: a retraction is owed back before positive E counts,
+    // else every unretract (thousands per print) is billed as usage
+    // (+30% on PETG prints vs Bambu's used_g).
+    float& debt = _retractDebt[_active];
+    if (delta_mm < 0.f) { debt -= delta_mm; return; }
+    const float repay = delta_mm < debt ? delta_mm : debt;
+    debt     -= repay;
+    delta_mm -= repay;
+    if (delta_mm <= 0.f) return;
     _tools[_active].mm += delta_mm;
     _totalMm += delta_mm;
     // Running grams update so callers polling totalGrams() during a
