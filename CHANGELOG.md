@@ -8,6 +8,42 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.17.0] - 2026-11-10
+
+**New**
+- Console: command signing can fetch the Bambu app certificate from the
+  cloud. Under Config -> Printers -> Command signing, enter your client
+  secret instead of uploading the three files; the console downloads and
+  installs the certificate. The secret is remembered (never shown, logged
+  or included in backups) so renewal is one click, and can be forgotten.
+- Console: a user filament can be based on another of your own presets,
+  not only a stock one. Values you leave unset (temperatures, density,
+  type, vendor, variants) are filled from the parent chain when the
+  preset is pushed to the cloud.
+
+**Changes**
+- Console: presets pushed to Bambu Cloud are now full standalone presets
+  shaped like the ones Bambu Studio creates, so Studio recognises them
+  instead of showing "unknown filament, generic preset used".
+- Console: a filament's base ID is now the parent's own Bambu ID, and
+  spools always follow their filament's current ID.
+- Console: AMS tile tooltips show the spool ID; the tag is shown only for
+  a real Bambu RFID tag.
+- Console: H2S 0.4 nozzle presets list E3D High Flow, as Studio does.
+
+**Fixes**
+- Console: print consumption over-counted by 30-45% (every unretract was
+  billed as usage). It now bills net extrusion and matches the slicer's
+  estimate within 0.3%. Stopped or failed prints bill only up to the
+  progress reached.
+- Console: a mapped AMS spool is re-sent to the printer when its settings
+  change, and the printer's own filament choice no longer overwrites a
+  fresh edit on the console. Inverted nozzle temperature ranges are fixed.
+- Console: Bambu Cloud sync no longer drops a filament's local parent.
+- Console: with command signing on, the console no longer sends an
+  unsigned Developer Mode probe at startup, which made Bambu Studio report
+  a badly signed command on every console restart.
+
 ## [0.16.0] - 2026-10-30
 
 **New**
