@@ -8,6 +8,23 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.17.1] - 2026-11-22
+
+**Changes**
+- Console: when a new spool is created by duplicating an existing one, the
+  new-tag wizard now offers the color step too. It opens with the source
+  spool's color selected; tap a swatch to change it or Keep to leave it.
+- Console: development builds show their exact build in Device -> Info
+  (for example `0.17.2-dev.1a2b3c4`); the footer shows `V 0.17.2-dev`.
+  Official releases still update devices running a development build.
+
+**Fixes**
+- Console: a spool created with Duplicate lost its filament preset, so the
+  AMS slot reached Bambu Studio as plain "PETG" instead of the preset. It
+  now keeps the source spool's preset, temperatures and density. A stock
+  filament picked with New filament is also recognized in Studio now.
+- Console: the version in the screen footer no longer wraps onto two lines.
+
 ## [0.17.0] - 2026-11-10
 
 **New**
