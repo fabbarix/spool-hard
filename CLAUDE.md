@@ -613,8 +613,9 @@ on the `lvgl` task, so they must only validate/queue, never publish or block.
 **New-tag wizard colour step** (`ui_wizard.cpp`, `kColors`): fixed 15-swatch
 palette (3 x 5, 84x52 px, name inside, black/white text by higher WCAG contrast), sets
 `color_name` + `color_code` (uppercase RRGGBB). Shown after the filament pick
-on the New-filament path (Skip keeps the tag hint / grey `cccccc`); Duplicate
-skips it. The Done screen's colour chip (filled with the current colour)
+on the New-filament path (Skip keeps the tag hint / grey `cccccc`) and after
+the template pick on the Duplicate path (preselected with the source spool's
+colour; the Skip button reads "Keep"). The Done screen's colour chip (filled with the current colour)
 reopens it on both paths and returns to Done.
 
 **New-tag wizard filament picker**: Type (PLA/PETG/ABS/TPU/Other/All; Other =

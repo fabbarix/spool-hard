@@ -71,7 +71,7 @@ struct WizardCtx {
     String     final_color_name;
     String     final_color_hex;
     String     final_setting_id;          // Filament preset ref (PFUL/PFUS), "" = none
-    bool       via_color        = false;  // color step shown after filament pick (Back target)
+    bool       via_color        = false;  // color step shown after filament / template pick (Back target)
     int        final_advertised = -1;
     int        final_core       = -1;
     int        final_current    = -1;
@@ -306,6 +306,7 @@ static void on_template(lv_event_t* e) {
             return;
         case OP_DUPLICATE:
             s_wiz.use_template = true;
+            s_wiz.via_color    = false;
             show_pick();
             return;
         case OP_BACK:
@@ -370,7 +371,9 @@ static void on_pick(lv_event_t* e) {
             // Empty screens can offer a one-tap "same as template" shortcut.
             s_wiz.template_core     = rec.weight_core;
         }
-        show_state();
+        // Colour step next, preselected with the source spool's colour
+        // (Keep leaves it unchanged).
+        show_color(false);
         return;
     }
 }
@@ -834,8 +837,9 @@ static void show_filament_pick() {
 //
 // Fixed palette of common filament colours, 3 x 5 swatches. One tap sets
 // colour hex + name. Shown after the filament pick (New filament path) and
-// from the Done screen's colour chip (both paths); Duplicate already copied
-// the source spool's colour so it skips the step.
+// and after the template pick (Duplicate path: preselected with the source
+// spool's colour, whose Skip reads "Keep"), and from the Done screen's colour
+// chip (both paths).
 
 struct ColorSwatch { const char* name; const char* hex; };
 static const ColorSwatch kColors[] = {
@@ -875,7 +879,8 @@ static void on_color(lv_event_t* e) {
         s_wiz.final_color_name = c.name;
         s_wiz.final_color_hex  = c.hex;
     } else if (op == OP_BACK && !s_color_from_done) {
-        show_filament_pick();
+        if (s_wiz.use_template) show_pick();
+        else                    show_filament_pick();
         return;
     }
     // Swatch, Skip, or Back from the Done chip.
@@ -925,6 +930,8 @@ static void show_color(bool from_done) {
     // From Done, Back already means "keep the current colour".
     if (from_done) lv_obj_add_flag(s_color_skip, LV_OBJ_FLAG_HIDDEN);
     else           lv_obj_clear_flag(s_color_skip, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(lv_obj_get_child(s_color_skip, 0),
+                      s_wiz.use_template ? "Keep" : "Skip");
     lv_screen_load(s_scr_color);
     lv_unlock();
 }
@@ -937,9 +944,9 @@ static void on_state(lv_event_t* e) {
         case OP_STATE_USED:  s_wiz.spool_state = SS_USED;  show_used();  return;
         case OP_STATE_EMPTY: s_wiz.spool_state = SS_EMPTY; show_empty(); return;
         case OP_BACK:
-            if (s_wiz.use_template)   show_pick();
-            else if (s_wiz.via_color) show_color(false);
-            else                      show_template();
+            if (s_wiz.via_color)         show_color(false);
+            else if (s_wiz.use_template) show_pick();
+            else                         show_template();
             return;
     }
 }
