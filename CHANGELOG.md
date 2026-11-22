@@ -8,6 +8,16 @@ New entries are appended automatically by `scripts/update_changelog.sh`,
 which pulls commit subjects from `git log <previous-tag>..HEAD` and drops
 anything tagged `[chore]`. See the script header for the full release flow.
 
+## [0.18.0] - 2026-11-22
+
+**Fixes**
+- Console: print consumption was billed to the wrong spool when the printer
+  still had the previous job's filament loaded as the print started (the
+  H2S swaps to the job's AMS slot only later). Single-filament prints now
+  follow the slot that is actually feeding. If the printer switches slots
+  mid-print (e.g. AMS auto-refill), the first spool keeps what it used and
+  the new one is billed only for the rest.
+
 ## [0.17.1] - 2026-11-22
 
 **Changes**
