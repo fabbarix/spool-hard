@@ -764,6 +764,9 @@ void BambuPrinter::_parseReport(const JsonDocument& doc) {
             _parseExternalTray(pick, (id == 254 || id == 255) ? id : 255, /*vir_slot*/ true);
         }
     }
+
+    // After active_tray + the tray mappings are up to date for this report.
+    _followSingleToolTray();
 }
 
 void BambuPrinter::_parseExternalTray(const JsonObjectConst& vt, int wire_id, bool vir_slot) {
@@ -2963,6 +2966,61 @@ void BambuPrinter::_commitPrintConsumption(bool finished) {
     if (pct < _progressCommittedPct) pct = _progressCommittedPct;
     _commitConsumptionTo(pct, _jobKey(), finished ? "print-end" : "print-stopped");
     _progressCommittedPct = pct;
+}
+
+// Single-tool prints bind their one tool to the tray feeding when the
+// analysis finishes (resolveTray step 0). On the H2S that is often still
+// the PREVIOUS job's filament: the analysis lands ~30 s in, before the
+// printer swaps to the job's slot, so the whole print was billed to the
+// wrong spool. Follow the live feeding tray instead (loopTask, after every
+// report). Before anything is billed (_progressCommittedPct == 0) a plain
+// rebind. After that (mid-print switch, e.g. AMS auto-refill to a backup
+// slot) the old spool keeps what it was billed and the new spool's job
+// mark starts at the grams committed so far, so it only gets the rest.
+void BambuPrinter::_followSingleToolTray() {
+    if (_analysisInProgress || !_lastAnalysis.valid) return;
+    if (_lastAnalysis.tool_count != 1) return;
+    if (!_isActiveGcodeState(_state.gcode_state)) return;
+
+    const int at = _state.active_tray;
+    int unit, slot;
+    const AmsTray* tr;
+    if (at == 254 && _state.has_vt_tray) {
+        unit = 254; slot = 0; tr = &_state.vt_tray;
+    } else if (at >= 0 && at < 16 && at / 4 < _state.ams_count) {
+        unit = at / 4; slot = at % 4; tr = &_state.ams[unit].trays[slot];
+    } else {
+        return;   // nothing loaded / unknown: keep the current binding
+    }
+
+    GcodeAnalysisTool& t = _lastAnalysis.tools[0];
+    if (t.ams_unit == unit && t.slot_id == slot && t.spool_id == tr->mapped_spool_id) return;
+
+    const String old_spool = t.spool_id;
+    const int old_unit = t.ams_unit, old_slot = t.slot_id;
+    t.ams_unit = unit;
+    t.slot_id  = slot;
+    t.spool_id = tr->mapped_spool_id;
+    t.material = tr->tray_type;
+    t.color    = tr->tray_color;
+
+    float handover_g = 0.f;
+    if (_progressCommittedPct > 0 && t.spool_id.length()) {
+        const String key = _jobKey();
+        SpoolRecord rec;
+        if (key.length() && g_store.findById(t.spool_id, rec) &&
+            rec.last_committed_job != key) {
+            handover_g = _deltaGrams(_lastAnalysis, t, 0, _progressCommittedPct);
+            rec.last_committed_job   = key;
+            rec.last_committed_grams = handover_g;
+            g_store.upsert(rec);
+        }
+    }
+    dlog("consume", "%s single-tool tray %d:%d -> %d:%d, spool %s -> %s (at %d%%, handover %.1fg)",
+         _cfg.serial.c_str(), old_unit, old_slot, unit, slot,
+         old_spool.length() ? old_spool.c_str() : "-",
+         t.spool_id.length() ? t.spool_id.c_str() : "-",
+         _progressCommittedPct, handover_g);
 }
 
 void BambuPrinter::_commitIncrementalConsumption() {

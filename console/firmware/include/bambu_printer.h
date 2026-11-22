@@ -574,4 +574,6 @@ private:
     // and the current `mc_percent` (quantised to 5% steps to cap flash
     // wear) into each mapped spool's consumed_since_weight.
     void _commitIncrementalConsumption();
+    // Single-tool prints: follow the live feeding tray (see .cpp).
+    void _followSingleToolTray();
 };

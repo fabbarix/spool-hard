@@ -751,6 +751,12 @@ one-liner in header; `test/host/stubs/Arduino.h` supplies String). On a
 terminal transition `_commitPrintConsumption(finished)` bills 100% only on
 FINISH; FAILED / IDLE (stopped) bill up to the last `progress_pct` seen while
 printing (the report's mc_percent is applied after the transition handler).
+Single-tool prints bind the tool to the feeding tray (`active_tray`), but the
+analysis finishes ~30 s in, while the H2S still has the PREVIOUS job's
+filament loaded. `_followSingleToolTray()` (end of every `_parseReport`)
+re-binds to the live feeding tray. Before the first commit this is a plain
+rebind. After it (e.g. AMS auto-refill) the old spool keeps its grams and
+the new spool's job mark is seeded at the grams committed so far.
 
 ## Gcode-analysis inflate placement measurement (console only)
 
