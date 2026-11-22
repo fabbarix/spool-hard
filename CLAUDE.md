@@ -615,7 +615,11 @@ palette (3 x 5, 84x52 px, name inside, black/white text by higher WCAG contrast)
 `color_name` + `color_code` (uppercase RRGGBB). Shown after the filament pick
 on the New-filament path (Skip keeps the tag hint / grey `cccccc`) and after
 the template pick on the Duplicate path (preselected with the source spool's
-colour; the Skip button reads "Keep"). The Done screen's colour chip (filled with the current colour)
+colour; the Skip button reads "Keep"). Duplicate copies the source spool's
+filament link (`setting_id` + `slicer_filament`) and its temps/density; the
+New-filament pick sets `setting_id` + `slicer_filament` = the preset's
+`filament_id` (temps/density stay inherited). Without `slicer_filament` a
+stock pick reached the AMS with an empty tray_info_idx (Studio: bare "PETG"). The Done screen's colour chip (filled with the current colour)
 reopens it on both paths and returns to Done.
 
 **New-tag wizard filament picker**: Type (PLA/PETG/ABS/TPU/Other/All; Other =

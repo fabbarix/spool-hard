@@ -71,6 +71,10 @@ struct WizardCtx {
     String     final_color_name;
     String     final_color_hex;
     String     final_setting_id;          // Filament preset ref (PFUL/PFUS), "" = none
+    String     final_slicer_filament;     // AMS tray_info_idx (preset filament_id), "" = none
+    int        final_temp_min   = -1;     // nozzle range °C, -1 = unset
+    int        final_temp_max   = -1;
+    float      final_density    = 0.f;    // g/cm³, 0 = unset
     bool       via_color        = false;  // color step shown after filament / template pick (Back target)
     int        final_advertised = -1;
     int        final_core       = -1;
@@ -291,7 +295,11 @@ static void on_template(lv_event_t* e) {
         case OP_NEW_FILAMENT:
             s_wiz.use_template     = false;
             s_wiz.template_id      = "";
-            s_wiz.final_setting_id = "";
+            s_wiz.final_setting_id      = "";
+            s_wiz.final_slicer_filament = "";
+            s_wiz.final_temp_min        = -1;
+            s_wiz.final_temp_max        = -1;
+            s_wiz.final_density         = 0.f;
             // Seed material/brand from the tag's NDEF hints in case the
             // user picked a filament that doesn't carry them. Picker
             // will overwrite these on selection.
@@ -367,6 +375,13 @@ static void on_pick(lv_event_t* e) {
             s_wiz.final_color_name  = rec.color_name;
             s_wiz.final_color_hex   = rec.color_code;
             s_wiz.final_advertised  = rec.weight_advertised;
+            // The filament link is what the AMS / Studio identify the spool
+            // by (tray_info_idx); without it a duplicate showed as bare PETG.
+            s_wiz.final_setting_id      = rec.setting_id;
+            s_wiz.final_slicer_filament = rec.slicer_filament;
+            s_wiz.final_temp_min        = rec.nozzle_temp_min;
+            s_wiz.final_temp_max        = rec.nozzle_temp_max;
+            s_wiz.final_density         = rec.density;
             // Carry the template's measured empty-core over so the Used /
             // Empty screens can offer a one-tap "same as template" shortcut.
             s_wiz.template_core     = rec.weight_core;
@@ -735,7 +750,12 @@ static void on_filament_pick(lv_event_t* e) {
         bool found = g_user_filaments.findById(s_filapick_sel, rec) ||
                      g_stock_filaments.findById(s_filapick_sel, rec);
         if (found) {
-            s_wiz.final_setting_id  = rec.setting_id;
+            s_wiz.final_setting_id      = rec.setting_id;
+            // Stock presets aren't in the user store, so the push can't
+            // resolve their filament_id from setting_id: carry it here.
+            // Temps / density stay unset: the spool inherits them from the
+            // preset instead of pinning a copy.
+            s_wiz.final_slicer_filament = rec.filament_id;
             if (rec.filament_type.length())   s_wiz.final_material = rec.filament_type;
             if (rec.filament_subtype.length())s_wiz.final_subtype  = rec.filament_subtype;
             if (rec.filament_vendor.length()) s_wiz.final_brand    = rec.filament_vendor;
@@ -1315,6 +1335,10 @@ static void on_done(lv_event_t* e) {
             rec.weight_current    = s_wiz.final_current;
             rec.weight_new        = s_wiz.final_new;
             rec.setting_id        = s_wiz.final_setting_id;
+            rec.slicer_filament   = s_wiz.final_slicer_filament;
+            rec.nozzle_temp_min   = s_wiz.final_temp_min;
+            rec.nozzle_temp_max   = s_wiz.final_temp_max;
+            rec.density           = s_wiz.final_density;
             rec.data_origin       = s_wiz.tag_format;
             rec.tag_type          = s_wiz.tag_type;
             g_store.upsert(rec);
