@@ -503,11 +503,16 @@ static void build_home() {
     lv_obj_align_to(s_lbl_hostname, s_lbl_wifi_icon,
                     LV_ALIGN_OUT_RIGHT_MID, 8, 0);
 
-    lv_obj_t* foot = make_label(s_home, LV_SYMBOL_SETTINGS "  V " FW_VERSION,
-                                COL_TEXT_MUTED, &spoolhard_mont_16);
-    // Dev builds stamp "<v>-dev.<hash>[-dirty]", too wide for the gap between
-    // hostname and IP; clip it here (device config shows the full string).
-    lv_obj_set_width(foot, 160);
+    // Dev builds stamp "<v>-dev.<hash>[-dirty]", too wide for the ~160 px gap
+    // between hostname and IP: show only "<v>-dev" here (device config, one
+    // tap away, shows the full string). One fixed line so LONG_DOT clips
+    // instead of wrapping.
+    char foot_txt[48];
+    const char* dev = strstr(FW_VERSION, "-dev");
+    int vlen = dev ? (int)(dev - FW_VERSION) + 4 : (int)strlen(FW_VERSION);
+    snprintf(foot_txt, sizeof(foot_txt), LV_SYMBOL_SETTINGS "  V %.*s", vlen, FW_VERSION);
+    lv_obj_t* foot = make_label(s_home, foot_txt, COL_TEXT_MUTED, &spoolhard_mont_16);
+    lv_obj_set_size(foot, 160, lv_font_get_line_height(&spoolhard_mont_16));
     lv_label_set_long_mode(foot, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(foot, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -12);
